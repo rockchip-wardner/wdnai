@@ -1,7 +1,7 @@
 """``@Callable`` decorator — mark a function as a completion callback for ``session.respond``.
 
 In the same spirit as Apple Foundation Models' ``@Callable``: the decorator itself
-does no real work, it just stamps the function with a ``__rksdk_callable__`` flag
+does no real work, it just stamps the function with a ``__rkai_callable__`` flag
 so that:
 - IDEs / readers can see at a glance that "this function will be invoked by the framework"
 - there's a hook available for future signature validation (e.g. must accept exactly
@@ -31,5 +31,5 @@ def Callable(func: _Callable) -> _Callable:
             on_complete=alarm,   # auto-invoked after a successful parse
         )
     """
-    func.__rksdk_callable__ = True  # type: ignore[attr-defined]
+    func.__rkai_callable__ = True  # type: ignore[attr-defined]
     return func

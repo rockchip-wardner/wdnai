@@ -16,7 +16,7 @@ go straight to ``_lib`` if needed.
 
 The library is searched in this order:
 
-    1. ``rksdk/libs/librockchip_mpp.so.0``    (vendored copy that ships with the SDK)
+    1. ``rkai/libs/librockchip_mpp.so.0``    (vendored copy that ships with the SDK)
     2. ``/usr/lib/aarch64-linux-gnu/librockchip_mpp.so.0``    (system install)
     3. ``ctypes.util.find_library("rockchip_mpp")``           (fallback)
 """
@@ -637,7 +637,7 @@ class MppDecoder:
                         byref(grp),
                         MppBufferType.DMA_HEAP,
                         MppBufferMode.INTERNAL,
-                        b"rksdk-mpp",
+                        b"rkai-mpp",
                         b"info_change",
                     ),
                     "mpp_buffer_group_get",
@@ -655,7 +655,7 @@ class MppDecoder:
                 for _ in range(self._extra_buf_count):
                     buf = MppBuffer()
                     _check(
-                        _lib.mpp_buffer_get_with_tag(grp, byref(buf), buf_size, b"rksdk-mpp", b"prime"),
+                        _lib.mpp_buffer_get_with_tag(grp, byref(buf), buf_size, b"rkai-mpp", b"prime"),
                         "mpp_buffer_get prime",
                     )
                     _lib.mpp_buffer_put_with_caller(buf, b"prime")
@@ -677,7 +677,7 @@ class MppDecoder:
                 return None
 
             buf = _lib.mpp_frame_get_buffer(frame)
-            ptr = _lib.mpp_buffer_get_ptr_with_caller(buf, b"rksdk-mpp")
+            ptr = _lib.mpp_buffer_get_ptr_with_caller(buf, b"rkai-mpp")
             out = DecodedFrame(
                 width=_lib.mpp_frame_get_width(frame),
                 height=_lib.mpp_frame_get_height(frame),

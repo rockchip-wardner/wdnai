@@ -8,11 +8,11 @@ parameters, etc.). ``SystemLanguageModel`` is the catalog entry point, exposing
 
 Typical usage::
 
-    from rksdk import SystemLanguageModel, LLMSession, Attachment
+    from rkai import SystemLanguageModel, LLMSession, Attachment
 
     model = SystemLanguageModel.qwen3_vl_2b().with_paths(
-        rknn_llm_path="/userdata/Qwen3-VL-2B-llm.rknn",
-        rknn_vision_path="/userdata/Qwen3-VL-2B-vision.rknn",
+        rknn_llm_path="/userdata/Qwen3-VL-2B-llm.rknn3",
+        rknn_vision_path="/userdata/Qwen3-VL-2B-vision.rknn3",
         tokenizer_path="/userdata/qwen3_VL_2B",
         embed_path="/userdata/Qwen3-VL-2B-llm.embed.bin",
     )
@@ -21,8 +21,11 @@ Typical usage::
 """
 from __future__ import annotations
 
+import logging
 import os as _os
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict
 
 
@@ -220,20 +223,51 @@ def _qwen3vl_4b_spec(**overrides) -> ModelSpec:
 
 
 # --------------------------------------------------------------------------- #
-# Predefined paths: absolute paths to the SDK-shipped 4B model (rksdk/models/Qwen3-VL-4B/)
+# Predefined paths: Qwen3-VL-4B lives at a fixed on-device location
+# (``/userdata/models/Qwen3-VL-4B/``). No network access is performed at any
+# point — the user is expected to place the files there manually.
+# Override the root with the ``RKAI_MODELS_DIR`` environment variable.
 # --------------------------------------------------------------------------- #
-_RKSDK_DIR = _os.path.dirname(_os.path.abspath(__file__))
-_DEFAULT_QWEN3_VL_4B_DIR = _os.path.join(_RKSDK_DIR, "models", "Qwen3-VL-4B")
+_QWEN3_VL_4B_DIR_NAME = "Qwen3-VL-4B"
+_QWEN3_VL_4B_REQUIRED = (
+    "llm_Qwen3-VL-4B.rknn3",
+    "llm_Qwen3-VL-4B.weight",
+    "vision_Qwen3-VL-4B.rknn3",
+    "vision_Qwen3-VL-4B.weight",
+    "Qwen3-VL-4B.embed.bin",
+    "Qwen3-VL-4B.tokenizer.gguf",
+)
+
+
+def _models_root() -> Path:
+    """Return the on-device root directory holding all fixed-location models."""
+    return Path(_os.environ.get("RKAI_MODELS_DIR", "/userdata/models"))
+
+
+def _qwen3_vl_4b_dir() -> Path:
+    return _models_root() / _QWEN3_VL_4B_DIR_NAME
 
 
 def _default_qwen3_vl_4b_paths() -> dict:
-    """Return absolute paths pointing to ``rksdk/models/Qwen3-VL-4B/``."""
+    """Return absolute paths to the Qwen3-VL-4B files under the fixed models root."""
+    d = _qwen3_vl_4b_dir()
     return {
-        "rknn_llm_path":   _os.path.join(_DEFAULT_QWEN3_VL_4B_DIR, "llm_Qwen3-VL-4B.rknn"),
-        "rknn_vision_path": _os.path.join(_DEFAULT_QWEN3_VL_4B_DIR, "vision_Qwen3-VL-4B.rknn"),
-        "tokenizer_path":  _os.path.join(_DEFAULT_QWEN3_VL_4B_DIR, "Qwen3-VL-4B.tokenizer.gguf"),
-        "embed_path":      _os.path.join(_DEFAULT_QWEN3_VL_4B_DIR, "Qwen3-VL-4B.embed.bin"),
+        "rknn_llm_path":   str(d / "llm_Qwen3-VL-4B.rknn3"),
+        "rknn_vision_path": str(d / "vision_Qwen3-VL-4B.rknn3"),
+        "tokenizer_path":  str(d / "Qwen3-VL-4B.tokenizer.gguf"),
+        "embed_path":      str(d / "Qwen3-VL-4B.embed.bin"),
     }
+
+
+def _verify_qwen3_vl_4b_files() -> None:
+    """Raise :class:`FileNotFoundError` listing any missing Qwen3-VL-4B files."""
+    d = _qwen3_vl_4b_dir()
+    missing = [f for f in _QWEN3_VL_4B_REQUIRED if not (d / f).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Qwen3-VL-4B files missing under {d}: {missing}. "
+            f"Place the files there or set RKAI_MODELS_DIR to override the root."
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -251,7 +285,9 @@ class SystemLanguageModel:
     - ``qwen2_5_vl_7b()``        — Qwen2.5-VL-7B (image)
     - ``qwen3_vl_2b()``          — Qwen3-VL-2B (image + video)
     - ``qwen3_vl_4b_template()`` — Qwen3-VL-4B template (no default paths)
-    - ``qwen3_vl_4b``            — Pre-baked Qwen3-VL-4B with default paths
+    - ``qwen3_vl_4b()``          — Qwen3-VL-4B bound to ``/userdata/models/Qwen3-VL-4B``
+                                    (the user is expected to place the files there;
+                                     override the root with ``RKAI_MODELS_DIR``)
     """
 
     #: Default placeholder (no paths; for the ``model=default`` syntax in demo_vlm)
@@ -278,7 +314,7 @@ class SystemLanguageModel:
 
     @classmethod
     def qwen2_5_vl_7b(cls) -> ModelSpec:
-        return _qwen2_5vl_7b_spec()
+        return _qwen2_5_vl_7b_spec()
 
     @classmethod
     def qwen3_vl_2b(cls) -> ModelSpec:
@@ -289,8 +325,13 @@ class SystemLanguageModel:
         """4B template with no default paths; users can apply .with_paths(...) on top."""
         return _qwen3vl_4b_spec()
 
-    # Pre-baked instance: directly bound to the SDK-shipped ``rksdk/models/Qwen3-VL-4B/``
-    # absolute paths. In demos you can just use ``SystemLanguageModel.qwen3_vl_4b``
-    # without ``.with_paths(...)``. To override:
-    # ``SystemLanguageModel.qwen3_vl_4b.with_paths(rknn_llm_path=...)``.
-    qwen3_vl_4b: ModelSpec = _qwen3vl_4b_spec().with_paths(**_default_qwen3_vl_4b_paths())
+    @classmethod
+    def qwen3_vl_4b(cls) -> ModelSpec:
+        """Return a :class:`ModelSpec` pre-bound to the fixed Qwen3-VL-4B files.
+
+        The files are expected at ``/userdata/models/Qwen3-VL-4B/`` (override the
+        root with the ``RKAI_MODELS_DIR`` environment variable). If any expected
+        file is missing a :class:`FileNotFoundError` is raised listing them.
+        """
+        _verify_qwen3_vl_4b_files()
+        return _qwen3vl_4b_spec().with_paths(**_default_qwen3_vl_4b_paths())

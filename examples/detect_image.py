@@ -1,16 +1,19 @@
 """Qwen3-VL-4B VLM 推理示例。
 
-模型文件位于 ``rksdk/models/Qwen3-VL-4B/``：
-    llm_Qwen3-VL-4B.rknn / .weight
-    vision_Qwen3-VL-4B.rknn / .weight
+模型文件位于固定的本地路径 ``/userdata/models/Qwen3-VL-4B/``：
+    llm_Qwen3-VL-4B.rknn3 / .weight
+    vision_Qwen3-VL-4B.rknn3 / .weight
     Qwen3-VL-4B.embed.bin
     Qwen3-VL-4B.tokenizer.gguf     ← RKNN 自带的 GGUF 格式 tokenizer
+
+可通过环境变量更改根目录：
+    RKAI_MODELS_DIR=/path/to/models
 """
 from typing import Literal
 
 import cv2
 
-from rksdk import Attachment, Generable, Callable, Field, LLMSession, SystemLanguageModel
+from rkai import Attachment, Generable, Callable, Field, LLMSession, SystemLanguageModel
 
 @Generable
 class Event:
@@ -26,12 +29,12 @@ def alarm(parm: Event):
     print(f"!!! 发现异常行为，触发报警 !!! {parm}")
 
 async def main():
-    #img = cv2.imread("test.jpg")
-    img = cv2.imread("R-C.png")
+    img = cv2.imread("demo.jpg")
     if img is None:
         raise FileNotFoundError("图片不存在，请放在 demo_vlm.py 同级目录")
 
-    session = LLMSession(model=SystemLanguageModel.qwen3_vl_4b)
+    model = SystemLanguageModel.qwen3_vl_4b()
+    session = LLMSession(model=model)
     try:
         msg = '这是一张公共场所内的图片，请检查出是否有人在车厢内做出危险行为，或者摔倒等异常情况'
         for i in range(10):

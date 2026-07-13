@@ -7,7 +7,7 @@ import numpy as np
 
 # --------------------------------------------------------------------------- #
 def _make_workspace():
-    tmp = tempfile.mkdtemp(prefix="rksdk_mock_")
+    tmp = tempfile.mkdtemp(prefix="rkai_mock_")
     emb = np.arange(64 * 8, dtype=np.uint16).view(np.float16).reshape(64, 8).copy()
     embed_path = os.path.join(tmp, "embed.bin")
     emb.tofile(embed_path)
@@ -98,9 +98,9 @@ class _MockFactory:
 def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
     """把 rknn3lite + transformers + 关键 helper 全部 monkey-patch 成 mock。"""
     import rknn3lite.api as api
-    import rksdk.backends._common as common
-    import rksdk.backends.text as text_mod
-    import rksdk.backends.vlm as vlm_mod
+    import rkai.backends._common as common
+    import rkai.backends.text as text_mod
+    import rkai.backends.vlm as vlm_mod
 
     # ---- 1) RKNN3Lite 构造器：返回 _FakeRknn ----
     def make(llm_mode=False, verbose=False):
@@ -152,7 +152,7 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
         # 2) 暂存，让后续 build_llm_callback 找得到
         last_rknn["obj"] = self.rknn
         # 3) 跑剩下的初始化
-        from rksdk.backends._common import (
+        from rkai.backends._common import (
             StreamSink, build_llm_args, apply_chat_template,
         )
         self.tokenizer = text_mod.load_tokenizer(spec.tokenizer_path)
@@ -176,17 +176,17 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
         # vision
         self.rknn_vision = RKNN3Lite()
         vp = spec.rknn_vision_path
-        if self.rknn_vision.load_rknn(vp, vp.replace(".rknn", ".weight")) != 0:
+        if self.rknn_vision.load_rknn(vp, vp.replace(".rknn3", ".weight")) != 0:
             raise RuntimeError("vision load failed")
         # llm
         self.rknn_llm = RKNN3Lite(llm_mode=True, verbose=spec.verbose)
         lp = spec.rknn_llm_path
-        if self.rknn_llm.load_rknn(lp, lp.replace(".rknn", ".weight")) != 0:
+        if self.rknn_llm.load_rknn(lp, lp.replace(".rknn3", ".weight")) != 0:
             raise RuntimeError("llm load failed")
         self.variant = spec.variant
         last_rknn["obj"] = self.rknn_llm
 
-        from rksdk.backends._common import (
+        from rkai.backends._common import (
             StreamSink, build_llm_args, apply_chat_template,
         )
         self.tokenizer = vlm_mod.load_tokenizer(spec.tokenizer_path)
@@ -217,12 +217,12 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
 
 # --------------------------------------------------------------------------- #
 def test_text_qwen3():
-    from rksdk import LLMSession, SystemLanguageModel
+    from rkai import LLMSession, SystemLanguageModel
     embed, tok_dir = _make_workspace()
     _install_mocks(deepstack_n=0, vocab_size=64)
 
     spec = SystemLanguageModel.qwen3_1_7b().with_paths(
-        rknn_path="/fake.rknn", weight_path="/fake.weight",
+        rknn_path="/fake.rknn3", weight_path="/fake.weight",
         tokenizer_path=tok_dir, embed_path=embed,
     )
     sess = LLMSession(model=spec)
@@ -233,12 +233,12 @@ def test_text_qwen3():
 
 
 def test_text_qwen25():
-    from rksdk import LLMSession, SystemLanguageModel
+    from rkai import LLMSession, SystemLanguageModel
     embed, tok_dir = _make_workspace()
     _install_mocks(deepstack_n=0, vocab_size=64)
 
     spec = SystemLanguageModel.qwen2_5_0_5b().with_paths(
-        rknn_path="/fake.rknn", weight_path="/fake.weight",
+        rknn_path="/fake.rknn3", weight_path="/fake.weight",
         tokenizer_path=tok_dir, embed_path=embed,
     )
     sess = LLMSession(model=spec)
@@ -249,7 +249,7 @@ def test_text_qwen25():
 
 
 def test_image_qwen3vl():
-    from rksdk import LLMSession, SystemLanguageModel
+    from rkai import LLMSession, SystemLanguageModel
     from pydantic import BaseModel, Field
     from typing import Optional
 
@@ -257,7 +257,7 @@ def test_image_qwen3vl():
     _install_mocks(deepstack_n=3, vocab_size=64)
 
     spec = SystemLanguageModel.qwen3_vl_2b().with_paths(
-        rknn_llm_path="/fake_llm.rknn", rknn_vision_path="/fake_v.rknn",
+        rknn_llm_path="/fake_llm.rknn3", rknn_vision_path="/fake_v.rknn3",
         tokenizer_path=tok_dir, embed_path=embed,
     )
     sess = LLMSession(model=spec)
@@ -279,12 +279,12 @@ def test_image_qwen3vl():
 
 
 def test_image_qwen25vl():
-    from rksdk import LLMSession, SystemLanguageModel
+    from rkai import LLMSession, SystemLanguageModel
     embed, tok_dir = _make_workspace()
     _install_mocks(deepstack_n=0, vocab_size=64)  # Qwen2.5-VL 没有 deepstack
 
     spec = SystemLanguageModel.qwen2_5_vl_3b().with_paths(
-        rknn_llm_path="/fake_llm.rknn", rknn_vision_path="/fake_v.rknn",
+        rknn_llm_path="/fake_llm.rknn3", rknn_vision_path="/fake_v.rknn3",
         tokenizer_path=tok_dir, embed_path=embed,
     )
     sess = LLMSession(model=spec)
@@ -296,12 +296,12 @@ def test_image_qwen25vl():
 
 
 def test_video_qwen3vl():
-    from rksdk import LLMSession, SystemLanguageModel
+    from rkai import LLMSession, SystemLanguageModel
     embed, tok_dir = _make_workspace()
     _install_mocks(deepstack_n=3, vocab_size=64)
 
     spec = SystemLanguageModel.qwen3_vl_2b().with_paths(
-        rknn_llm_path="/fake_llm.rknn", rknn_vision_path="/fake_v.rknn",
+        rknn_llm_path="/fake_llm.rknn3", rknn_vision_path="/fake_v.rknn3",
         tokenizer_path=tok_dir, embed_path=embed,
     )
     sess = LLMSession(model=spec)
@@ -314,12 +314,12 @@ def test_video_qwen3vl():
 
 def test_overrides_passed_to_session_run():
     """``max_new_tokens`` / ``enable_thinking`` / ``keep_history`` 能通过 overrides 透传。"""
-    from rksdk import LLMSession, SystemLanguageModel
+    from rkai import LLMSession, SystemLanguageModel
     embed, tok_dir = _make_workspace()
     _install_mocks(deepstack_n=0, vocab_size=64)
 
     spec = SystemLanguageModel.qwen3_1_7b().with_paths(
-        rknn_path="/fake.rknn", weight_path="/fake.weight",
+        rknn_path="/fake.rknn3", weight_path="/fake.weight",
         tokenizer_path=tok_dir, embed_path=embed,
     )
     sess = LLMSession(model=spec)
@@ -339,7 +339,7 @@ def test_overrides_passed_to_session_run():
     # VLM 也同样
     _install_mocks(deepstack_n=3, vocab_size=64)
     vlm_spec = SystemLanguageModel.qwen3_vl_2b().with_paths(
-        rknn_llm_path="/fake_llm.rknn", rknn_vision_path="/fake_v.rknn",
+        rknn_llm_path="/fake_llm.rknn3", rknn_vision_path="/fake_v.rknn3",
         tokenizer_path=tok_dir, embed_path=embed,
     )
     sess2 = LLMSession(model=vlm_spec)
@@ -360,7 +360,7 @@ def test_overrides_passed_to_session_run():
 def test_session_respond_full_flow():
     """通过 LLMSession.respond() 走完整链路：prompt 注入 + JSON 解析 + pydantic。"""
     import asyncio
-    from rksdk import LLMSession, SystemLanguageModel, Attachment
+    from rkai import LLMSession, SystemLanguageModel, Attachment
     from pydantic import BaseModel, Field
     from typing import Optional
 
@@ -372,7 +372,7 @@ def test_session_respond_full_flow():
     _install_mocks(deepstack_n=3, vocab_size=64)
 
     spec = SystemLanguageModel.qwen3_vl_2b().with_paths(
-        rknn_llm_path="/fake_llm.rknn", rknn_vision_path="/fake_v.rknn",
+        rknn_llm_path="/fake_llm.rknn3", rknn_vision_path="/fake_v.rknn3",
         tokenizer_path=tok_dir, embed_path=embed,
     )
 

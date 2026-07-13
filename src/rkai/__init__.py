@@ -1,20 +1,20 @@
-"""rksdk — LLM / VLM access SDK for Rockchip NPUs (rknn3-toolkit-lite).
+"""rkai — LLM / VLM access SDK for Rockchip NPUs (rknn3-toolkit-lite).
 
 Public API:
 
-    from rksdk import BaseModel, Field, Generable, Callable, Attachment, LLMSession, SystemLanguageModel
+    from rkai import BaseModel, Field, Generable, Callable, Attachment, LLMSession, SystemLanguageModel
 
 Quick start (Qwen3-VL image):
 
     from typing import Literal
-    from rksdk import Generable, Field
+    from rkai import Generable, Field
 
     @Generable
     class Event:
         act: str = Field(description="action")
         level: Literal["Normal", "Warning"] = Field(default="Normal")
 
-    model = SystemLanguageModel.qwen3_vl_4b
+    model = SystemLanguageModel.qwen3_vl_4b()
     session = LLMSession(model=model)
     out = await session.respond(
         msg="Analyze this image",

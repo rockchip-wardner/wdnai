@@ -56,13 +56,13 @@ class VLMBackend:
         # ---- vision -----------------------------------------------------
         self.rknn_vision = RKNN3Lite()
         vp = spec.rknn_vision_path
-        if self.rknn_vision.load_rknn(vp, vp.replace(".rknn", ".weight")) != 0:
+        if self.rknn_vision.load_rknn(vp, vp.replace(".rknn3", ".weight")) != 0:
             raise RuntimeError(f"vision load_rknn failed: {vp}")
 
         # ---- llm --------------------------------------------------------
         self.rknn_llm = RKNN3Lite(llm_mode=True, verbose=spec.verbose)
         lp = spec.rknn_llm_path
-        if self.rknn_llm.load_rknn(lp, lp.replace(".rknn", ".weight")) != 0:
+        if self.rknn_llm.load_rknn(lp, lp.replace(".rknn3", ".weight")) != 0:
             raise RuntimeError(f"llm load_rknn failed: {lp}")
 
         self.tokenizer = load_tokenizer(spec.tokenizer_path)

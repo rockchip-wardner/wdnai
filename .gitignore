@@ -47,14 +47,14 @@ Thumbs.db
 # Project-specific: huge RKNN model files
 # (each .rknn/.weight/.bin is hundreds of MB to 2.4 GB; never commit them)
 # ============================================================================ #
-rksdk/models/**/*.rknn
-rksdk/models/**/*.weight
-rksdk/models/**/*.bin
-rksdk/models/**/*.gguf
+rkai/models/**/*.rknn
+rkai/models/**/*.weight
+rkai/models/**/*.bin
+rkai/models/**/*.gguf
 
 # Keep the directory itself + README
-!rksdk/models/README.md
-!rksdk/models/.gitkeep
+!rkai/models/README.md
+!rkai/models/.gitkeep
 
 # ============================================================================ #
 # Test / demo data

@@ -23,7 +23,7 @@ def Generable(cls: type) -> type:
 
     Usage::
 
-        from rksdk import Generable, Field
+        from rkai import Generable, Field
         from typing import Literal, Optional
 
         @Generable

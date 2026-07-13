@@ -59,15 +59,15 @@ class LLMSession:
 
         prompt = self._maybe_inject_json_hint(msg, generating)
         if debug:
-            print(f"[rksdk.debug] msg    = {msg!r}")
-            print(f"[rksdk.debug] prompt = {prompt!r}")
+            print(f"[rkai.debug] msg    = {msg!r}")
+            print(f"[rkai.debug] prompt = {prompt!r}")
         text = self._dispatch(prompt, attachment, **overrides)
 
         if debug:
-            print(f"[rksdk.debug] raw    = {text!r}")
+            print(f"[rkai.debug] raw    = {text!r}")
             sink = getattr(self._backend, "sink", None)
             if sink is not None and sink.perf:
-                print(f"[rksdk.debug] perf   = {sink.perf}")
+                print(f"[rkai.debug] perf   = {sink.perf}")
 
         # Maintain history
         self.history.append({"role": "user", "content": msg or ""})
@@ -75,7 +75,7 @@ class LLMSession:
 
         result = self._parse_output(text, generating=generating)
         if debug:
-            print(f"[rksdk.debug] parsed = {result!r}")
+            print(f"[rkai.debug] parsed = {result!r}")
 
         # Completion callbacks (invoked in order; sync / async both supported)
         if tools:

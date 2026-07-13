@@ -4,14 +4,14 @@ Designed to mirror ``cv2.VideoCapture`` so existing OpenCV pipelines can be
 retargeted at the Rockchip VPU with a one-line import swap. The heavy
 lifting (PyAV demux, AVCC→Annex B, SPS/PPS injection, NV12→BGR) lives in
 this module; the underlying ctypes binding to ``librockchip_mpp.so`` is
-``rksdk.mpp``.
+``rkai.mpp``.
 
 Typical usage:
 
     import cv2
-    import rksdk
+    import rkai
 
-    cap = rksdk.VideoCapture("bus.mp4")
+    cap = rkai.VideoCapture("bus.mp4")
     while True:
         ret, frame = cap.read()
         if not ret:
