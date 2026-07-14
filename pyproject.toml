@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rkai"
-version = "0.2.0"
+version = "0.1.1"
 description = "RK 芯片上的 LLM / VLM 访问 SDK（基于 rknn3-toolkit-lite）"
 readme = "README.md"
 requires-python = ">=3.9"
