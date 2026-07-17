@@ -1,8 +1,8 @@
 """Qwen3-VL-4B VLM 推理示例。
 
 模型文件位于固定的本地路径 ``/userdata/models/Qwen3-VL-4B/``：
-    llm_Qwen3-VL-4B.rknn3 / .weight
-    vision_Qwen3-VL-4B.rknn3 / .weight
+    llm_Qwen3-VL-4B.1828.rknn / .weight
+    vision_Qwen3-VL-4B.1828.rknn / .weight
     Qwen3-VL-4B.embed.bin
     Qwen3-VL-4B.tokenizer.gguf     ← RKNN 自带的 GGUF 格式 tokenizer
 

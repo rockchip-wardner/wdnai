@@ -230,9 +230,9 @@ def _qwen3vl_4b_spec(**overrides) -> ModelSpec:
 # --------------------------------------------------------------------------- #
 _QWEN3_VL_4B_DIR_NAME = "Qwen3-VL-4B"
 _QWEN3_VL_4B_REQUIRED = (
-    "llm_Qwen3-VL-4B.rknn3",
+    "llm_Qwen3-VL-4B.1828.rknn",
     "llm_Qwen3-VL-4B.weight",
-    "vision_Qwen3-VL-4B.rknn3",
+    "vision_Qwen3-VL-4B.1828.rknn",
     "vision_Qwen3-VL-4B.weight",
     "Qwen3-VL-4B.embed.bin",
     "Qwen3-VL-4B.tokenizer.gguf",
@@ -252,8 +252,8 @@ def _default_qwen3_vl_4b_paths() -> dict:
     """Return absolute paths to the Qwen3-VL-4B files under the fixed models root."""
     d = _qwen3_vl_4b_dir()
     return {
-        "rknn_llm_path":   str(d / "llm_Qwen3-VL-4B.rknn3"),
-        "rknn_vision_path": str(d / "vision_Qwen3-VL-4B.rknn3"),
+        "rknn_llm_path":   str(d / "llm_Qwen3-VL-4B.1828.rknn"),
+        "rknn_vision_path": str(d / "vision_Qwen3-VL-4B.1828.rknn"),
         "tokenizer_path":  str(d / "Qwen3-VL-4B.tokenizer.gguf"),
         "embed_path":      str(d / "Qwen3-VL-4B.embed.bin"),
     }
