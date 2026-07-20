@@ -295,23 +295,6 @@ def test_image_qwen25vl():
     sess.close()
 
 
-def test_video_qwen3vl():
-    from rkai import LLMSession, SystemLanguageModel
-    embed, tok_dir = _make_workspace()
-    _install_mocks(deepstack_n=3, vocab_size=64)
-
-    spec = SystemLanguageModel.qwen3_vl_2b().with_paths(
-        rknn_llm_path="/fake_llm.rknn3", rknn_vision_path="/fake_v.rknn3",
-        tokenizer_path=tok_dir, embed_path=embed,
-    )
-    sess = LLMSession(model=spec)
-    frames = [np.zeros((360, 480, 3), dtype=np.uint8) for _ in range(4)]
-    text = sess._backend.run_video("请介绍视频", frames)
-    print("[Qwen3-VL] video ->", repr(text))
-    assert text
-    sess.close()
-
-
 def test_overrides_passed_to_session_run():
     """``max_new_tokens`` / ``enable_thinking`` / ``keep_history`` 能通过 overrides 透传。"""
     from rkai import LLMSession, SystemLanguageModel
@@ -422,7 +405,6 @@ if __name__ == "__main__":
     test_text_qwen25()
     test_image_qwen3vl()
     test_image_qwen25vl()
-    test_video_qwen3vl()
     test_overrides_passed_to_session_run()
     test_session_respond_full_flow()
     print("\nALL MOCK TESTS PASSED")

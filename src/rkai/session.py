@@ -44,7 +44,8 @@ class LLMSession:
         """Fire one request and return the result.
 
         - ``attachment`` — if it's an ``Attachment``, the VLM backend is used
-          (image / video path).
+          (image path; decode video frames with ``rkv`` and pass them as a
+          list of ndarrays).
         - ``generating`` — if given, requires the model to emit JSON
           (auto-appends a schema hint and parses the result).
         - ``debug=True`` — additionally prints ``msg``, the actual ``prompt``
@@ -97,8 +98,6 @@ class LLMSession:
         kind = attachment.kind
         if kind == "image":
             return self._backend.run_images(prompt, attachment.images, **overrides)
-        if kind == "video":
-            return self._backend.run_video(prompt, attachment.frames, **overrides)
         raise TypeError(f"Unsupported attachment kind: {kind}")
 
     # ------------------------------------------------------------------ #
@@ -113,13 +112,13 @@ class LLMSession:
         sep = "\n\n" if user_msg else ""
         # When msg is empty, give the model a default task so it doesn't "do nothing"
         default_task = (
-            "Please carefully observe the behavior of people in the image / video, "
-            "describe it according to the JSON Schema below, and assign a safety level. "
-            "**Output JSON only, no other text**:"
-            if not user_msg
-            else "Please strictly follow the JSON Schema below to return the result. "
-                 "**Output JSON only, no other text**:"
-        )
+                "Please carefully observe the behavior of people in the image, "
+                "describe it according to the JSON Schema below, and assign a safety level. "
+                "**Output JSON only, no other text**:"
+                if not user_msg
+                else "Please strictly follow the JSON Schema below to return the result. "
+                     "**Output JSON only, no other text**:"
+            )
         return (
             f"{user_msg}{sep}"
             f"{default_task}\n"

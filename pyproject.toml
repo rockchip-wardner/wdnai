@@ -27,4 +27,4 @@ include = ["rkai*"]
 exclude = ["tests*", "examples*"]
 
 [tool.setuptools.package-data]
-rkai = ["libs/*.so*", "models/README.md"]
+rkai = ["models/README.md"]

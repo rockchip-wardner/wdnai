@@ -283,7 +283,7 @@ class SystemLanguageModel:
     - ``qwen3_1_7b()``           — Qwen3-1.7B
     - ``qwen2_5_vl_3b()``        — Qwen2.5-VL-3B (image)
     - ``qwen2_5_vl_7b()``        — Qwen2.5-VL-7B (image)
-    - ``qwen3_vl_2b()``          — Qwen3-VL-2B (image + video)
+    - ``qwen3_vl_2b()``          — Qwen3-VL-2B (image)
     - ``qwen3_vl_4b_template()`` — Qwen3-VL-4B template (no default paths)
     - ``qwen3_vl_4b()``          — Qwen3-VL-4B bound to ``/userdata/models/Qwen3-VL-4B``
                                     (the user is expected to place the files there;

@@ -1,4 +1,4 @@
-"""Common utilities: image / video preprocessing, JSON extraction, etc."""
+"""Common utilities: image preprocessing, JSON extraction, etc."""
 from __future__ import annotations
 
 import json
@@ -51,8 +51,7 @@ def qwen25vl_prune(img_nchw: np.ndarray) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# Qwen3-VL pruned-model preprocessing (test_video.py 2-frame version and
-# test.py 1-frame version share the same algorithm)
+# Qwen3-VL pruned-model preprocessing (single-image path; matches examples/Qwen3VL/test.py)
 # --------------------------------------------------------------------------- #
 def _qwen3vl_normalize(img_nchw: np.ndarray) -> np.ndarray:
     img = np.float32(img_nchw)
@@ -68,18 +67,6 @@ def qwen3vl_prune_single(img_nchw: np.ndarray) -> np.ndarray:
     patches = np.concatenate([img, img], axis=1)
     h = img.shape[2]
     w = img.shape[3]
-    patches = patches.reshape(1, 2, 3, h // 2 // 16, 2, 16, w // 2 // 16, 2, 16)
-    patches = patches.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)
-    return patches.reshape(1 * h // 16 * w // 16, 3 * 2 * 16 * 16)
-
-
-def qwen3vl_prune_pair(img1_nchw: np.ndarray, img2_nchw: np.ndarray) -> np.ndarray:
-    """Qwen3-VL pruned-model two-image (consecutive video frames) input."""
-    img1 = _qwen3vl_normalize(img1_nchw)
-    img2 = _qwen3vl_normalize(img2_nchw)
-    patches = np.concatenate([img1, img2], axis=1)
-    h = img1.shape[2]
-    w = img1.shape[3]
     patches = patches.reshape(1, 2, 3, h // 2 // 16, 2, 16, w // 2 // 16, 2, 16)
     patches = patches.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)
     return patches.reshape(1 * h // 16 * w // 16, 3 * 2 * 16 * 16)

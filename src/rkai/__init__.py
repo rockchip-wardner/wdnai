@@ -31,7 +31,6 @@ from ._generable import Generable
 from .attachment import Attachment
 from .model import ModelSpec, SystemLanguageModel
 from .session import LLMSession
-from .video import VideoCapture
 
 __all__ = [
     "BaseModel",
@@ -42,7 +41,6 @@ __all__ = [
     "ModelSpec",
     "SystemLanguageModel",
     "LLMSession",
-    "VideoCapture",
 ]
 
 __version__ = "0.1.1"

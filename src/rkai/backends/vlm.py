@@ -1,13 +1,16 @@
-"""Vision-language model backend — for Qwen2.5-VL / Qwen3-VL (image + Qwen3-VL video).
+"""Vision-language model backend — for Qwen2.5-VL / Qwen3-VL (image).
 
-Flow (aligned with examples/Qwen2.5VL/test.py, Qwen3VL/test.py, Qwen3VL/test_video.py):
+Flow (aligned with examples/Qwen2.5VL/test.py, Qwen3VL/test.py):
 
 1. Load the vision RKNN + LLM RKNN.
 2. For each image: BGR -> RGB -> resize -> [optional] pruned preprocessing
    -> vision.inference -> float16.
-3. Pack the vision outputs into an RKNN3Image (or RKNN3Video) for the LLM.
+3. Pack the vision outputs into an RKNN3Image for the LLM.
 4. Qwen3-VL additionally concatenates 3 deepstack aux tensors (index 2, 3, 4).
 5. Call ``llm.session_run(inputs=..., prompt=...)``.
+
+Video decoding is not handled here; callers feed pre-decoded frames via
+``rkv.VideoCapture`` and pass them as a list of ndarrays to ``run_images``.
 """
 from __future__ import annotations
 
@@ -20,7 +23,6 @@ import numpy as np
 from ..utils import (
     bgr_to_rgb,
     qwen25vl_prune,
-    qwen3vl_prune_pair,
     qwen3vl_prune_single,
     resize,
 )
@@ -185,72 +187,9 @@ class VLMBackend:
         prefix = "<image>" * len(image_bgr_list)
         return prefix, inputs, vision_latency_total
 
-    def _build_video_inputs(
-        self, frames_bgr: List[np.ndarray], frames_per_feature: int = 2
-    ) -> Tuple[str, list]:
-        """Qwen3-VL video: every ``frames_per_feature`` frames produces 1 video feature."""
-        from rknn3lite.api import (  # type: ignore
-            Float16, RKNN3Video, RKNN3AuxTensorWrapper,
-        )
-
-        if self.variant != self.VARIANT_3VL:
-            raise NotImplementedError(f"{self.variant} does not support the video interface")
-
-        feats: List[np.ndarray] = []
-        deepstack: List[List[np.ndarray]] = [[], [], []]
-        size = self.spec.image_size
-
-        # Pair consecutive frames and feed each pair into the vision model
-        for i in range(0, len(frames_bgr), frames_per_feature):
-            f1 = frames_bgr[i]
-            f2 = frames_bgr[i + 1] if i + 1 < len(frames_bgr) else f1
-            f1_nchw = (
-                resize(bgr_to_rgb(f1), size).transpose(2, 0, 1).reshape(1, 3, size, size)
-            )
-            f2_nchw = (
-                resize(bgr_to_rgb(f2), size).transpose(2, 0, 1).reshape(1, 3, size, size)
-            )
-            feat = np.float16(qwen3vl_prune_pair(f1_nchw, f2_nchw))
-            outs = self.rknn_vision.inference(inputs=[feat])
-            out0 = outs[0]
-            if out0.ndim == 2:
-                out0 = np.expand_dims(out0, 0)
-            feats.append(np.float16(out0))
-            for k in range(3):
-                deepstack[k].append(np.float16(outs[1 + k]))
-
-        features = np.float16(np.concatenate(feats, axis=0))
-        ds_concat = [np.float16(np.concatenate(d, axis=0)) for d in deepstack]
-
-        inputs = []
-        vid = RKNN3Video()
-        vid.video_embed = features.ctypes.data_as(ctypes.POINTER(Float16))
-        vid.n_frame_per_video = features.shape[0]  # 2 input images -> 1 output frame
-        vid.n_frame_tokens = features.shape[1]
-        vid.n_video = 1
-        vid.video_start = "<|vision_start|>".encode("utf-8")
-        vid.video_end = "<|vision_end|>".encode("utf-8")
-        vid.video_content = "<|video_pad|>".encode("utf-8")
-        vid.frame_width = size
-        vid.frame_height = size
-        inputs.append(vid)
-
-        aligned = (
-            self.rknn_vision.get_outputs_tensor_attr()[0].aligned_size
-            * features.shape[0]
-        )
-        for i in range(3):
-            aux = RKNN3AuxTensorWrapper()
-            aux.index = 2 + i
-            aux.aux_data = ds_concat[i]
-            aux.align_size = aligned
-            inputs.append(aux)
-
-        return "<video>", inputs
-
     # ------------------------------------------------------------------ #
     def run_text(self, prompt: str, **overrides: Any) -> str:
-        """Pure-text inference (no image / video). The prompt is sent directly to the LLM."""
+        """Pure-text inference (no image). The prompt is sent directly to the LLM."""
         return self._run_llm(prompt, inputs=None, vision_latency=None, **overrides)
 
     def run_images(
@@ -261,14 +200,6 @@ class VLMBackend:
         prefix, inputs, vlat = self._build_image_inputs(images)
         full_prompt = f"{prefix}{prompt}"
         return self._run_llm(full_prompt, inputs, vision_latency=vlat, **overrides)
-
-    def run_video(
-        self, prompt: str, frames: List[np.ndarray], **overrides: Any
-    ) -> str:
-        if not frames:
-            raise ValueError("frames must not be empty")
-        prefix, inputs = self._build_video_inputs(frames)
-        return self._run_llm(f"{prefix}{prompt}", inputs, vision_latency=None, **overrides)
 
     def _run_llm(
         self, prompt: str, inputs, vision_latency: Optional[float], **overrides: Any,
