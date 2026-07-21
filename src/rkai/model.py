@@ -37,17 +37,19 @@ class ModelSpec:
     """All static configuration + dynamic paths needed for a single model."""
 
     name: str
-    kind: str                                # "llm" | "vlm"
-    variant: str                             # "qwen2.5" | "qwen3" | "qwen2.5-vl" | "qwen3-vl"
+    kind: str                                # "llm" | "vlm" | "tts"
+    variant: str                             # "qwen2.5" | "qwen3" | "qwen2.5-vl" | "qwen3-vl" | "qwen3-tts"
 
-    # ---- LLM resources ----
-    # kind=llm uses rknn_path / weight_path; kind=vlm uses rknn_llm_path / rknn_vision_path
+    # ---- LLM / VLM / TTS resources ----
+    # kind=llm uses rknn_path / weight_path; kind=vlm uses rknn_llm_path / rknn_vision_path;
+    # kind=tts uses tts_model_dir (the four .rknn paths are derived from it).
     rknn_path: str = ""
     weight_path: str = ""
     rknn_llm_path: str = ""
     weight_llm_path: str = ""
     rknn_vision_path: str = ""
     weight_vision_path: str = ""
+    tts_model_dir: str = ""
     embed_path: str = ""
     tokenizer_path: str = ""
 
@@ -288,6 +290,9 @@ class SystemLanguageModel:
     - ``qwen3_vl_4b()``          — Qwen3-VL-4B bound to ``/userdata/models/Qwen3-VL-4B``
                                     (the user is expected to place the files there;
                                      override the root with ``RKAI_MODELS_DIR``)
+    - ``qwen3_tts()``            — Qwen3-TTS bound to ``/userdata/models/Qwen3-TTS``;
+                                    the 4 ``.1828.rknn`` files are looked up inside
+                                    that directory.
     """
 
     #: Default placeholder (no paths; for the ``model=default`` syntax in demo_vlm)
@@ -335,3 +340,21 @@ class SystemLanguageModel:
         """
         _verify_qwen3_vl_4b_files()
         return _qwen3vl_4b_spec().with_paths(**_default_qwen3_vl_4b_paths())
+
+    @classmethod
+    def qwen3_tts(cls) -> ModelSpec:
+        """Return a :class:`ModelSpec` pre-bound to the fixed Qwen3-TTS files.
+
+        The directory is expected at ``/userdata/models/Qwen3-TTS/`` (override
+        the root with the ``RKAI_MODELS_DIR`` environment variable). The TTS
+        backend derives the four ``<role>.1828.rknn`` / ``<role>.weight`` paths
+        from that directory at construction time.
+        """
+        return ModelSpec(
+            name="qwen3-tts",
+            kind="tts",
+            variant="qwen3-tts",
+            target="rk1820",
+            core_mask=0xFF,
+            tts_model_dir=str(_models_root() / "Qwen3-TTS"),
+        )
