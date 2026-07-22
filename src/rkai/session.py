@@ -80,7 +80,6 @@ class LLMSession:
         generating: Optional[Type[T]] = None,
         debug: bool = False,
         tools: Optional[List[Any]] = None,
-        to: Optional[str] = None,
         perf: bool = False,
         **overrides: Any,
     ) -> Any:
@@ -118,11 +117,6 @@ class LLMSession:
           instance is returned. The caller picks the branch via
           ``isinstance``.
         """
-        # Apple Foundation Models' style: ``to="..."`` is an alias for
-        # ``prompt="..."``. Accept both for convenience.
-        if to is not None and prompt is None:
-            prompt = to
-
         attachments = self._coerce_attachments(attachment)
 
         # ``tools=`` is a list of ``@Callable`` classes. Validate up

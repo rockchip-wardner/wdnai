@@ -362,21 +362,21 @@ def test_session_respond_full_flow():
     async def run():
         sess = LLMSession(model=spec)
         # 1) 纯文本
-        out1 = await sess.respond(to="请介绍 RK 芯片")
+        out1 = await sess.respond(prompt="请介绍 RK 芯片")
         assert isinstance(out1, str) and out1
         print("[session] text respond ->", repr(out1))
 
         # 2) 图像
         img = np.zeros((480, 640, 3), dtype=np.uint8)
         out2 = await sess.respond(
-            to="请分析这张图的行为", attachment=Attachment(img),
+            prompt="请分析这张图的行为", attachment=Attachment(img),
         )
         assert isinstance(out2, str) and out2
         print("[session] image respond ->", repr(out2))
 
         # 3) 图像 + 结构化输出（注入 JSON hint + 解析）
         out3 = await sess.respond(
-            to="请分析这张图的行为",
+            prompt="请分析这张图的行为",
             attachment=Attachment(img),
             generating=Event,
         )
