@@ -345,6 +345,7 @@ class TTSBackend:
                 instruct="", non_streaming_mode=False,
                 play=True, volume=0.5, audio_device=None,
                 stop_event=None, on_step=None,
+                on_audio_chunk=None,
             ):
                 self.load_resources()
                 self.init_text_projection()
@@ -364,6 +365,7 @@ class TTSBackend:
                     )
                     audio = self._run_talker_streaming_with_progress(
                         prefill, stop_event=stop_event, on_step=on_step,
+                        on_audio_chunk=on_audio_chunk,
                     )
                     if audio.size == 0:
                         pass
@@ -376,7 +378,7 @@ class TTSBackend:
                         self.audio_player = None
                     self.release()
 
-            def _run_talker_streaming_with_progress(self, prefill_embeds, stop_event=None, on_step=None):
+            def _run_talker_streaming_with_progress(self, prefill_embeds, stop_event=None, on_step=None, on_audio_chunk=None):
                 import queue as _q
                 import numpy as _np
                 import threading as _threading
@@ -412,6 +414,11 @@ class TTSBackend:
                             self._streamed_audio.append(audio)
                             if self.audio_player is not None:
                                 self.audio_player.play_chunk(audio)
+                            if on_audio_chunk is not None:
+                                try:
+                                    on_audio_chunk(audio, kSampleRate)
+                                except Exception:
+                                    pass
                         if on_step is not None:
                             on_step(len(self.collected_codes),
                                     sum(a.size for a in self._streamed_audio) / _sr)
@@ -435,6 +442,11 @@ class TTSBackend:
                             self._streamed_audio.append(audio)
                             if self.audio_player is not None:
                                 self.audio_player.play_chunk(audio)
+                            if on_audio_chunk is not None:
+                                try:
+                                    on_audio_chunk(audio, kSampleRate)
+                                except Exception:
+                                    pass
                         if on_step is not None:
                             on_step(len(self.collected_codes),
                                     sum(a.size for a in self._streamed_audio) / _sr)
@@ -489,6 +501,7 @@ class TTSBackend:
             non_streaming = bool(overrides.get("non_streaming_mode", False))
             stop_event = overrides.get("stop_event", None)
             on_step = overrides.get("on_step", None)
+            on_audio_chunk = overrides.get("on_audio_chunk", None)
 
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fp:
                 tmp_path = fp.name
@@ -500,6 +513,7 @@ class TTSBackend:
                     instruct=instruct, non_streaming_mode=non_streaming,
                     play=not no_play, volume=volume, audio_device=None,
                     stop_event=stop_event, on_step=on_step,
+                    on_audio_chunk=on_audio_chunk,
                 )
                 if audio is None or audio.size == 0:
                     raise RuntimeError("TTS produced no audio")
