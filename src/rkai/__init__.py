@@ -20,7 +20,8 @@ Quick start (Qwen3-VL image):
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, Field  # noqa: F401  re-exported
+from pydantic import *  # noqa: F401  re-exported
+from typing import *
 
 from ._callable import Callable
 from ._generable import Generable
