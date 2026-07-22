@@ -57,7 +57,7 @@ async def main():
     model = SystemLanguageModel.qwen3_vl_4b()
     session = LLMSession(model=model)
     try:
-        msg = (
+        prompt = (
             "这是一张公共场所内的图片，请检查出是否有人在车厢内"
             "做出危险行为，或者摔倒等异常情况"
         )
@@ -67,7 +67,7 @@ async def main():
             # call doesn't see the previous turn's state.
             session.reset()
             result = await session.respond(
-                msg=msg,
+                prompt=prompt,
                 attachment=[Attachment(img)],
                 generating=Event,
                 tools=[alarm],

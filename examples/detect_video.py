@@ -97,7 +97,7 @@ async def main() -> None:
                 # reset() 清空 history + C 库 KV cache，避免上一轮状态污染下一轮
                 session.reset()
                 result = await session.respond(
-                    msg=PROMPT,
+                    prompt=PROMPT,
                     attachment=Attachment(frame),
                     generating=Event,
                 )

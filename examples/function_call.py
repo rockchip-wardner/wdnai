@@ -80,13 +80,13 @@ async def main(image: Path) -> None:
     model = SystemLanguageModel.qwen3_vl_4b()
     session = LLMSession(model=model)
     try:
-        msg = (
+        prompt = (
             "这是一张公共场所内的图片，如果发现火灾、人员摔倒、"
             "打架等异常情况，请调用对应工具"
         )
         session.reset()
         result = await session.respond(
-            msg=msg,
+            prompt=prompt,
             attachment=[Attachment(img)],
             tools=[Alarm, Notify],   # both tools available
             generating=Event,        # model may emit Event JSON instead

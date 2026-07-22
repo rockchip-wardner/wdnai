@@ -33,7 +33,7 @@ class LLMSession:
             tokenizer_path=..., embed_path=...,
         )
         async with LLMSession(model=model) as sess:
-            out = await sess.respond(msg="...", attachment=[Attachment(img)])
+            out = await sess.respond(prompt="...", attachment=[Attachment(img)])
 
     ``attachment`` is now a **list** of :class:`Attachment` (or a single
     ``Attachment`` for backward compat). This lets one session take in
@@ -75,7 +75,7 @@ class LLMSession:
     # ------------------------------------------------------------------ #
     async def respond(
         self,
-        msg: Optional[str] = None,
+        prompt: Optional[str] = None,
         attachment: Union[None, Attachment, List[Attachment]] = None,
         generating: Optional[Type[T]] = None,
         debug: bool = False,
@@ -96,9 +96,10 @@ class LLMSession:
           instance of the class. ``LMOutput`` subclasses additionally
           have ``attachment`` populated from any output attachments
           the backend produced.
-          - ``debug=True`` — additionally prints ``msg``, the actual
-          ``prompt`` sent to the LLM, the raw model output, the parsed
-          result, and the backend perf table.
+          - ``debug=True`` — additionally prints the raw user input
+          (``prompt=``), the actual ``full_prompt`` sent to the LLM,
+          the raw model output, the parsed result, and the backend
+          perf table.
           - ``perf=True`` — print the backend perf table (Prefill /
           Generate / vision / total latency + FPS). Default ``False``;
           the data is still recorded on ``session._backend.sink.perf``
@@ -118,9 +119,9 @@ class LLMSession:
           ``isinstance``.
         """
         # Apple Foundation Models' style: ``to="..."`` is an alias for
-        # ``msg="..."``. Accept both for convenience.
-        if to is not None and msg is None:
-            msg = to
+        # ``prompt="..."``. Accept both for convenience.
+        if to is not None and prompt is None:
+            prompt = to
 
         attachments = self._coerce_attachments(attachment)
 
@@ -132,13 +133,13 @@ class LLMSession:
         # perf-table printout when the caller doesn't want it.
         overrides.setdefault("perf", perf)
 
-        prompt = self._compose_prompt(msg, generating, tool_specs)
+        full_prompt = self._compose_prompt(prompt, generating, tool_specs)
         if debug:
-            print(f"[rkai.debug] msg    = {msg!r}")
-            print(f"[rkai.debug] prompt = {prompt!r}")
+            print(f"[rkai.debug] prompt      = {prompt!r}")
+            print(f"[rkai.debug] full_prompt = {full_prompt!r}")
             print(f"[rkai.debug] attachments={[a.to_payload() for a in attachments]}")
             print(f"[rkai.debug] tools  = {tool_specs}")
-        text, attachments_out = self._dispatch(prompt, attachments, **overrides)
+        text, attachments_out = self._dispatch(full_prompt, attachments, **overrides)
 
         if debug:
             print(f"[rkai.debug] raw    = {text!r}")
@@ -147,7 +148,7 @@ class LLMSession:
                 print(f"[rkai.debug] perf   = {sink.perf}")
 
         # Maintain history
-        self.history.append({"role": "user", "content": msg or ""})
+        self.history.append({"role": "user", "content": prompt or ""})
         self.history.append({"role": "assistant", "content": text})
 
         # Output classification — passive, the caller decides what to do:
@@ -252,7 +253,7 @@ class LLMSession:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _compose_prompt(
-        msg: Optional[str],
+        prompt: Optional[str],
         generating: Optional[Type[T]],
         tool_specs: List[Dict[str, Any]],
     ) -> str:
@@ -264,8 +265,9 @@ class LLMSession:
         the structured payload. The output-classification step in
         ``respond()`` decides which one the model picked.
         """
-        base = (msg or "").rstrip()
+        base = (prompt or "").rstrip()
         sections: List[str] = [base] if base else []
+
 
         if tool_specs and generating is not None:
             # Both ways of responding are available — put a clear
@@ -306,7 +308,7 @@ class LLMSession:
         if not schema_text:
             return user_msg
         sep = "\n\n" if user_msg else ""
-        # When msg is empty, give the model a default task so it doesn't "do nothing"
+        # When prompt is empty, give the model a default task so it doesn't "do nothing"
         default_task = (
                 "Please carefully observe the behavior of people in the image, "
                 "describe it according to the JSON Schema below, and assign a safety level. "
