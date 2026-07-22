@@ -39,8 +39,6 @@ import argparse
 import io
 import logging
 import struct
-import subprocess
-import sys
 from pathlib import Path
 from typing import List
 
@@ -94,8 +92,6 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
                    help="播放音量 0.0 ~ 1.0（线性缩放 PCM 幅度，默认 0.1）")
     p.add_argument("--no-play", action="store_true",
                    help="只落盘 wav，不出声")
-    p.add_argument("--audio-device", default=None,
-                   help="ALSA / sounddevice device 标识（None = 自动挑 onboard 跳过 HDMI）")
     p.add_argument("--output", "-o", type=Path, default=Path("output.wav"),
                    help="输出 WAV 文件路径")
     p.add_argument("--model-dir", type=Path, default=None,
@@ -107,7 +103,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
 
 
 # --------------------------------------------------------------------------- #
-# Post-processing: WAV duration + live playback
+# Post-processing: WAV duration + volume scaling
 # --------------------------------------------------------------------------- #
 def _wav_duration_seconds(wav_bytes: bytes) -> float:
     """Decode audio duration from a RIFF/WAVE header.
@@ -192,96 +188,6 @@ def _apply_volume_to_wav(wav_bytes, volume):
     return bytes(out)
 
 
-def _strip_wav_header(wav_bytes: bytes) -> tuple:
-    """Return (raw_float32_le_pcm_bytes, sample_rate, num_channels) from a WAV blob."""
-    bio = io.BytesIO(wav_bytes)
-    # RIFF/WAVE layout: "RIFF" (4) + size (4) + "WAVE" (4) + chunks.
-    # Read 12 bytes at once so the second 4-byte compare lands on
-    # "WAVE" instead of the (also-4-byte) file size field.
-    head = bio.read(12)
-    if head[:4] != b"RIFF" or head[8:12] != b"WAVE":
-        raise ValueError("not a RIFF/WAVE file")
-    sample_rate = 24000
-    num_channels = 1
-    data_offset = 0
-    data_size = 0
-    while True:
-        h = bio.read(8)
-        if len(h) < 8:
-            break
-        cid, csize = h[:4], struct.unpack("<I", h[4:8])[0]
-        cdata = bio.read(csize)
-        if cid == b"fmt ":
-            _fmt, num_channels, sample_rate, _br, _ba, _bits = struct.unpack(
-                "<HHIIHH", cdata[:16])
-        elif cid == b"data":
-            data_offset = bio.tell() - len(cdata)
-            data_size = csize
-            break
-        if csize % 2:
-            bio.read(1)
-    pcm = wav_bytes[data_offset:data_offset + data_size]
-    return pcm, sample_rate, num_channels
-
-
-def _live_playback(
-    wav_bytes: bytes,
-    volume: float,
-    no_play: bool,
-    device: str | None = None,
-) -> None:
-    """Best-effort live playback. Tries sounddevice first (lower latency),
-    falls back to spawning ``aplay`` (always available on ALSA boards).
-
-    Volume is applied as a linear amplitude scale on the decoded
-    float32 PCM, matching the upstream ``AudioPlayer`` semantics.
-    """
-    if no_play:
-        return
-    pcm, sample_rate, num_channels = _strip_wav_header(wav_bytes)
-    if volume != 1.0:
-        floats = np.frombuffer(pcm, dtype=np.float32).copy()
-        floats = np.clip(floats * volume, -1.0, 1.0)
-        pcm = floats.tobytes()
-
-    # sounddevice path
-    try:
-        import sounddevice as sd
-        sd.play(pcm, samplerate=sample_rate, channels=num_channels, blocking=False)
-        LOG.info("[live-playback] sounddevice streaming %d samples (%.2fs)",
-                 len(pcm) // 4, len(pcm) / 4 / sample_rate)
-        return
-    except Exception as exc:
-        LOG.info("[live-playback] sounddevice unavailable (%s); using aplay", exc)
-
-    # aplay fallback. Pipe the float32 PCM straight in (matches the SDK
-    # upstream ``AudioPlayer`` and the saved WAV's IEEE-float format).
-    # S24_LE also works mathematically but renders as noise on this
-    # board's plughw:1,0, so we don't go there.
-    try:
-        if device is None:
-            device = "plughw:1,0"
-        proc = subprocess.Popen(
-            [
-                "aplay", "-q", "-t", "raw", "-f", "FLOAT_LE",
-                "-r", str(sample_rate), "-c", str(num_channels),
-                "-D", device, "-",
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        proc.stdin.write(pcm)
-        proc.stdin.flush()
-        proc.stdin.close()
-        try:
-            proc.wait(timeout=30)
-        except Exception:
-            proc.kill()
-    except FileNotFoundError:
-        LOG.warning("aplay not available; live playback skipped")
-
-
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -311,7 +217,6 @@ async def main() -> None:
             volume=args.volume,
             no_play=args.no_play,
             non_streaming_mode=bool(args.non_streaming_mode),
-            audio_device=args.audio_device,
         )
 
         atts = list(getattr(result, "attachment", []) or [])

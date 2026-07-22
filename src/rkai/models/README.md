@@ -66,8 +66,12 @@ add a preset + path helper in [rkai/model.py](../model.py).
 The full Qwen3-TTS pipeline runs four RKNN3 models on the same RK1828
 PCIe card as the VLM. Used by pyrkaiweb's `#page-tts` (the
 Qwen3-TTS model itself is loaded via `TTSBackend` in `rkai/backends/tts.py`,
-which wraps the upstream `Qwen3TTSDemo` shipped with
-`rknn3-toolkit-lite/examples/Qwen3-TTS/qwen3_tts_demo.py`.
+which wraps the in-tree `Qwen3TTSDriver` vendored into the same
+`rkai/backends/tts.py` module). The driver used to live in
+`rknn3-toolkit-lite/examples/Qwen3-TTS/qwen3_tts_demo.py` and was
+imported at runtime via `sys.path` injection; it has since been
+ported into the SDK so `import rkai.backends.tts` no longer needs
+to find the upstream demo anywhere on disk.
 
 | #  | File (`<root>/Qwen3-TTS/…`)            | Purpose                                              | core_mask         |
 | -- | -------------------------------------- | ---------------------------------------------------- | ----------------- |
