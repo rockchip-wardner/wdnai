@@ -223,7 +223,22 @@ def printf_perf(sink: StreamSink, vision_latency: Optional[float] = None) -> Non
     print(" %-12s  %-15.2f  %-8d  %-23.2f  %-23.2f" %
           ("Generate", decode_ms, decode_n, decode_tpt, decode_tps))
     print("--------------------------------------------------------------------------------------")
+    # Combined LLM-only latency (prefill + decode). Excludes vision
+    # preprocessing so it stays comparable across text-only and VLM
+    # backends.
+    llm_ms = prefill_ms + decode_ms
+    print(f" LLM latency = {llm_ms:.2f} ms")
     if vision_latency is not None:
-        ms = vision_latency * 1000
-        fps = 1.0 / vision_latency if vision_latency > 0 else 0.0
-        print(f" Vision latency = {ms:.2f} ms, FPS = {fps:.2f}")
+        # ``vision_latency`` measures only vision preprocessing +
+        # vision inference — the LLM portion is reported above. The
+        # end-to-end FPS combines both and reflects the real
+        # per-frame throughput.
+        vision_ms = vision_latency * 1000.0
+        print(f" Vision latency = {vision_ms:.2f} ms")
+        total_sec = vision_latency + llm_ms / 1000.0
+        if total_sec > 0:
+            print(f" Total latency = {total_sec * 1000.0:.2f} ms, FPS = {1.0 / total_sec:.2f}")
+    else:
+        total_sec = llm_ms / 1000.0
+        if total_sec > 0:
+            print(f" Total latency = {total_sec * 1000.0:.2f} ms, FPS = {1.0 / total_sec:.2f}")

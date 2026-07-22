@@ -223,7 +223,8 @@ class VLMBackend:
                 "prefill_ms": (self.sink.first_token_time - llm_start) * 1000.0,
                 "decode_ms": (llm_end - self.sink.first_token_time) * 1000.0,
             })
-        printf_perf(self.sink, vision_latency=vision_latency)
+        if overrides.get("perf", False):
+            printf_perf(self.sink, vision_latency=vision_latency)
         return self.sink.text
 
     # ------------------------------------------------------------------ #

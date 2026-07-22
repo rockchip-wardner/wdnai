@@ -71,10 +71,12 @@ class TextBackend:
                 "prefill_ms": (self.sink.first_token_time - llm_start) * 1000.0,
                 "decode_ms": (llm_end - self.sink.first_token_time) * 1000.0,
             })
-            printf_perf(self.sink)
+            if overrides.get("perf", False):
+                printf_perf(self.sink)
         else:  # pragma: no cover
-            print(f"[TextBackend] total {(time.perf_counter() - t0) * 1000:.1f} ms, "
-                  f"prefill={n_prefill} decode={n_decode}")
+            if overrides.get("perf", False):
+                print(f"[TextBackend] total {(time.perf_counter() - t0) * 1000:.1f} ms, "
+                      f"prefill={n_prefill} decode={n_decode}")
         return self.sink.text
 
     # ------------------------------------------------------------------ #

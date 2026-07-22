@@ -3,10 +3,17 @@ supports structured output (``LMOutput`` subclasses + plain ``@Generable``
 classes alike)."""
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 from pydantic import BaseModel
 
+from ._callable import (
+    dispatch_tool_call,
+    get_tool_specs,
+    render_tools_block,
+    try_parse_tool_call,
+)
 from .attachment import Attachment
 from .backends import build_backend
 from .lm_output import LMOutput
@@ -74,8 +81,9 @@ class LLMSession:
         debug: bool = False,
         tools: Optional[List[Any]] = None,
         to: Optional[str] = None,
+        perf: bool = False,
         **overrides: Any,
-    ) -> Union[str, T, Dict[str, Any]]:
+    ) -> Any:
         """Fire one request and return the result.
 
         - ``attachment`` — list (or single) of :class:`Attachment`. Any
@@ -88,16 +96,27 @@ class LLMSession:
           instance of the class. ``LMOutput`` subclasses additionally
           have ``attachment`` populated from any output attachments
           the backend produced.
-        - ``debug=True`` — additionally prints ``msg``, the actual
+          - ``debug=True`` — additionally prints ``msg``, the actual
           ``prompt`` sent to the LLM, the raw model output, the parsed
           result, and the backend perf table.
-        - ``tools`` — a list of completion callbacks (a ``@Callable``-
-          marked function or any 1-arg callable): invoked in order
-          after a successful parse, with the parse result as the
-          argument. Both sync and async callbacks are supported.
+          - ``perf=True`` — print the backend perf table (Prefill /
+          Generate / vision / total latency + FPS). Default ``False``;
+          the data is still recorded on ``session._backend.sink.perf``
+          even when the table is suppressed.
+        - ``tools`` — a list of ``@Callable``-decorated classes. Each
+          class's field schema is serialised into a JSON tool
+          definition and appended to the prompt. When the model emits
+          a tool-call JSON (``{"name": ..., "arguments": ...}``), a
+          *populated instance* of the matching ``@Callable`` class is
+          returned to the caller. The SDK does NOT auto-invoke —
+          ``isinstance(result, AlarmCls)`` identifies which tool the
+          model picked, and ``result()`` triggers the side effect on
+          the developer-defined ``__call__``. When ``generating=`` is
+          also supplied, the model may instead respond with the
+          structured payload — in that case the parsed ``generating=``
+          instance is returned. The caller picks the branch via
+          ``isinstance``.
         """
-        import inspect
-
         # Apple Foundation Models' style: ``to="..."`` is an alias for
         # ``msg="..."``. Accept both for convenience.
         if to is not None and msg is None:
@@ -105,11 +124,20 @@ class LLMSession:
 
         attachments = self._coerce_attachments(attachment)
 
-        prompt = self._maybe_inject_json_hint(msg, generating)
+        # ``tools=`` is a list of ``@Callable`` classes. Validate up
+        # front so a non-decorated entry fails before we burn an
+        # inference cycle.
+        tool_specs: List[Dict[str, Any]] = get_tool_specs(tools) if tools else []
+        # Forward the perf flag to the backend so it can suppress the
+        # perf-table printout when the caller doesn't want it.
+        overrides.setdefault("perf", perf)
+
+        prompt = self._compose_prompt(msg, generating, tool_specs)
         if debug:
             print(f"[rkai.debug] msg    = {msg!r}")
             print(f"[rkai.debug] prompt = {prompt!r}")
             print(f"[rkai.debug] attachments={[a.to_payload() for a in attachments]}")
+            print(f"[rkai.debug] tools  = {tool_specs}")
         text, attachments_out = self._dispatch(prompt, attachments, **overrides)
 
         if debug:
@@ -122,18 +150,40 @@ class LLMSession:
         self.history.append({"role": "user", "content": msg or ""})
         self.history.append({"role": "assistant", "content": text})
 
+        # Output classification — passive, the caller decides what to do:
+        #
+        # 1. If ``tools=[…]`` was passed AND the model emitted a
+        #    tool-call JSON (``{"name": ..., "arguments": ...}``),
+        #    return a populated instance of the matching ``@Callable``
+        #    class (so ``isinstance(result, Alarm)`` discriminates
+        #    between multiple tools). The SDK does NOT auto-invoke;
+        #    the user calls ``result()`` (or any other method) to
+        #    trigger side effects.
+        # 2. Otherwise run the regular parse path, which honours
+        #    ``generating=…`` (returns the parsed instance) or falls
+        #    back to the raw text when no schema was supplied.
+        #
+        # The two branches coexist: the model picks one or the other
+        # depending on its prompt, and the caller inspects ``result``
+        # to decide what to do.
+        if tools and tool_specs:
+            tool_call = try_parse_tool_call(text)
+            if tool_call is not None:
+                name, arguments = tool_call
+                instance = dispatch_tool_call(tools, name, arguments)
+                if instance is not None:
+                    if debug:
+                        print(f"[rkai.debug] tool_call -> {instance!r}")
+                    return instance
+                if debug:
+                    print(f"[rkai.debug] tool_call: no @Callable named {name!r} "
+                          f"(or args failed validation)")
+
         result = self._parse_output(
             text, generating=generating, attachments_out=attachments_out,
         )
         if debug:
             print(f"[rkai.debug] parsed = {result!r}")
-
-        # Completion callbacks (invoked in order; sync / async both supported)
-        if tools:
-            for tool in tools:
-                ret = tool(result)
-                if inspect.iscoroutine(ret):
-                    await ret
         return result
 
     # ------------------------------------------------------------------ #
@@ -201,24 +251,59 @@ class LLMSession:
     # JSON prompt injection
     # ------------------------------------------------------------------ #
     @staticmethod
+    def _compose_prompt(
+        msg: Optional[str],
+        generating: Optional[Type[T]],
+        tool_specs: List[Dict[str, Any]],
+    ) -> str:
+        """Build the final prompt from the user message, the optional
+        ``generating=`` schema hint, and the optional tool block.
+
+        When ``tools=[…]`` and ``generating=…`` are both supplied, the
+        model is told to pick exactly one: either call a tool OR emit
+        the structured payload. The output-classification step in
+        ``respond()`` decides which one the model picked.
+        """
+        base = (msg or "").rstrip()
+        sections: List[str] = [base] if base else []
+
+        if tool_specs and generating is not None:
+            # Both ways of responding are available — put a clear
+            # "pick one" instruction up top so the model doesn't
+            # silently default to whichever format has the strongest
+            # tail instruction.
+            schema = _safe_schema(generating)
+            choice_block = (
+                "# Response format\n"
+                "Pick **exactly one** of the following two ways. "
+                "Do NOT output both. Do NOT include any explanation.\n\n"
+                "**Option A — Call a tool.** Output ONLY this JSON:\n"
+                "```json\n"
+                "{\"name\": \"<tool_name>\", \"arguments\": {<arguments matching the tool's parameters>}}\n"
+                "```\n\n"
+                "**Option B — Structured response.** Output ONLY a JSON "
+                "object matching this schema:\n"
+                "```json\n"
+                f"{schema}\n"
+                "```\n"
+            )
+            sections.append(choice_block)
+            sections.append(render_tools_block(tool_specs))
+        else:
+            if tool_specs:
+                sections.append(render_tools_block(tool_specs))
+            if generating is not None:
+                sections.append(LLMSession._maybe_inject_json_hint("", generating))
+
+        return "\n\n".join(s for s in sections if s)
+
+    @staticmethod
     def _maybe_inject_json_hint(prompt: Optional[str], generating: Optional[Type[T]]) -> str:
         if generating is None:
             return prompt or ""
         user_msg = (prompt or "").rstrip()
-        # Generate the JSON schema for the prompt hint. If this fails
-        # (e.g. ``generating`` carries an ``Attachment`` field — a
-        # non-pydantic class — pydantic refuses to produce a JSON
-        # schema for it), fall back to no hint. That's fine for
-        # audio / multimodal output where the model doesn't emit JSON.
-        try:
-            schema = (
-                generating.schema()
-                if hasattr(generating, "schema")
-                else generating.__doc__
-            )
-        except Exception:
-            return user_msg
-        if not schema:
+        schema_text = _safe_schema(generating)
+        if not schema_text:
             return user_msg
         sep = "\n\n" if user_msg else ""
         # When msg is empty, give the model a default task so it doesn't "do nothing"
@@ -233,7 +318,7 @@ class LLMSession:
         return (
             f"{user_msg}{sep}"
             f"{default_task}\n"
-            f"```json\n{schema}\n```"
+            f"```json\n{schema_text}\n```"
         )
 
     @staticmethod
@@ -390,6 +475,34 @@ class LLMSession:
 # Compatibility shim: pydantic v1 uses parse_obj / parse_raw, v2 uses
 # model_validate / model_validate_json
 # --------------------------------------------------------------------------- #
+def _safe_schema(generating: Optional[Type[T]]) -> str:
+    """Render ``generating`` as a JSON Schema string. Falls back to an
+    empty string when the class can't produce a schema (e.g. it carries
+    a non-pydantic ``attachment`` field). Used in the dual-mode
+    prompt composer; never raises.
+    """
+    if generating is None:
+        return ""
+    try:
+        schema = (
+            generating.model_json_schema()
+            if hasattr(generating, "model_json_schema")
+            else (
+                generating.schema()
+                if hasattr(generating, "schema")
+                else None
+            )
+        )
+    except Exception:
+        return ""
+    if not schema:
+        return ""
+    try:
+        return json.dumps(schema, indent=2, ensure_ascii=False)
+    except Exception:
+        return str(schema)
+
+
 def _model_validate(model: Type[T], data: Dict[str, Any]) -> T:
     validator = getattr(model, "model_validate", None) or getattr(model, "parse_obj", None)
     if validator is None:  # pragma: no cover
