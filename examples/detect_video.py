@@ -51,10 +51,6 @@ def parse_args() -> argparse.Namespace:
         "--no-display", action="store_true",
         help="无显示环境时使用：不调用 cv2.imshow",
     )
-    p.add_argument(
-        "--no-rga", action="store_true",
-        help="禁用 RGA 硬件色彩转换（遇 RK3588 等机型上 RGA 段错误时使用）",
-    )
     return p.parse_args()
 
 
@@ -65,11 +61,18 @@ async def main() -> None:
     if not video_path.is_file():
         raise FileNotFoundError(f"视频文件不存在: {video_path}")
 
+    if rkv.VideoCapture is None:
+        raise RuntimeError(
+            "rkv.VideoCapture 不可用：rkv.video 模块加载失败（多半是 "
+            "librockchip_mpp.so.0 缺符号或 librockchip-mpp / librga 没装）。"
+            "在装了原生库的环境上再跑这个脚本。"
+        )
+
     # 模型文件需要在 /userdata/models/Qwen3-VL-4B/ 下（可用 RKAI_MODELS_DIR 覆盖）
     model = SystemLanguageModel.qwen3_vl_4b()
     session = LLMSession(model=model)
 
-    cap = rkv.VideoCapture(str(video_path), use_rga=not args.no_rga)
+    cap = rkv.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频: {video_path}")
     print(
