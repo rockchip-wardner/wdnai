@@ -137,7 +137,7 @@ async def _run_detect_once(session, prompt, frame, schema):
     """Run a single detect-mode VLM call on a copy of frame."""
     session.reset()
     return await session.respond(
-        msg=prompt,
+        prompt=prompt,
         attachment=Attachment(frame),
         generating=schema,
     )
@@ -146,7 +146,7 @@ async def _run_detect_once(session, prompt, frame, schema):
 async def _run_ocr_once(session, roi):
     """Run a single OCR-mode VLM call on a copy of roi."""
     return await session.respond(
-        msg=build_ocr_prompt(),
+        prompt=build_ocr_prompt(),
         attachment=Attachment(roi),
         generating=PlateOCR,
     )
