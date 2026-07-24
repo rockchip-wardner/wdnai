@@ -260,6 +260,7 @@ class LLMSession:
         ``respond()`` decides which one the model picked.
         """
         base = (prompt or "").rstrip()
+        has_user_prompt = bool(base)
         sections: List[str] = [base] if base else []
 
 
@@ -289,7 +290,18 @@ class LLMSession:
             if tool_specs:
                 sections.append(render_tools_block(tool_specs))
             if generating is not None:
-                sections.append(LLMSession._maybe_inject_json_hint("", generating))
+                # The schema hint is appended as its own section. The
+                # choice of default_task must be made here, NOT inside
+                # ``_maybe_inject_json_hint`` (which only knows about
+                # the prompt it was passed).  When the caller has
+                # already supplied a user message in ``sections[0]``,
+                # we use the "strictly follow" branch; otherwise we
+                # fall back to the placeholder prompt that nudges the
+                # model toward a "people / safety" structured output
+                # (the original behaviour of the no-user-prompt path).
+                hint = LLMSession._schema_hint_section(generating, has_user_prompt)
+                if hint:
+                    sections.append(hint)
 
         return "\n\n".join(s for s in sections if s)
 
@@ -302,20 +314,49 @@ class LLMSession:
         if not schema_text:
             return user_msg
         sep = "\n\n" if user_msg else ""
-        # When prompt is empty, give the model a default task so it doesn't "do nothing"
+        hint = LLMSession._schema_hint_section(generating, has_user_prompt=bool(user_msg))
+        if not hint:
+            return user_msg
+        return f"{user_msg}{sep}{hint}"
+
+    @staticmethod
+    def _schema_hint_section(generating: Optional[Type[T]], has_user_prompt: bool) -> str:
+        """Build the JSON-Schema hint block (default task instruction +
+        fenced JSON schema). Returns "" when ``generating`` carries no
+        schema.  When the caller has already supplied a user message the
+        hint uses the concise "strictly follow" instruction; otherwise it
+        uses the placeholder prompt that nudges the model toward a
+        "people / safety" structured output.
+
+        Note: the schema is rendered as the Python ``repr`` of the
+        pydantic v1 / v2 schema dict (single line, single-quoted keys,
+        Python-native types like ``str`` / ``dict``), matching the
+        legacy ``_maybe_inject_json_hint`` behaviour from 141ee17.
+        ``json.dumps(..., indent=2)`` was tried here and produced
+        different model output for the same image — the LLM is
+        sensitive to schema formatting; we keep the legacy shape.
+        """
+        if generating is None:
+            return ""
+        # Use the same rendering path as the legacy 141ee17 helper:
+        # ``generating.schema()`` on pydantic v1 returns a dict, and
+        # f"…{schema}…" interpolates it via ``str(dict)`` which is
+        # the same as ``repr(dict)`` for plain-dict content.
+        # ``_safe_schema`` already normalises both pydantic v1 and v2
+        # to the same dict, so this single call works across versions.
+        schema_text = _safe_schema(generating)
+        if not schema_text:
+            return ""
         default_task = (
+            "Please strictly follow the JSON Schema below to return the result. "
+            "**Output JSON only, no other text**:"
+            if has_user_prompt
+            else
                 "Please carefully observe the behavior of people in the image, "
                 "describe it according to the JSON Schema below, and assign a safety level. "
                 "**Output JSON only, no other text**:"
-                if not user_msg
-                else "Please strictly follow the JSON Schema below to return the result. "
-                     "**Output JSON only, no other text**:"
-            )
-        return (
-            f"{user_msg}{sep}"
-            f"{default_task}\n"
-            f"```json\n{schema_text}\n```"
         )
+        return f"{default_task}\n```json\n{schema_text}\n```"
 
     @staticmethod
     def _parse_output(
@@ -472,10 +513,19 @@ class LLMSession:
 # model_validate / model_validate_json
 # --------------------------------------------------------------------------- #
 def _safe_schema(generating: Optional[Type[T]]) -> str:
-    """Render ``generating`` as a JSON Schema string. Falls back to an
-    empty string when the class can't produce a schema (e.g. it carries
-    a non-pydantic ``attachment`` field). Used in the dual-mode
-    prompt composer; never raises.
+    """Render ``generating``'s pydantic schema as a string for use in
+    the JSON-Schema hint block. Falls back to an empty string when
+    the class can't produce a schema (e.g. it carries a non-pydantic
+    ``attachment`` field). Never raises.
+
+    The rendering is the Python ``str(dict)`` of the schema — i.e.
+    single line, single-quoted keys, Python-native type names like
+    ``str`` / ``dict``. This matches the legacy ``_maybe_inject_json_hint``
+    helper from 141ee17 exactly (``f"{user_msg}\n\n{default_task}\\n
+    ```json\\n{schema}\\n```"`` with ``schema`` interpolated as a
+    dict). The Qwen3-VL model is sensitive to schema formatting —
+    ``json.dumps(..., indent=2)`` was tried here and produced visibly
+    different output for the same image, so we keep the legacy shape.
     """
     if generating is None:
         return ""
@@ -494,9 +544,9 @@ def _safe_schema(generating: Optional[Type[T]]) -> str:
     if not schema:
         return ""
     try:
-        return json.dumps(schema, indent=2, ensure_ascii=False)
-    except Exception:
         return str(schema)
+    except Exception:
+        return ""
 
 
 def _model_validate(model: Type[T], data: Dict[str, Any]) -> T:
