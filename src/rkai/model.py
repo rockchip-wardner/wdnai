@@ -228,9 +228,10 @@ def _qwen3vl_4b_spec(**overrides) -> ModelSpec:
 # Predefined paths: Qwen3-VL-4B lives at a fixed on-device location
 # (``/userdata/models/Qwen3-VL-4B/``). No network access is performed at any
 # point — the user is expected to place the files there manually.
-# Override the root with the ``RKAI_MODELS_DIR`` environment variable.
+# Override the directory directly via the ``RKAI_QWEN3_VL_4B_DIR`` env var
+# (intended for debugging; e.g. pointing at an ad-hoc export tree).
 # --------------------------------------------------------------------------- #
-_QWEN3_VL_4B_DIR_NAME = "Qwen3-VL-4B"
+_QWEN3_VL_4B_DIR_DEFAULT = "/userdata/models/Qwen3-VL-4B"
 _QWEN3_VL_4B_REQUIRED = (
     "llm_Qwen3-VL-4B.1828.rknn",
     "llm_Qwen3-VL-4B.weight",
@@ -247,11 +248,16 @@ def _models_root() -> Path:
 
 
 def _qwen3_vl_4b_dir() -> Path:
-    return _models_root() / _QWEN3_VL_4B_DIR_NAME
+    """Resolve the Qwen3-VL-4B model directory.
+
+    Override via the ``RKAI_QWEN3_VL_4B_DIR`` env var (full path);
+    default ``/userdata/models/Qwen3-VL-4B``.
+    """
+    return Path(_os.environ.get("RKAI_QWEN3_VL_4B_DIR", _QWEN3_VL_4B_DIR_DEFAULT))
 
 
 def _default_qwen3_vl_4b_paths() -> dict:
-    """Return absolute paths to the Qwen3-VL-4B files under the fixed models root."""
+    """Return absolute paths to the Qwen3-VL-4B files under the resolved directory."""
     d = _qwen3_vl_4b_dir()
     return {
         "rknn_llm_path":   str(d / "llm_Qwen3-VL-4B.1828.rknn"),
@@ -268,7 +274,7 @@ def _verify_qwen3_vl_4b_files() -> None:
     if missing:
         raise FileNotFoundError(
             f"Qwen3-VL-4B files missing under {d}: {missing}. "
-            f"Place the files there or set RKAI_MODELS_DIR to override the root."
+            f"Place the files there or set RKAI_QWEN3_VL_4B_DIR to point at a custom path."
         )
 
 
@@ -289,7 +295,7 @@ class SystemLanguageModel:
     - ``qwen3_vl_4b_template()`` — Qwen3-VL-4B template (no default paths)
     - ``qwen3_vl_4b()``          — Qwen3-VL-4B bound to ``/userdata/models/Qwen3-VL-4B``
                                     (the user is expected to place the files there;
-                                     override the root with ``RKAI_MODELS_DIR``)
+                                     override the path with ``RKAI_QWEN3_VL_4B_DIR``)
     - ``qwen3_tts()``            — Qwen3-TTS bound to ``/userdata/models/Qwen3-TTS``;
                                     the 4 ``.1828.rknn`` files are looked up inside
                                     that directory.
@@ -334,9 +340,9 @@ class SystemLanguageModel:
     def qwen3_vl_4b(cls) -> ModelSpec:
         """Return a :class:`ModelSpec` pre-bound to the fixed Qwen3-VL-4B files.
 
-        The files are expected at ``/userdata/models/Qwen3-VL-4B/`` (override the
-        root with the ``RKAI_MODELS_DIR`` environment variable). If any expected
-        file is missing a :class:`FileNotFoundError` is raised listing them.
+        The files are expected at ``/userdata/models/Qwen3-VL-4B/`` (override with
+        the ``RKAI_QWEN3_VL_4B_DIR`` environment variable). If any expected file
+        is missing a :class:`FileNotFoundError` is raised listing them.
         """
         _verify_qwen3_vl_4b_files()
         return _qwen3vl_4b_spec().with_paths(**_default_qwen3_vl_4b_paths())

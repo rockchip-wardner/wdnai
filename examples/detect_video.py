@@ -2,10 +2,10 @@
 
 按一定帧间隔把视频帧送给 ``LLMSession`` 推理，并把分析结果打在终端。
 
-模型文件位于固定的本地路径 ``/userdata/models/Qwen3-VL-4B/``，可通过环境
-变量更改根目录：
+模型文件位于固定的本地路径 ``/userdata/models/Qwen3-VL-4B/``，可通过
+环境变量直接指定模型目录（调试时用）：
 
-    RKAI_MODELS_DIR=/path/to/models
+    RKAI_QWEN3_VL_4B_DIR=/path/to/Qwen3-VL-4B  # 直接指定 4B 模型目录，默认 /userdata/models/Qwen3-VL-4B
 """
 import argparse
 import asyncio
@@ -68,7 +68,7 @@ async def main() -> None:
             "在装了原生库的环境上再跑这个脚本。"
         )
 
-    # 模型文件需要在 /userdata/models/Qwen3-VL-4B/ 下（可用 RKAI_MODELS_DIR 覆盖）
+    # 模型文件需要在 /userdata/models/Qwen3-VL-4B/ 下（可用 RKAI_QWEN3_VL_4B_DIR 覆盖）
     model = SystemLanguageModel.qwen3_vl_4b()
     session = LLMSession(model=model)
 
