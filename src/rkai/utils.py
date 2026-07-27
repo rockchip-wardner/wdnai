@@ -25,11 +25,41 @@ def bgr_to_rgb(img_bgr: np.ndarray) -> np.ndarray:
 
 
 def resize(img: np.ndarray, size: int) -> np.ndarray:
+    """Resize an image to ``(size, size)``.
+
+    Picks the interpolation by direction:
+      * **downsample** (``size < max(h, w)``) → ``cv2.INTER_AREA``. This
+        averages every source pixel covered by the destination cell,
+        which is what OpenCV documents as the recommended mode for
+        decimation and what preserves anti-aliased mean intensity for
+        small high-frequency content (e.g. license-plate strokes when
+        scaling 960x540 → 384x384). Plain bilinear
+        (``cv2.INTER_LINEAR``) only sees the 2x2 corner pixels of each
+        destination cell and silently drops the rest, which mangles
+        text-like patterns.
+      * **upsample** (``size > max(h, w)``) → ``cv2.INTER_CUBIC``. Cubic
+        spline over a 4x4 neighbourhood is markedly sharper than the
+        bilinear default at the cost of a few extra multiplies — well
+        worth it for small-target detection on a 384 → 768 upscale.
+      * **isometric** (equal) → ``cv2.INTER_LINEAR``. No resampling
+        needed, but INTER_LINEAR keeps the function symmetric.
+
+    Equivalence: ``cv2.resize(img, (s, s), interpolation=...)`` is the
+    same code path OpenCV itself uses internally; we just pick the
+    flag ahead of the call.
+    """
     try:
         import cv2  # noqa: WPS433
     except ImportError as e:
         raise ImportError("Image resize requires opencv-python; please `pip install opencv-python`") from e
-    return cv2.resize(img, (size, size))
+    h, w = img.shape[:2]
+    if size < max(h, w):
+        interp = cv2.INTER_AREA
+    elif size > max(h, w):
+        interp = cv2.INTER_CUBIC
+    else:
+        interp = cv2.INTER_LINEAR
+    return cv2.resize(img, (size, size), interpolation=interp)
 
 
 # --------------------------------------------------------------------------- #
