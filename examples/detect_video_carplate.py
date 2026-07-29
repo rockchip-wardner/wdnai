@@ -63,8 +63,10 @@ from dataclasses import replace
 class PlateBox:
     """两阶段模式第一步：仅输出车牌位置"""
     carplate: str = Field(
-        default="车牌坐标",
-        description="车牌完整包围盒，格式 [x1,y1,x2,y2]，四个角必须紧贴车牌外框边缘；未检测到时返回'未检测到'",
+        default="未检测到",
+        description="车牌包围盒，**字符串必须带方括号**，格式 [x1,y1,x2,y2]，"
+                  "0-1000 归一化坐标（左上=(0,0)、右下=(1000,1000)，x1,y1 左上、x2,y2 右下）；"
+                  "无车牌时填 \"未检测到\"。",
     )
 
 
@@ -73,7 +75,8 @@ class PlateOCR:
     """两阶段模式第二步：仅识别车牌号"""
     plate_text: str = Field(
         default="未识别",
-        description="车牌号码（汉字+字母+数字，例如'京A12345'）；无法清晰识别时返回'未识别'",
+        description="车牌号码 = 汉字(省份) + 字母 + 数字，可能含 \"·\"；"
+                  "完全无法辨认时填 \"未识别\"。",
     )
 
 
@@ -81,45 +84,55 @@ class PlateOCR:
 class Event:
     """单阶段模式：同时输出车牌位置和号码"""
     carplate: str = Field(
-        default="车牌坐标",
-        description="车牌完整包围盒，格式 [x1,y1,x2,y2]，四个角必须紧贴车牌外框边缘；未检测到时返回'未检测到'",
+        default="未检测到",
+        description="车牌包围盒，**字符串必须带方括号**，格式 [x1,y1,x2,y2]，"
+                  "0-1000 归一化坐标（左上=(0,0)、右下=(1000,1000)，x1,y1 左上、x2,y2 右下）；"
+                  "无车牌时填 \"未检测到\"。",
     )
     plate_text: str = Field(
         default="未识别",
-        description="车牌号码（汉字+字母+数字，例如'京A12345'）；无法清晰识别时返回'未识别'",
+        description="车牌号码 = 汉字(省份) + 字母 + 数字，可能含 \"·\"；"
+                  "完全无法辨认时填 \"未识别\"。",
     )
 
 
 def build_box_prompt(width: int, height: int) -> str:
     return (
-        f"这是一段 {width}x{height} 的视频帧。请判断图中是否有车牌。\n"
-        f"如有车牌，请给出一行完整包围盒坐标 [x1,y1,x2,y2]，"
-        f"要求四个角紧贴车牌外框四个边缘，确保所有汉字、字母和数字完整可见、不被裁切；"
-        f"如果无车牌，写'未检测到'。\n"
-        f"重要：坐标必须使用 0-1000 归一化空间（左上角=(0,0)，右下角=(1000,1000)），"
-        f"不要使用像素坐标，也不要使用 0-1 或 0-{min(width, height)} 空间。"
+        f"这是一段 {width}x{height} 的视频帧。请判断图中是否有中国车牌。\n"
+        f"中国车牌特征：细长矩形（长宽比约 4.4:1），常见为蓝/黄/绿/白底。"
+        f"如有，输出车牌的完整包围盒 [x1,y1,x2,y2]，使用 **0-1000 归一化坐标**"
+        f"（左上=(0,0)、右下=(1000,1000)，x1,y1 左上、x2,y2 右下）。\n"
+        f"如无车牌，carplate 填字符串 \"未检测到\"。\n"
+        f"输出格式（**必须用下面这种 JSON wrapper**）：\n"
+        f'{{"carplate":"[x1,y1,x2,y2]"}}\n'
+        f'或 {{"carplate":"未检测到"}}'
     )
 
 
 def build_single_prompt(width: int, height: int) -> str:
     return (
-        f"这是一段 {width}x{height} 的视频帧。请判断图中是否有车牌。\n"
-        f"车牌特征：细长矩形（长宽比约 4.4:1），中国常见为蓝底白字 / 黄底黑字 / 绿底黑字，"
-        f"内容包含汉字、字母和数字。\n"
-        f"如有车牌，请同时给出：\n"
-        f"  carplate   = 车牌完整包围盒 [x1,y1,x2,y2]，四个角紧贴车牌外框，确保字符完整可见\n"
-        f"  plate_text = 车牌号码（如'京A12345'），如果字符不够清晰也要尽量识别\n"
-        f"如果无车牌，carplate 写'未检测到'，plate_text 写'未识别'。\n"
-        f"重要：carplate 必须使用 0-1000 归一化坐标（左上角=(0,0)，右下角=(1000,1000)），"
-        f"不要使用像素坐标，也不要使用 0-1 或 0-{min(width, height)} 空间。"
+        f"这是一段 {width}x{height} 的视频帧。请判断图中是否有中国车牌。\n"
+        f"中国车牌特征：细长矩形（长宽比约 4.4:1），常见为蓝底白字 / 黄底黑字 / 绿底黑字 / 白底黑字。"
+        f"如有，同时输出 (1) 包围盒 [x1,y1,x2,y2]（**0-1000 归一化坐标**："
+        f"左上=(0,0)、右下=(1000,1000)，x1,y1 左上、x2,y2 右下）和 (2) 车牌号码。\n"
+        f"车牌号码 = 汉字(省份) + 字母 + 数字，可能含居中圆点 \"·\"。"
+        f"按图中实际字符输出；看不清的字符用 ? 占位。\n"
+        f"无车牌：carplate=\"未检测到\"，plate_text=\"未识别\"。\n"
+        f"输出格式（**必须用下面这种 JSON wrapper，字段名 carplate / plate_text 一字不差**）：\n"
+        f'{{"carplate":"[x1,y1,x2,y2]","plate_text":"<图中实际字符>"}}\n'
+        f'或 {{"carplate":"未检测到","plate_text":"未识别"}}'
     )
 
 
 def build_ocr_prompt() -> str:
     return (
-        "请识别图中的车牌号码。这是裁剪并已扩边过的车牌图像，应只包含 1 个车牌。"
-        "如果字符清晰可读，直接给出完整车牌内容（例如'京A12345'或'粤B6D89H'）；"
-        "如果图像模糊或无法识别，返回'未识别'。"
+        "请按图中实际字符识别车牌号码。\n"
+        "车牌号码 = 汉字(省份) + 字母 + 数字，可能含居中圆点 \"·\"。\n"
+        "看清的字符按图中原样输出；看不清的字符用 ? 占位；"
+        "整张图无法辨认返回 \"未识别\"。\n"
+        "输出格式（**必须用下面这种 JSON wrapper，字段名 plate_text**）：\n"
+        f'{{"plate_text":"<图中实际字符>"}}\n'
+        f'或 {{"plate_text":"未识别"}}'
     )
 
 
@@ -257,8 +270,8 @@ async def main() -> None:
     # Pruned vision RKNN: Python 用 qwen3vl_prune_single 算 patch features 喂进去,
     # 可在 32 倍数 image_size 之间切换(384/768/512)不用重新导出 RKNN。
     model = SystemLanguageModel.qwen3_vl_4b()
-    # model = replace(model, use_prune=True, image_size=768)
-    model = replace(model, use_prune=False, image_size=768)
+    model = replace(model, use_prune=True, image_size=768)
+    # model = replace(model, use_prune=False, image_size=768)
     # 强制 greedy：默认 options 里 temperature=1e-6, top_k=1 已经接近 argmax，
     # 但 top_p=0.9 在 C 库里可能先于 temperature 起作用、保留 2~3 个候选 token
     # 再采样。把 top_p 也置 1.0 把这条潜在路径关掉，配合 top_k=1 走纯 argmax。
@@ -343,14 +356,16 @@ async def main() -> None:
                 detect_kind = None
 
                 if kind == "detect" and result is not None:
-                    if not isinstance(result, PlateBox):
+                    # detect 路径接受两种 schema：two-stage 第一步返回 PlateBox，
+                    # single 模式返回 Event（同时含 carplate 和 plate_text）。
+                    if not isinstance(result, (PlateBox, Event)):
                         # NPU mis-decode / schema 不匹配时，SDK 会 fallback 到
                         # 直接返回 raw string（src/rkai/session.py:439）。这种
                         # 帧直接 skip，不计数、不调度 OCR、不更新 display。
                         snippet = result if isinstance(result, str) else type(result).__name__
                         print(
                             f"\n========== frame {detect_pos} (parse failed) ==========\n"
-                            f"  ⚠ vlm 未输出合法 PlateBox (got {type(result).__name__})，跳过本帧\n"
+                            f"  ⚠ vlm 未输出合法 PlateBox/Event (got {type(result).__name__})，跳过本帧\n"
                             f"  raw = {repr(snippet)[:200]}"
                         )
                     else:
