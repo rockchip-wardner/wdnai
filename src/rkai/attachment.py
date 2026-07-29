@@ -11,6 +11,15 @@ from typing import TYPE_CHECKING, List, Optional, Union
 if TYPE_CHECKING:  # noqa: F401
     import numpy as np
 
+# ``rkv`` is an optional peer dependency. ``Attachment`` only needs the
+# ``DecodedFrame`` class to detect ``rkv.VideoCapture.read0()`` outputs;
+# keep the import lazy so a system without ``rkv`` installed can still
+# import ``rkai`` and use the ndarray / text / bytes constructors.
+try:
+    from rkv.mpp import DecodedFrame as _RKVDecodedFrame  # noqa: F401
+except ImportError:
+    _RKVDecodedFrame = None  # type: ignore[assignment]
+
 
 class Attachment:
     """Attachment sent to / received from an LLM / VLM / TTS session.
@@ -19,6 +28,12 @@ class Attachment:
 
     - Single image: ``Attachment(img)`` where ``img`` is a BGR ndarray.
     - Multiple images: ``Attachment([img1, img2, ...])``.
+    - 0-copy frame from ``rkv.VideoCapture.read0()``: ``Attachment(frame0)``
+      where ``frame0`` is an ``rkv.mpp.DecodedFrame``. Internally calls
+      ``frame0.numpy()`` (RGA DMA→CPU materialisation) and proceeds as a
+      regular image attachment. ``rkv`` is an optional peer dependency —
+      if it is not installed, the constructor falls through to the
+      usual ``TypeError`` for unsupported types.
     - Text: ``Attachment("the prompt text")`` or ``Attachment("…", kind="text")``.
       When the string happens to also be an existing file path, pass
       ``kind="text"`` explicitly to opt out of the video heuristic.
@@ -54,6 +69,26 @@ class Attachment:
         self.frames: List["np.ndarray"] = []
         self.data: bytes = b""
         self.mime_type = mime_type
+
+        # ---------- 0-copy frame: rkv.mpp.DecodedFrame ----------
+        # ``rkv.VideoCapture.read0()`` returns a ``DecodedFrame`` whose
+        # backing storage is a DMA-BUF fd (kernel-side, owned by MPP).
+        # Calling ``.numpy()`` hands the fd to RGA, which materialises
+        # the frame into a contiguous BGR ndarray in one hardware pass.
+        # After that the pipeline (``_preprocess_image``,
+        # ``_build_image_inputs``) runs unchanged — equivalent to
+        # ``Attachment(frame0.numpy())`` but lets the caller keep the
+        # DecodedFrame handle until ``Attachment`` is constructed.
+        if _RKVDecodedFrame is not None and isinstance(content, _RKVDecodedFrame):
+            arr = content.numpy()
+            if _np is None or not isinstance(arr, _np.ndarray):
+                raise TypeError(
+                    f"{type(content).__name__}.numpy() must return np.ndarray, "
+                    f"got {type(arr).__name__}"
+                )
+            self.kind = "image"
+            self.images = [arr]
+            return
 
         # ---------- image (ndarray / list[ndarray]) ----------
         if _np is not None and isinstance(content, _np.ndarray):
