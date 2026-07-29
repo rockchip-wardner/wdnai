@@ -97,7 +97,7 @@ async def main() -> None:
 
             if cap.frame_pos % args.every == 0:
                 print(f"\n========== frame {cap.frame_pos} ==========")
-                # reset() 清空 history + C 库 KV cache，避免上一轮状态污染下一轮
+                # reset() 清空 C 库 KV cache，避免上一轮状态污染下一轮
                 session.reset()
                 result = await session.respond(
                     prompt=PROMPT,

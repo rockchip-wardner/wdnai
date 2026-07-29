@@ -63,7 +63,7 @@ async def main():
         )
         for i in range(10):
             print(f"\n========== run {i} ==========")
-            # reset() clears history + the C-level KV cache so the next
+            # reset() clears the C-level KV cache so the next
             # call doesn't see the previous turn's state.
             session.reset()
             result = await session.respond(

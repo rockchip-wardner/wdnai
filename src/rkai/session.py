@@ -49,7 +49,6 @@ class LLMSession:
     def __init__(self, model: ModelSpec, **options: Any) -> None:
         self.spec = model
         self._backend = build_backend(model)
-        self.history: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -140,10 +139,6 @@ class LLMSession:
             sink = getattr(self._backend, "sink", None)
             if sink is not None and sink.perf:
                 print(f"[rkai.debug] perf   = {sink.perf}")
-
-        # Maintain history
-        self.history.append({"role": "user", "content": prompt or ""})
-        self.history.append({"role": "assistant", "content": text})
 
         # Output classification — passive, the caller decides what to do:
         #
@@ -468,12 +463,11 @@ class LLMSession:
     # ------------------------------------------------------------------ #
 
     def reset(self) -> None:
-        """Clear history + the C library's KV cache / internal state.
+        """Clear the C library's KV cache / internal state.
 
         Call this between loop iterations to force the model to start from a
         clean state — trades a bit of speed for determinism.
         """
-        self.history.clear()
         rknn_llm = getattr(self._backend, "rknn_llm", None)
         if rknn_llm is not None and hasattr(rknn_llm, "clear_kvcache"):
             try:

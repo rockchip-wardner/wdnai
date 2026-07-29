@@ -161,7 +161,7 @@ def annotate_frame(frame: np.ndarray, x1: float, y1: float, x2: float, y2: float
 async def _majority_vote_async(session, k: int, **kwargs) -> Any:
     """Run ``session.respond(**kwargs)`` k times and return the most common parsed result.
 
-    Each call is preceded by ``session.reset()`` so KV cache / history from
+    Each call is preceded by ``session.reset()`` so KV cache from
     the previous attempt doesn't leak into the next one — important for
     stability because the LLM is autoregressive: a tiny first-token
     difference can snowball into a totally different final string.
