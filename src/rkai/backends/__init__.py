@@ -16,11 +16,18 @@ _REGISTRY: Dict[str, Type] = {
 
 
 def build_backend(spec: ModelSpec):
-    """Pick the backend implementation based on ``spec.kind``."""
+    """Pick the backend implementation based on ``spec.kind``.
+
+    ``"asr"`` is loaded on demand — :mod:`rkai.backends.asr` imports
+    rknn3lite at module load time, which segfaults on non-RK hosts.
+    """
+    if spec.kind == "asr":
+        from .asr import ASRBackend  # type: ignore  # noqa: WPS433
+        return ASRBackend(spec)
     cls = _REGISTRY.get(spec.kind)
     if cls is None:
         raise ValueError(
-            f"Unknown kind: {spec.kind!r} (expected 'llm' / 'vlm' / 'tts')"
+            f"Unknown kind: {spec.kind!r} (expected 'llm' / 'vlm' / 'tts' / 'asr')"
         )
     return cls(spec)
 

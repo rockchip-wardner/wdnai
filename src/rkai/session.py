@@ -192,12 +192,14 @@ class LLMSession:
             run = getattr(self._backend, "run_text", None) or self._backend.run
             return run(prompt, **overrides), []
 
-        # Sort attachments by channel. We split into images / video frames
-        # / text prefixes. Unknown kinds (audio, …) are forwarded as-is
-        # for future backends; for now they fall through to run_text.
+                # Split attachments by channel. Audio is routed to
+        # ``backend.run_audio`` when the backend exposes one (ASR);
+        # image / video / text-prefixes work as before; unknown kinds
+        # fall through to ``run_text``.
         images: List = []
         video_frames: List = []
         text_prefixes: List[str] = []
+        audio_payloads: List[Attachment] = []
         other: List[Attachment] = []
 
         for att in attachments:
@@ -207,16 +209,30 @@ class LLMSession:
                 video_frames.extend(att.frames)
             elif att.kind == "text":
                 text_prefixes.append(att.text or "")
+            elif att.kind == "audio":
+                audio_payloads.append(att)
             else:
-                # audio / bytes / unknown — pass through so future TTS /
-                # multimodal backends can pick them up.
                 other.append(att)
 
-        # Build a single prompt with text attachments prepended.
         full_prompt = prompt or ""
         if text_prefixes:
             joined = "\n".join(p for p in text_prefixes if p)
             full_prompt = (joined + ("\n" + full_prompt if full_prompt else "")).strip()
+
+        if audio_payloads and hasattr(self._backend, "run_audio"):
+            pcm = b"".join(att.data for att in audio_payloads)
+            sample_rate = int(overrides.pop("sample_rate", 16000))
+            n_channels = int(overrides.pop("n_channels", 1))
+            sample_width = int(overrides.pop("sample_width", 2))
+            text = self._backend.run_audio(
+                pcm, sample_rate=sample_rate,
+                n_channels=n_channels, sample_width=sample_width,
+                **overrides,
+            )
+            return text, []
+
+
+
 
         if images:
             text = self._backend.run_images(full_prompt, images, **overrides)
