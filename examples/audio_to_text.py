@@ -6,7 +6,16 @@ back into two fields.
 
 Usage::
 
+    # Offline (encoder.1828.rknn, one-shot)
     .venv/bin/python examples/audio_to_text.py --wav /path/to.wav --iter 3
+
+    # Online / streaming (encoder_online.1828.rknn, 1-second chunks,
+    # partial text committed each round after a rollback warm-up)
+    .venv/bin/python examples/audio_to_text.py --wav /path/to.wav --online
+
+``--online`` prints each round's confirmed prefix / unfixed tail to
+stdout; the final transcript is the ``"language <lang>\\n<text>"``
+return value of ``ASRBackend.run_audio`` (same shape as offline).
 
 ``RKAI_MODELS_DIR`` overrides the model root.
 """
@@ -24,9 +33,6 @@ import numpy as np
 
 from rkai import (
     Attachment,
-    Field,
-    Generable,
-    LMOutput,
     LLMSession,
     SystemLanguageModel,
 )
@@ -44,11 +50,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="覆盖模型根目录；默认 $RKAI_MODELS_DIR/Qwen3-ASR")
     p.add_argument("--iter", type=int, default=10,
                    help="连续识别轮数（每轮 reset KV cache）")
-    p.add_argument("--max-new-tokens", type=int, default=1024 * 6)
+    p.add_argument("--max-new-tokens", type=int, default=1024 * 6,
+                   help="LLM 单轮最大生成 tokens（offline 生效）")
     p.add_argument("--language", default=None,
                    help="可选 ASR 语言提示；当前 SDK 透传但不强制")
     p.add_argument("--perf", action="store_true",
                    help="打印 Prefill / Generate 延迟表")
+    p.add_argument("--online", action="store_true",
+                   help="Use encoder_online.1828.rknn (streaming, 1s/chunk)")
+    p.add_argument("--online-chunk-seconds", type=float, default=1.0,
+                   help="Online chunk size (default 1.0s)")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -130,6 +141,32 @@ def split_language_and_text(raw: str) -> Tuple[str, str]:
 
 
 # --------------------------------------------------------------------------- #
+# Online-commit handler — ``\r\033[K`` reprints the same console line so
+# the watcher sees the running committed / unfixed prefix (matches the
+# single-line trick in cpp/online_main.cc::print_single_line_result).
+# --------------------------------------------------------------------------- #
+class _StreamingPrinter:
+    RED = "\033[31m"
+    BLUE = "\033[34m"
+    RESET = "\033[0m"
+    CLEAR = "\033[K"
+
+    def __init__(self):
+        self.printed_committed_len = 0
+
+    def __call__(self, committed: str, unfixed: str, language: str):
+        tail = committed[self.printed_committed_len:]
+        self.printed_committed_len = len(committed)
+        print(
+            f"\rcommitted: {tail}{self.BLUE}{unfixed}{self.RESET}{self.CLEAR}",
+            end="", flush=True,
+        )
+
+    def newline(self):
+        print("")
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 async def main() -> None:
@@ -143,12 +180,23 @@ async def main() -> None:
     model = SystemLanguageModel.qwen3_asr()
     if args.model_dir:
         model = model.with_paths(asr_model_dir=str(args.model_dir))
+    if args.online:
+        model = model.with_options(
+            use_online_encoder=True,
+            online_chunk_seconds=args.online_chunk_seconds,
+        )
+
     session = LLMSession(model=model)
     try:
+        printer = _StreamingPrinter() if args.online else None
         for i in range(max(1, args.iter)):
             print(f"\n========== run {i} ==========")
             t0 = time.perf_counter()
             session.reset()
+            if printer is not None:
+                printer.printed_committed_len = 0
+            on_commit = printer if args.online else None
+
             raw = await session.respond(
                 attachment=[Attachment(pcm, kind="audio")],
                 sample_rate=sample_rate,
@@ -157,7 +205,11 @@ async def main() -> None:
                 max_new_tokens=args.max_new_tokens,
                 language=args.language,
                 perf=args.perf,
+                on_asr_commit=on_commit,
             )
+
+            if printer is not None:
+                printer.newline()
             lang, text = split_language_and_text(raw)
             print(f"  language : {lang!r}")
             print(f"  text     : {text!r}")
