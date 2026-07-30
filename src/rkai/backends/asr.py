@@ -1,18 +1,25 @@
 """Qwen3-ASR backend — wav-in, text-out.
 
-Pipeline (mirrors ``examples/Qwen3_ASR/cpp``):
+Offline pipeline (mirrors ``examples/Qwen3_ASR/cpp/main.cc``)::
 
-    raw PCM (any rate / s16le / s24le / s32le / IEEE float)
-        → 16 kHz mono fp32 → log-mel-spectrogram (pure numpy)
-        → audio encoder (NCHW, ``encoder.1828.rknn``) chunk-by-chunk
-        → fp16 audio embeddings
-        → concat with hardcoded ``prefix`` (9 tokens) + ``postfix`` (6 tokens)
-        → ``llm.session_run(embeds=…)`` with ``keep_history=0``
-        → raw text, with the language-separator ``[PAD151704]`` replaced by ``\n``.
+    raw PCM  →  16 kHz mono fp32  →  log-mel-spectrogram
+           →  audio encoder (NCHW, ``encoder.1828.rknn``) one shot
+           →  fp16 audio embeddings  →  prefix (9) + audio + postfix (6)
+           →  llm.session_run(embeds=…, keep_history=0)
+           →  raw text, with separator ``[PAD151704]`` replaced by ``\n``.
 
-``run_audio`` returns the full transcript string
-(``"language <lang>\\n<text>"``). The example in ``examples/audio_to_text.py``
-splits on the first ``\n``.
+Online pipeline (mirrors ``examples/Qwen3_ASR/cpp/online_main.cc``)
+runs when ``spec.options["use_online_encoder"]`` is True. The audio
+is split into 1-second chunks; each chunk runs the streaming
+encoder (``encoder_online.1828.rknn``) and the LLM once, with all
+previous audio embeddings and confirmed-text tokens carried in the
+LLM input. Rollback (4 warm-up rounds + 5 trailing tokens) keeps
+the committed prefix stable.
+
+``run_audio`` returns the final transcript (``"language <lang>\\n<text>"``).
+Online mode additionally calls ``on_asr_commit(committed, unfixed,
+language)`` after each round if provided. The example in
+``examples/audio_to_text.py`` consumes both.
 
 Supported model layout (matches :class:`rkai.model.SystemLanguageModel.qwen3_asr`):
 
@@ -61,8 +68,17 @@ PREFIX_N_TOKENS = 9                    # fixed by the LLM export
 POSTFIX_N_TOKENS = 6                   # fixed by the LLM export
 AUDIO_START_TOKEN = 151669
 AUDIO_END_TOKEN = 151670
+LANGUAGE_SEP_TOKEN = 151704            # token after which the ASR body starts
 
 MAX_NEW_TOKENS_DEFAULT = 1024 * 6
+
+# Online-encoder knobs. Defaults mirror cpp/online_main.cc
+# (ONLINE_CHUNK_MS=1000, ONLINE_MAX_NEW_TOKENS=50,
+#  ONLINE_ROLLBACK_TOKENS=5, ONLINE_ROLLBACK_ROUNDS=4).
+ONLINE_CHUNK_SECONDS_DEFAULT = 1.0
+ONLINE_MAX_NEW_TOKENS_DEFAULT = 50
+ONLINE_ROLLBACK_TOKENS_DEFAULT = 5
+ONLINE_ROLLBACK_ROUNDS_DEFAULT = 4
 
 
 # --------------------------------------------------------------------------- #
@@ -183,12 +199,12 @@ class ASRBackend:
         self.spec = spec
         model_dir = Path(spec.asr_model_dir)
 
-        encoder_rknn = model_dir / "encoder.1828.rknn"
-        encoder_wt = model_dir / "encoder.weight"
         llm_rknn = model_dir / "llm.1828.rknn"
         llm_wt = model_dir / "llm.weight"
         for p in (
-            encoder_rknn, encoder_wt, llm_rknn, llm_wt,
+            model_dir / "encoder.1828.rknn", model_dir / "encoder.weight",
+            model_dir / "encoder_online.1828.rknn", model_dir / "encoder_online.weight",
+            llm_rknn, llm_wt,
             Path(spec.tokenizer_path), Path(spec.embed_path),
             model_dir / "mel_128_filters.txt",
         ):
@@ -198,6 +214,17 @@ class ASRBackend:
         self._mel_filters = _load_mel_filters(
             str(model_dir / "mel_128_filters.txt"), N_MELS_DEFAULT, MELS_FILTERS_COLS,
         )
+
+        # Switch encoder based on the streaming flag. The two encoder
+        # rknns share the same input shape / dtype, so the runtime
+        # query below is identical for both.
+        self._use_online = bool(spec.options.get("use_online_encoder", False))
+        if self._use_online:
+            encoder_rknn = model_dir / "encoder_online.1828.rknn"
+            encoder_wt = model_dir / "encoder_online.weight"
+        else:
+            encoder_rknn = model_dir / "encoder.1828.rknn"
+            encoder_wt = model_dir / "encoder.weight"
 
         # ---- Audio encoder: user_mem_internal=1 so shared internal memory
         # can be set after the LLM is also initialised.
@@ -462,13 +489,26 @@ class ASRBackend:
         sample_rate: int = TARGET_SAMPLE_RATE,
         n_channels: int = 1,
         sample_width: int = 2,
+        on_asr_commit: Optional[Any] = None,
         **overrides: Any,
     ) -> str:
         """Run a single ASR pass over a raw PCM payload.
 
-        ``**overrides`` (``max_new_tokens`` / ``keep_history``) goes
-        straight to ``rknn_llm.session_run``. Returns the LLM text
-        output (``"language <lang>\\n<text>"``).
+        The encoder choice is locked at backend construction time via
+        ``spec.options["use_online_encoder"]``: ``False`` (default)
+        uses the offline ``encoder.1828.rknn`` and returns the full
+        transcript in one shot; ``True`` uses the streaming
+        ``encoder_online.1828.rknn`` and runs the LLM once per
+        ``online_chunk_seconds`` window.
+
+        ``on_asr_commit`` — *(online only, optional)* ``Callable``
+        invoked after each round as
+        ``on_asr_commit(committed_text, unfixed_text, language)``.
+        ``committed_text`` is the text confirmed by the rollback
+        policy so far; ``unfixed_text`` may still be revised by the
+        next round.
+
+        Returns ``"language <lang>\\n<text>"`` for both modes.
         """
         self.sink.reset()
         audio = _pcm_to_mono_float32(pcm_bytes, n_channels, sample_width)
@@ -476,9 +516,16 @@ class ASRBackend:
             audio = _resample_linear(audio, sample_rate, TARGET_SAMPLE_RATE)
         if len(audio) < N_FFT:
             raise RuntimeError(f"audio too short: {len(audio)} samples (< {N_FFT})")
+
+        if self._use_online:
+            return self._run_online(audio, on_asr_commit, overrides)
+        return self._run_offline(audio, overrides)
+
+    # ------------------------------------------------------------------ #
+    def _run_offline(self, audio: np.ndarray, overrides: Dict[str, Any]) -> str:
+        """Single-shot path; mirrors ``cpp/main.cc::inference_qwen3_asr_model``."""
         mel_spec = _log_mel_spectrogram(audio, self._mel_filters)
         audio_embeds = self._run_audio_encoder(mel_spec)
-
         full = np.concatenate(
             [
                 self._prefix_embeds[None, ...],
@@ -495,12 +542,10 @@ class ASRBackend:
         if ret != 0:
             raise RuntimeError(f"llm session_run failed: ret={ret}")
         n_decode, n_prefill, llm_start, llm_end = stats
-        # The language separator (token 151704) is in the GGUF tokenizer's
-        # "control token" whitelist but not in HF's "special tokens"
-        # whitelist, so it leaks out as the literal ``[PAD151704]``
-        # glued to the language header. Replace it with ``\n`` so
-        # callers see a clean split. (The C demo splits on the token
-        # id directly inside its streaming callback.)
+        # Token 151704 is in the GGUF control-token list but not in HF's
+        # "special tokens" whitelist, so it leaks out as ``[PAD151704]``
+        # glued to the language header. Swap for ``\n`` so callers see
+        # a clean split.
         text = self.sink.text.replace("[PAD151704]", "\n", 1)
         if self.sink.first_token_time is not None:
             self.sink.perf.update({
@@ -512,6 +557,94 @@ class ASRBackend:
             if overrides.get("perf", False):
                 printf_perf(self.sink)
         return text
+
+    def _run_online(
+        self,
+        audio: np.ndarray,
+        on_asr_commit: Optional[Any],
+        overrides: Dict[str, Any],
+    ) -> str:
+        """Streaming path; mirrors ``cpp/online_main.cc::main``."""
+        chunk_seconds = float(overrides.pop(
+            "online_chunk_seconds", ONLINE_CHUNK_SECONDS_DEFAULT,
+        ))
+        max_new_tokens = int(overrides.pop(
+            "online_max_new_tokens", ONLINE_MAX_NEW_TOKENS_DEFAULT,
+        ))
+        rollback_tokens = int(overrides.pop(
+            "online_rollback_tokens", ONLINE_ROLLBACK_TOKENS_DEFAULT,
+        ))
+        rollback_rounds = int(overrides.pop(
+            "online_rollback_rounds", ONLINE_ROLLBACK_ROUNDS_DEFAULT,
+        ))
+
+        samples_per_chunk = max(N_FFT, int(TARGET_SAMPLE_RATE * chunk_seconds))
+        n_chunks = (len(audio) + samples_per_chunk - 1) // samples_per_chunk
+        if n_chunks <= 0:
+            raise RuntimeError("audio too short for online streaming")
+
+        decoder = _OnlineDecoder(self.tokenizer)
+        audio_embed_history: List[np.ndarray] = []
+        committed_token_ids: List[int] = []
+
+        for chunk_idx in range(n_chunks):
+            start = chunk_idx * samples_per_chunk
+            end = min(start + samples_per_chunk, len(audio))
+            chunk_audio = audio[start:end]
+            if len(chunk_audio) < N_FFT:
+                chunk_audio = np.pad(
+                    chunk_audio, (0, N_FFT - len(chunk_audio))
+                )
+            chunk_mel = _log_mel_spectrogram(chunk_audio, self._mel_filters)
+            chunk_embeds = self._run_audio_encoder(chunk_mel)
+            audio_embed_history.append(chunk_embeds)
+
+            committed_segment = (
+                self.embeds[committed_token_ids].astype(np.float16)[None, ...]
+                if committed_token_ids
+                else np.zeros((1, 0, self._embeds_dim), dtype=np.float16)
+            )
+            full = np.concatenate(
+                [
+                    self._prefix_embeds[None, ...],
+                    np.concatenate(audio_embed_history, axis=0)[None, ...],
+                    self._postfix_embeds[None, ...],
+                    committed_segment,
+                ],
+                axis=1,
+            ).astype(np.float16)
+
+            self.sink.reset()
+            ret, _ = self.rknn_llm.session_run(
+                embeds=full, keep_history=0, max_new_tokens=max_new_tokens,
+            )
+            if ret != 0:
+                raise RuntimeError(
+                    f"llm session_run failed at chunk {chunk_idx}: ret={ret}"
+                )
+
+            round_tokens = list(self.sink.tokens)
+            is_last = chunk_idx == n_chunks - 1
+
+            # rollback policy — mirrors cpp/online_main.cc:482-496
+            if is_last:
+                stable_count = len(round_tokens)
+            elif chunk_idx < rollback_rounds:
+                stable_count = 0
+            elif len(round_tokens) > rollback_tokens:
+                stable_count = len(round_tokens) - rollback_tokens
+            else:
+                stable_count = 0
+
+            new_stable = round_tokens[:stable_count]
+            committed_token_ids = committed_token_ids + new_stable
+            new_unfixed = round_tokens[stable_count:]
+
+            if on_asr_commit is not None:
+                _, committed, unfixed = decoder.add(new_stable, new_unfixed)
+                on_asr_commit(committed, unfixed, "")
+
+        return decoder.final_text(committed_token_ids, self.tokenizer)
 
     # Stub fall-throughs — ``LLMSession._dispatch`` probes for these
     # names when it can't route to a more specific method (audio /
@@ -539,6 +672,109 @@ class ASRBackend:
                 r.release()
             except Exception:  # noqa: BLE001
                 pass
+
+
+# --------------------------------------------------------------------------- #
+# Online-mode text accumulator — mirrors ``decode_asr_text`` /
+# ``round_idx`` bookkeeping in cpp/online_main.cc. Splits each round
+# into a "stable" prefix (confirmed by the rollback policy) and a
+# "unfixed" tail (still subject to revision next round), and stitches
+# the language header once the 151704 separator lands.
+#
+# Important: because the LLM session_run input keeps the same
+# ChatML prefix every round, the LLM re-emits ``language
+# <lang>[PAD151704]`` from every round. ``add`` strips that prefix
+# from whichever side carries it. The final ``language`` field is
+# recovered in ``final_text`` from the full committed-token stream
+# (more accurate than tracking per-round — early rounds' guess is
+# often wrong because the audio context is too short).
+# --------------------------------------------------------------------------- #
+class _OnlineDecoder:
+    def __init__(self, tokenizer):
+        self.tk = tokenizer
+        self.committed = ""
+        self.unfixed = ""
+        self.text_started = False  # has the 151704 separator been seen yet?
+
+    def add(
+        self,
+        new_stable_tokens: List[int],
+        new_unfixed_tokens: List[int],
+    ):
+        """Fold a round's tokens in.
+
+        Returns ``(delta, committed, unfixed)`` for streaming loggers:
+        ``delta`` is the text newly committed in this round,
+        ``committed`` is the total committed text so far, ``unfixed``
+        is the tail still subject to revision.
+        """
+        stable_text = self._decode(new_stable_tokens)
+        unfixed_text = self._decode(new_unfixed_tokens)
+
+        if not self.text_started:
+            # First time the 151704 separator lands: extract the
+            # language header from whichever side carries it, drop the
+            # other half, and remember to strip the prefix from later
+            # rounds.
+            sep = "[PAD151704]"
+            for src, is_stable in ((stable_text, True), (unfixed_text, False)):
+                idx = src.find(sep)
+                if idx < 0:
+                    continue
+                tail = src[idx + len(sep):]
+                if is_stable:
+                    stable_text = tail
+                    unfixed_text = ""
+                else:
+                    stable_text = ""
+                    unfixed_text = tail
+                self.text_started = True
+                break
+        else:
+            # The LLM re-emits the ``language <lang>[PAD151704]`` prefix
+            # every round. Strip it from whichever side has it so the
+            # committed accumulator only sees the actual content.
+            sep = "[PAD151704]"
+            for attr in ("stable", "unfixed"):
+                t = stable_text if attr == "stable" else unfixed_text
+                idx = t.find(sep)
+                if idx < 0:
+                    continue
+                body = t[idx + len(sep):]
+                if attr == "stable":
+                    stable_text = body
+                else:
+                    unfixed_text = body
+
+        delta = stable_text
+        self.committed += delta
+        self.unfixed = unfixed_text
+        return delta, self.committed, self.unfixed
+
+    def final_text(self, committed_token_ids: List[int], tokenizer) -> str:
+        """Decode the full committed-token stream and split on 151704.
+
+        Returned as ``"language <lang>\\n<text>"`` (matches the
+        offline ``ASRBackend.run_audio`` shape so ``examples/audio_to_text.py``
+        doesn't need separate handling).
+        """
+        if not committed_token_ids:
+            return ""
+        full = tokenizer.decode(committed_token_ids, skip_special_tokens=False)
+        sep = "[PAD151704]"
+        idx = full.find(sep)
+        if idx < 0:
+            return full
+        head = full[:idx].strip()
+        body = full[idx + len(sep):]
+        if head.lower().startswith("language "):
+            head = head[len("language "):].strip()
+        return f"language {head}\n{body}".rstrip("\n")
+
+    def _decode(self, tokens: List[int]) -> str:
+        if not tokens:
+            return ""
+        return self.tk.decode(tokens, skip_special_tokens=False)
 
 
 # --------------------------------------------------------------------------- #

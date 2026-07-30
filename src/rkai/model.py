@@ -374,12 +374,15 @@ class SystemLanguageModel:
         Model dir defaults to ``$RKAI_MODELS_DIR/Qwen3-ASR/``
         (resolves to ``/userdata/models/Qwen3-ASR/``). Layout::
 
-            encoder.1828.rknn            + encoder.weight
-            encoder_online.1828.rknn     + encoder_online.weight  (unused)
+            encoder.1828.rknn            + encoder.weight         (offline)
+            encoder_online.1828.rknn     + encoder_online.weight  (online / streaming)
             llm.1828.rknn                + llm.weight
             llm.embed.bin                (vocab_size × dim) fp16
             llm.tokenizer.gguf           GPT-2 BPE + ByteLevel
             mel_128_filters.txt          n_mels × N_FFT/2+1
+
+        Set ``options["use_online_encoder"] = True`` to switch to the
+        streaming encoder (see ``ASRBackend.run_audio``).
         """
         d = _models_root() / "Qwen3-ASR"
         return ModelSpec(
@@ -400,5 +403,11 @@ class SystemLanguageModel:
                 "top_p": 0.9,
                 "temperature": 1.0,
                 "repeat_penalty": 1.2,
+                # Streaming knobs (only used when use_online_encoder=True).
+                "use_online_encoder": False,
+                "online_chunk_seconds": 1.0,
+                "online_max_new_tokens": 50,
+                "online_rollback_tokens": 5,
+                "online_rollback_rounds": 4,
             },
         )
