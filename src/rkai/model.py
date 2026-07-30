@@ -50,6 +50,7 @@ class ModelSpec:
     rknn_vision_path: str = ""
     weight_vision_path: str = ""
     tts_model_dir: str = ""
+    asr_model_dir: str = ""
     embed_path: str = ""
     tokenizer_path: str = ""
 
@@ -363,4 +364,41 @@ class SystemLanguageModel:
             target="rk1820",
             core_mask=0xFF,
             tts_model_dir=str(_models_root() / "Qwen3-TTS"),
+        )
+
+    # ---- ASR -----------------------------------------------------------
+    @classmethod
+    def qwen3_asr(cls) -> ModelSpec:
+        """Return a :class:`ModelSpec` bound to the on-device Qwen3-ASR files.
+
+        Model dir defaults to ``$RKAI_MODELS_DIR/Qwen3-ASR/``
+        (resolves to ``/userdata/models/Qwen3-ASR/``). Layout::
+
+            encoder.1828.rknn            + encoder.weight
+            encoder_online.1828.rknn     + encoder_online.weight  (unused)
+            llm.1828.rknn                + llm.weight
+            llm.embed.bin                (vocab_size × dim) fp16
+            llm.tokenizer.gguf           GPT-2 BPE + ByteLevel
+            mel_128_filters.txt          n_mels × N_FFT/2+1
+        """
+        d = _models_root() / "Qwen3-ASR"
+        return ModelSpec(
+            name="qwen3-asr",
+            kind="asr",
+            variant="qwen3-asr",
+            target="rk1820",
+            core_mask=0xFF,
+            vocab_size=151936,
+            special_eos_id=151645,
+            max_context_len=1024 * 24,
+            asr_model_dir=str(d),
+            tokenizer_path=str(d / "llm.tokenizer.gguf"),
+            embed_path=str(d / "llm.embed.bin"),
+            options={
+                "max_new_tokens": 1024 * 6,
+                "top_k": 1,
+                "top_p": 0.9,
+                "temperature": 1.0,
+                "repeat_penalty": 1.2,
+            },
         )
