@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import ctypes
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -34,6 +34,7 @@ from ._common import (
     load_embed_table,
     load_tokenizer,
     printf_perf,
+    resolve_device_id,
 )
 
 
@@ -44,7 +45,13 @@ class VLMBackend:
     VARIANT_25VL = "qwen2.5-vl"
     VARIANT_3VL = "qwen3-vl"
 
-    def __init__(self, spec):
+    def __init__(
+        self,
+        spec,
+        *,
+        npu: Optional[int] = None,
+        device_id: Optional[Union[bytes, str]] = None,
+    ):
         from rknn3lite.api import RKNN3Lite  # type: ignore
 
         if not spec.rknn_llm_path or not spec.rknn_vision_path:
@@ -70,9 +77,15 @@ class VLMBackend:
         self.tokenizer = load_tokenizer(spec.tokenizer_path)
         self.embeds = load_embed_table(spec.embed_path, spec.vocab_size)
 
+        # Resolve NPU selection **once** after RKNN3Lite is imported;
+        # vision + llm init_runtime share the same resolved bytes so the
+        # whole VLM stays on a single card.
+        resolved_device_id = resolve_device_id(RKNN3Lite, npu, device_id)
+
         # ---- init runtimes ---------------------------------------------
         if self.rknn_vision.init_runtime(
-            target=spec.target, core_mask=spec.core_mask
+            target=spec.target, core_mask=spec.core_mask,
+            device_id=resolved_device_id,
         ) != 0:
             raise RuntimeError("vision init_runtime failed")
 
@@ -83,6 +96,7 @@ class VLMBackend:
             core_mask=spec.core_mask,
             llm_args=build_llm_args(spec),
             llm_callback=cb,
+            device_id=resolved_device_id,
         ) != 0:
             raise RuntimeError("llm init_runtime failed")
         apply_chat_template(self.rknn_llm)

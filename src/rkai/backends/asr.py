@@ -37,7 +37,7 @@ import ctypes
 import logging
 import time as _time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -48,6 +48,7 @@ from ._common import (
     make_embed_callback,
     make_tokenizer_callback,
     printf_perf,
+    resolve_device_id,
 )
 
 LOG = logging.getLogger("rkai.backends.asr")
@@ -185,7 +186,13 @@ def _load_mel_filters(path: str, n_mels: int, n_cols: int) -> np.ndarray:
 class ASRBackend:
     """WAV bytes in → raw transcript string out."""
 
-    def __init__(self, spec):
+    def __init__(
+        self,
+        spec,
+        *,
+        npu: Optional[int] = None,
+        device_id: Optional[Union[bytes, str]] = None,
+    ):
         from rknn3lite.api import RKNN3Lite, RKLLMCallback  # type: ignore
         from rknn3lite.api.rknn3_types import (
             RKNN3QueryCmd, RKNN3MemAllocFlags,
@@ -226,6 +233,10 @@ class ASRBackend:
             encoder_rknn = model_dir / "encoder.1828.rknn"
             encoder_wt = model_dir / "encoder.weight"
 
+        # Resolve NPU selection **once** after RKNN3Lite is imported;
+        # audio encoder + llm init_runtime share the same resolved bytes.
+        resolved_device_id = resolve_device_id(RKNN3Lite, npu, device_id)
+
         # ---- Audio encoder: user_mem_internal=1 so shared internal memory
         # can be set after the LLM is also initialised.
         self.rknn_audio = RKNN3Lite(verbose=spec.verbose)
@@ -234,6 +245,7 @@ class ASRBackend:
         self.rknn_audio.rknn_config.user_mem_internal = 1
         if self.rknn_audio.init_runtime(
             target=spec.target, core_mask=spec.core_mask,
+            device_id=resolved_device_id,
         ) != 0:
             raise RuntimeError("audio init_runtime failed")
 
@@ -283,6 +295,7 @@ class ASRBackend:
         if self.rknn_llm.init_runtime(
             target=spec.target, core_mask=spec.core_mask,
             llm_args=self._build_llm_args(spec), llm_callback=cb,
+            device_id=resolved_device_id,
         ) != 0:
             raise RuntimeError("llm init_runtime failed")
 

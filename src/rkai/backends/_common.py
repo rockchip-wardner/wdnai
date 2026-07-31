@@ -5,12 +5,49 @@ import ctypes
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
 # Set the HF mirror at import time, matching the example scripts
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com/")
+
+
+# --------------------------------------------------------------------------- #
+# NPU selection
+# --------------------------------------------------------------------------- #
+def resolve_device_id(
+    rknn_cls,
+    npu: Optional[int],
+    device_id: Optional[Union[bytes, str]],
+):
+    """Resolve the ``device_id`` bytes to pass into ``RKNN3Lite.init_runtime``.
+
+    - ``device_id`` already set (bytes or str) → returned normalised to
+      bytes (``str.encode("utf-8")`` if needed; bytes passed through).
+    - ``npu`` given → call ``rknn_cls().get_devices_id()[npu]`` and
+      return the corresponding bytes. Raises ``IndexError`` if out of
+      range (the message includes the available list).
+    - both ``None`` → returns ``None`` so the underlying call goes to
+      ``device_id=NULL`` (rknn3lite picks the default device).
+
+    The enumeration is performed lazily here — callers should invoke
+    this **inside** a backend's ``__init__`` (after ``RKNN3Lite`` is
+    already imported) so the RKNN3 native driver init does not race
+    with ``rkv`` in the same process.
+    """
+    if device_id is not None:
+        if isinstance(device_id, str):
+            return device_id.encode("utf-8")
+        return device_id
+    if npu is None:
+        return None
+    ids = rknn_cls().get_devices_id()
+    if not (0 <= npu < len(ids)):
+        raise IndexError(
+            f"npu={npu} out of range; {len(ids)} device(s) found: {ids!r}"
+        )
+    return ids[npu]
 
 
 # --------------------------------------------------------------------------- #

@@ -44,11 +44,33 @@ class LLMSession:
     subclass of :class:`LMOutput`. ``LMOutput`` carries an
     ``attachment`` field; when a TTS-style backend produces audio
     bytes, the SDK fills it in automatically.
+
+    NPU selection: pass exactly one of ``npu=`` (zero-based index into
+    ``RKNN3Lite().get_devices_id()``) or ``device_id=`` (raw device
+    identifier — bytes / str — e.g. a board serial for local
+    coprocessors, or an SoC name like ``"rk3588"`` for ADB targets).
+    Both ``None`` selects the default device. Resolution happens
+    inside the backend's ``__init__`` so the RKNN3 native driver
+    init stays lazy and never races with a co-resident ``rkv``
+    process.
     """
 
-    def __init__(self, model: ModelSpec, **options: Any) -> None:
+    def __init__(
+        self,
+        model: ModelSpec,
+        *,
+        npu: Optional[int] = None,
+        device_id: Optional[Union[bytes, str]] = None,
+        **options: Any,
+    ) -> None:
+        if npu is not None and device_id is not None:
+            raise ValueError("npu= and device_id= are mutually exclusive")
+        if isinstance(device_id, str):
+            device_id = device_id.encode("utf-8")
         self.spec = model
-        self._backend = build_backend(model)
+        self.npu = npu
+        self.device_id = device_id
+        self._backend = build_backend(model, npu=npu, device_id=device_id)
 
     # ------------------------------------------------------------------ #
     @staticmethod

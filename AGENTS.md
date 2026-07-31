@@ -188,6 +188,19 @@ name `rkai`.
 - **`.1828.rknn` 是 RK1828 NPU 量化版本后缀**：`TTSDriver._resolve_model_paths`
   先尝试 `<role>.1828.rknn`，找不到就 fallback 到 `<role>.rknn`。新增模型
   变体请沿用同一约定。
+- **NPU 选卡（多卡场景）**：`LLMSession(model=..., npu=K)` 或
+  `LLMSession(model=..., device_id=b"...")`。两者互斥；同时不传等价于
+  单卡默认行为（向后兼容所有现存调用点）。`npu` 是
+  `RKNN3Lite().get_devices_id()` 结果的下标（板上典型 4 卡 → `0..3`），
+  实际传到底层 `init_runtime(device_id=...)` 的是 bytes 字符串，**不是
+  整数**（RKNN3 的 `RKNN3InitExtend.device_id: c_char_p`，约定为设备唯一
+  标识符，如序列号 / SoC 名 / PCI BDF / ADB IP）。`device_id` 接受 str
+  或 bytes，str 会被自动 `.encode("utf-8")`。ADB 场景传
+  `device_id="rk3588"` 等 SoC 名；网络 ADB 传 `"IP[:Port]"`。解析在
+  `_common.resolve_device_id()` 里完成，**只在 backend `__init__` 里**
+  调用（`LLMSession.__init__` 自身不触发 `get_devices_id()`，保持 RKNN3
+  native driver 懒加载——与 `pyrkaiweb` 里 `RkaiDetector._load_rkai` 同源
+  约束）。
 
 ### 文本推理（LLM）
 
@@ -200,7 +213,7 @@ model = SystemLanguageModel.qwen3_1_7b().with_paths(
     tokenizer_path="/userdata/qwen3_tokenizer",
     embed_path="/userdata/qwen3_1.7b.embed.bin",
 )
-async with LLMSession(model=model) as sess:
+async with LLMSession(model=model, npu=2) as sess:    # 多卡场景选第 3 张卡
     out = await sess.respond(prompt="你好")
     # out is str when no generating= / tools= supplied
     sess.reset()  # 清历史 + rknn_llm.clear_kvcache()
@@ -220,7 +233,7 @@ class Event(LMOutput):
 
 img = cv2.imread("demo.jpg")
 model = SystemLanguageModel.qwen3_vl_4b()   # 默认绑 /userdata/models/Qwen3-VL-4B/
-async with LLMSession(model=model) as sess:
+async with LLMSession(model=model, device_id=b"0001:11:00.0") as sess:  # 多卡场景指定 device_id
     result = await sess.respond(
         prompt="请描述这张图",
         attachment=[Attachment(img)],       # list 形式，可叠加 text + image
@@ -242,7 +255,7 @@ class TTSResult(LMOutput):
     channels:    int = Field(default=1)
 
 model = SystemLanguageModel.qwen3_tts()      # 默认绑 /userdata/models/Qwen3-TTS/
-async with LLMSession(model=model) as sess:
+async with LLMSession(model=model, npu=0) as sess:    # 多卡场景选第 1 张卡
     result = await sess.respond(
         attachment=[Attachment("你好世界", kind="text")],
         generating=TTSResult,
@@ -313,3 +326,6 @@ async with LLMSession(model=model) as sess:
   下一轮 `respond` 会看到上一轮的状态，autoregressive 的小偏差会滚成
   完全不同的最终输出。`detect_video_carplate.py` 的 `--majority-vote`
   在每次投票前也会 `reset()`。
+- **`npu` 与 `device_id` 互斥**：同时传 `LLMSession(..., npu=K, device_id=b"...")`
+  直接抛 `ValueError`；`npu` 越界（>= `len(get_devices_id())`）抛
+  `IndexError` 并把可用设备列表写进消息里（方便排查板上卡数变化）。

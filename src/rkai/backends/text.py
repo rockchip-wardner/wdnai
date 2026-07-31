@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Optional, Union
 
 from ._common import (
     StreamSink,
@@ -12,6 +12,7 @@ from ._common import (
     load_embed_table,
     load_tokenizer,
     printf_perf,
+    resolve_device_id,
 )
 
 
@@ -22,7 +23,13 @@ class TextBackend:
     call :py:meth:`run` to perform a single inference.
     """
 
-    def __init__(self, spec):
+    def __init__(
+        self,
+        spec,
+        *,
+        npu: Optional[int] = None,
+        device_id: Optional[Union[bytes, str]] = None,
+    ):
         from rknn3lite.api import RKNN3Lite  # type: ignore
 
         if not spec.rknn_path or not spec.weight_path:
@@ -39,6 +46,11 @@ class TextBackend:
         self.tokenizer = load_tokenizer(spec.tokenizer_path)
         self.embeds = load_embed_table(spec.embed_path, spec.vocab_size)
 
+        # Resolve NPU selection **after** RKNN3Lite is imported so the
+        # native driver init order stays predictable (and doesn't race
+        # with a co-resident rkv process on dev boxes).
+        resolved_device_id = resolve_device_id(RKNN3Lite, npu, device_id)
+
         # callback / init
         self.sink = StreamSink(tokenizer=self.tokenizer)
         cb = build_llm_callback(self.tokenizer, self.embeds, self.sink)
@@ -47,6 +59,7 @@ class TextBackend:
             core_mask=spec.core_mask,
             llm_args=build_llm_args(spec),
             llm_callback=cb,
+            device_id=resolved_device_id,
         ) != 0:
             raise RuntimeError("init_runtime failed")
         apply_chat_template(self.rknn)

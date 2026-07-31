@@ -41,6 +41,11 @@ class _FakeTensorAttr:
 
 
 class _FakeRknn:
+    # Class-level list of mock device IDs returned by ``get_devices_id()``.
+    # Tests that exercise the ``npu=`` path monkey-patch this to control
+    # what's resolvable via ``rkai.backends.resolve_device_id``.
+    mock_devices = [b"0001:11:00.0", b"0003:31:00.0", b"deadbeef"]
+
     def __init__(self, llm_mode=False, deepstack_n=0, vocab_size=64):
         self.llm_mode = llm_mode
         self.deepstack_n = deepstack_n
@@ -48,17 +53,24 @@ class _FakeRknn:
         self._out_attr = _FakeTensorAttr(aligned_size=4096)
         self.last_inputs = None
         self.last_prompt = None
+        self.last_init_runtime_kwargs = None
         self.session_calls = 0
         self._sinks = []
         self._tokenizer = _MockTokenizer(vocab_size)
 
     def load_rknn(self, *a, **kw): return 0
-    def init_runtime(self, *a, **kw): return 0
+    def init_runtime(self, *a, **kw):
+        self.last_init_runtime_kwargs = kw
+        return 0
     def set_chat_template(self, *a, **kw): return 0
     def release(self): return 0
 
     def get_inputs_tensor_attr(self): return [self._in_attr]
     def get_outputs_tensor_attr(self): return [self._out_attr]
+    def get_devices_id(self):
+        # Always returns a fresh list (real RKNN3Runtime is constructed
+        # and released each time, so each call is independent).
+        return list(self.mock_devices)
 
     def inference(self, inputs=None, data_format=None):
         feat = np.random.randn(1, 32).astype(np.float32)
@@ -141,7 +153,7 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
     # 把 rknn 的 _sinks 列表暴露成"全局最近一次构造的 rknn"
     # —— 借助 text/vlm backend 的 __init__ 第一步 rknn 创建时机
     orig_text_init = text_mod.TextBackend.__init__
-    def h_text2(self, spec):
+    def h_text2(self, spec, *, npu=None, device_id=None):
         # 1) 先建 rknn（同步原 __init__ 的第一行）
         from rknn3lite.api import RKNN3Lite  # 已被 monkey-patch
         if not spec.rknn_path or not spec.weight_path:
@@ -159,16 +171,21 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
         self.embeds = text_mod.load_embed_table(spec.embed_path, spec.vocab_size)
         self.sink = StreamSink(tokenizer=self.tokenizer)
         cb = text_mod.build_llm_callback(self.tokenizer, self.embeds, self.sink)
+        # Use the real resolver so ``npu`` / ``device_id`` flow through
+        # identically to the unpatched backend.
+        from rkai.backends import resolve_device_id
+        resolved = resolve_device_id(RKNN3Lite, npu, device_id)
         if self.rknn.init_runtime(
             target=spec.target, core_mask=spec.core_mask,
             llm_args=build_llm_args(spec), llm_callback=cb,
+            device_id=resolved,
         ) != 0:
             raise RuntimeError("init_runtime failed")
         apply_chat_template(self.rknn)
     text_mod.TextBackend.__init__ = h_text2
 
     orig_vlm_init = vlm_mod.VLMBackend.__init__
-    def h_vlm(self, spec):
+    def h_vlm(self, spec, *, npu=None, device_id=None):
         from rknn3lite.api import RKNN3Lite
         if not spec.rknn_llm_path or not spec.rknn_vision_path:
             raise ValueError("missing path")
@@ -191,8 +208,11 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
         )
         self.tokenizer = vlm_mod.load_tokenizer(spec.tokenizer_path)
         self.embeds = vlm_mod.load_embed_table(spec.embed_path, spec.vocab_size)
+        from rkai.backends import resolve_device_id
+        resolved = resolve_device_id(RKNN3Lite, npu, device_id)
         if self.rknn_vision.init_runtime(
             target=spec.target, core_mask=spec.core_mask,
+            device_id=resolved,
         ) != 0:
             raise RuntimeError("vision init failed")
         self.sink = StreamSink(tokenizer=self.tokenizer)
@@ -200,6 +220,7 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
         if self.rknn_llm.init_runtime(
             target=spec.target, core_mask=spec.core_mask,
             llm_args=build_llm_args(spec), llm_callback=cb,
+            device_id=resolved,
         ) != 0:
             raise RuntimeError("llm init failed")
         apply_chat_template(self.rknn_llm)
@@ -400,6 +421,114 @@ def test_session_respond_full_flow():
 
 
 # --------------------------------------------------------------------------- #
+def test_device_id_passed_through():
+    """``LLMSession(model=..., device_id=b"...")`` 下传到 RKNN3Lite.init_runtime。"""
+    from rkai import LLMSession, SystemLanguageModel
+
+    embed, tok_dir = _make_workspace()
+    _install_mocks(deepstack_n=0, vocab_size=64)
+
+    spec = SystemLanguageModel.qwen3_1_7b().with_paths(
+        rknn_path="/fake.rknn3", weight_path="/fake.weight",
+        tokenizer_path=tok_dir, embed_path=embed,
+    )
+
+    raw = b"rk-custom-serial"
+    sess = LLMSession(model=spec, device_id=raw)
+    assert sess.device_id == raw
+    assert sess.npu is None
+    captured = sess._backend.rknn.last_init_runtime_kwargs
+    assert captured is not None
+    assert captured.get("device_id") == raw
+    print("[device_id] TextBackend init_runtime kw device_id =", captured["device_id"])
+    sess.close()
+
+    # str 形态也会被自动 encode
+    sess2 = LLMSession(model=spec, device_id="rk3588")
+    assert sess2.device_id == b"rk3588"
+    captured2 = sess2._backend.rknn.last_init_runtime_kwargs
+    assert captured2.get("device_id") == b"rk3588"
+    print("[device_id] str -> bytes, kw =", captured2["device_id"])
+    sess2.close()
+
+
+def test_npu_index_resolves_via_get_devices_id():
+    """``LLMSession(model=..., npu=K)`` 走 ``RKNN3Lite().get_devices_id()[K]``。"""
+    from rkai import LLMSession, SystemLanguageModel
+
+    embed, tok_dir = _make_workspace()
+    _install_mocks(deepstack_n=3, vocab_size=64)
+
+    spec = SystemLanguageModel.qwen3_vl_2b().with_paths(
+        rknn_llm_path="/fake_llm.rknn3", rknn_vision_path="/fake_v.rknn3",
+        tokenizer_path=tok_dir, embed_path=embed,
+    )
+
+    # _FakeRknn.mock_devices = [b'0001:11:00.0', b'0003:31:00.0', b'deadbeef']
+    sess = LLMSession(model=spec, npu=1)
+    assert sess.npu == 1
+    expected = b"0003:31:00.0"
+
+    # vision + llm 都应该拿到同一个解析后的 device_id
+    assert sess._backend.rknn_vision.last_init_runtime_kwargs.get("device_id") == expected
+    assert sess._backend.rknn_llm.last_init_runtime_kwargs.get("device_id") == expected
+    print(
+        "[npu] vision=%r llm=%r"
+        % (
+            sess._backend.rknn_vision.last_init_runtime_kwargs["device_id"],
+            sess._backend.rknn_llm.last_init_runtime_kwargs["device_id"],
+        )
+    )
+    sess.close()
+
+
+def test_npu_out_of_range_raises():
+    """``npu`` 越界时抛 IndexError，错误消息列出可用列表。"""
+    from rkai import LLMSession, SystemLanguageModel
+
+    embed, tok_dir = _make_workspace()
+    _install_mocks(deepstack_n=0, vocab_size=64)
+
+    spec = SystemLanguageModel.qwen3_1_7b().with_paths(
+        rknn_path="/fake.rknn3", weight_path="/fake.weight",
+        tokenizer_path=tok_dir, embed_path=embed,
+    )
+
+    try:
+        LLMSession(model=spec, npu=10)
+    except IndexError as e:
+        msg = str(e)
+        assert "npu=10" in msg
+        assert "device(s) found" in msg
+        # 可用列表里有这 3 个 mock id 之一
+        assert b"0001:11:00.0" in msg.encode() or b"deadbeef" in msg.encode()
+        print("[npu] out-of-range IndexError:", msg)
+    else:
+        raise AssertionError("expected IndexError")
+
+
+def test_npu_and_device_id_mutually_exclusive():
+    """同时传 npu + device_id 直接在 LLMSession.__init__ 抛 ValueError（不依赖 backend）。"""
+    from rkai import LLMSession, SystemLanguageModel
+
+    embed, tok_dir = _make_workspace()
+    _install_mocks(deepstack_n=0, vocab_size=64)
+
+    spec = SystemLanguageModel.qwen3_1_7b().with_paths(
+        rknn_path="/fake.rknn3", weight_path="/fake.weight",
+        tokenizer_path=tok_dir, embed_path=embed,
+    )
+
+    try:
+        LLMSession(model=spec, npu=0, device_id=b"abc")
+    except ValueError as e:
+        assert "mutually exclusive" in str(e)
+        print("[npu] mutual-exclusion ValueError:", e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     test_text_qwen3()
     test_text_qwen25()
@@ -407,4 +536,8 @@ if __name__ == "__main__":
     test_image_qwen25vl()
     test_overrides_passed_to_session_run()
     test_session_respond_full_flow()
+    test_device_id_passed_through()
+    test_npu_index_resolves_via_get_devices_id()
+    test_npu_out_of_range_raises()
+    test_npu_and_device_id_mutually_exclusive()
     print("\nALL MOCK TESTS PASSED")

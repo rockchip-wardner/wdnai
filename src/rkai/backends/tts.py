@@ -59,7 +59,7 @@ import threading
 import time
 import zlib
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -78,6 +78,7 @@ except Exception as exc:  # pragma: no cover - import error path
     ) from exc
 
 from ..attachment import Attachment
+from ._common import resolve_device_id
 
 LOG = logging.getLogger("rkai.backends.tts")
 
@@ -1464,7 +1465,13 @@ class TTSBackend:
     so the v2 caller sees a unified output.
     """
 
-    def __init__(self, spec):
+    def __init__(
+        self,
+        spec,
+        *,
+        npu: Optional[int] = None,
+        device_id: Optional[Union[bytes, str]] = None,
+    ):
         self.spec = spec
         self.model_dir = _resolve_tts_model_dir(spec)
         if not self.model_dir.is_dir():
@@ -1472,12 +1479,20 @@ class TTSBackend:
                 f"TTS model directory not found: {self.model_dir}"
             )
 
+        # Resolve NPU selection **once** (the four RKNN3Lite handles in
+        # Qwen3TTSDriver — text_projection / talker / code_predictor /
+        # speech_decoder — all share this resolved bytes).
+        resolved_device_id = resolve_device_id(RKNN3Lite, npu, device_id)
+
         # Instantiating ``Qwen3TTSDriver`` loads the four RKNN3 models
         # + embed tables up front; that cost is paid for in
         # ``run_text`` and friends. ``TTSBackend`` is intentionally
         # not importable for non-TTS tasks — keep the import
         # localised here.
-        self.driver = Qwen3TTSDriver(model_dir=str(self.model_dir))
+        self.driver = Qwen3TTSDriver(
+            model_dir=str(self.model_dir),
+            device_id=resolved_device_id,
+        )
         LOG.info("TTSBackend initialised; model_dir=%s", self.model_dir)
 
     # ------------------------------------------------------------------ #
