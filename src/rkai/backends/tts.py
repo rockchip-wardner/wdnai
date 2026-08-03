@@ -603,8 +603,42 @@ class Qwen3TTSDriver:
         )
         return bundled
 
+    def ensure_loaded(self):
+        """Eagerly load embed tables + tokeniser + all four RKNN3 models.
+
+        Idempotent — each underlying ``init_*`` method short-circuits on a
+        non-None handle, and ``load_resources`` short-circuits on a non-None
+        embed / tokenizer. Safe to call multiple times.
+
+        Called by :class:`TTSBackend.__init__` so that ``LLMSession(...)``
+        instantiation triggers the full TTS load (matching the eager
+        semantics of ``TextBackend`` / ``VLMBackend`` / ``ASRBackend`` —
+        those run ``load_rknn`` + ``init_runtime`` directly in their
+        constructors). Without this, the user-facing "运行中" status on
+        the 算力配置 page is misleading: NPU runtime is not built, weights
+        are not even mmap'd until the first ``run_text`` triggers
+        ``run_with_progress``.
+        """
+        if getattr(self, "_ensure_loaded_done", False):
+            return
+        self.load_resources()
+        self.init_text_projection()
+        self.init_speech_decoder()
+        self.init_code_predictor()
+        self.init_talker()
+        self._ensure_loaded_done = True
+
     def load_resources(self):
-        """Load embedding tables and configure the tokenizer."""
+        """Load embedding tables and configure the tokenizer.
+
+        Idempotent: after the first call the embed tables (~750 MB) and
+        tokenizer are reused on subsequent calls. pyrkaiweb relies on
+        this — ``TtsSession._infer_one`` issues one ``respond`` per
+        ``tts_alert`` trigger; re-loading 750 MB each time made every
+        call ~10 s before this guard landed.
+        """
+        if self.text_embed is not None and self._encode_text is not None:
+            return
         text_path = self.model_dir / "talker_text_embed.fp16.bin"
         input_path = self.model_dir / "talker_input_embed.fp16.bin"
         codec_path = self.model_dir / "codec_embed.fp16.bin"
@@ -635,6 +669,8 @@ class Qwen3TTSDriver:
     # text_projection (separate inference, not LLM)
     # ------------------------------------------------------------------ #
     def init_text_projection(self):
+        if self.text_projection is not None:
+            return
         rknn_path, weight_path = self._resolve_model_paths("text_projection")
         self.text_projection = RKNN3Lite(verbose=self.verbose)
         ret = self.text_projection.load_rknn(str(rknn_path), str(weight_path))
@@ -684,6 +720,8 @@ class Qwen3TTSDriver:
     # speech_decoder (separate inference, not LLM)
     # ------------------------------------------------------------------ #
     def init_speech_decoder(self):
+        if self.speech_decoder is not None:
+            return
         rknn_path, weight_path = self._resolve_model_paths("speech_decoder")
         self.speech_decoder = RKNN3Lite(verbose=self.verbose)
         ret = self.speech_decoder.load_rknn(str(rknn_path), str(weight_path))
@@ -712,6 +750,8 @@ class Qwen3TTSDriver:
     # code_predictor (LLM)
     # ------------------------------------------------------------------ #
     def init_code_predictor(self):
+        if self.code_predictor is not None:
+            return
         rknn_path, weight_path = self._resolve_model_paths("code_predictor")
         self.code_predictor = RKNN3Lite(llm_mode=True, verbose=self.verbose)
         ret = self.code_predictor.load_rknn(str(rknn_path), str(weight_path))
@@ -766,6 +806,8 @@ class Qwen3TTSDriver:
     # talker (LLM)
     # ------------------------------------------------------------------ #
     def init_talker(self):
+        if self.talker is not None:
+            return
         rknn_path, weight_path = self._resolve_model_paths("talker")
         self.talker = RKNN3Lite(llm_mode=True, verbose=self.verbose)
         ret = self.talker.load_rknn(str(rknn_path), str(weight_path))
@@ -1272,7 +1314,6 @@ class Qwen3TTSDriver:
             if self.audio_player is not None:
                 self.audio_player.close()
                 self.audio_player = None
-            self.release()
 
     def _run_talker_streaming_with_progress(
         self,
@@ -1493,6 +1534,13 @@ class TTSBackend:
             model_dir=str(self.model_dir),
             device_id=resolved_device_id,
         )
+        # Eagerly trigger the full TTS load (embed tables + 4× load_rknn
+        # + 4× init_runtime). Without this, the heavy init work would be
+        # deferred to the first ``run_text`` call, making the "运行中"
+        # status on the 算力配置 page misleading (NPU runtime not built,
+        # .weight files not even mmap'd). Mirrors the eager semantics
+        # already used by TextBackend / VLMBackend / ASRBackend.
+        self.driver.ensure_loaded()
         LOG.info("TTSBackend initialised; model_dir=%s", self.model_dir)
 
     # ------------------------------------------------------------------ #
