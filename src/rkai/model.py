@@ -21,10 +21,8 @@ Typical usage::
 """
 from __future__ import annotations
 
-import logging
 import os as _os
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict
 
@@ -126,6 +124,12 @@ def _qwen3_spec(**overrides) -> ModelSpec:
     )
     base.update(overrides)
     return ModelSpec(**base)
+
+
+def _qwen3_8b_spec(**overrides) -> ModelSpec:
+    base = dict(name="qwen3-8b", max_context_len=4096)
+    base.update(overrides)
+    return _qwen3_spec(**base)
 
 
 def _qwen2_5vl_spec(**overrides) -> ModelSpec:
@@ -279,6 +283,39 @@ def _verify_qwen3_vl_4b_files() -> None:
         )
 
 
+_QWEN3_8B_REQUIRED = (
+    "Qwen3-8B.1828.rknn",
+    "Qwen3-8B.weight",
+    "Qwen3-8B.embed.bin",
+    "Qwen3-8B.tokenizer.gguf",
+)
+
+
+def _qwen3_8b_dir() -> Path:
+    override = _os.environ.get("RKAI_QWEN3_8B_DIR")
+    return Path(override) if override else _models_root() / "Qwen3-8B"
+
+
+def _default_qwen3_8b_paths() -> dict:
+    d = _qwen3_8b_dir()
+    return {
+        "rknn_path":      str(d / "Qwen3-8B.1828.rknn"),
+        "weight_path":    str(d / "Qwen3-8B.weight"),
+        "tokenizer_path": str(d / "Qwen3-8B.tokenizer.gguf"),
+        "embed_path":     str(d / "Qwen3-8B.embed.bin"),
+    }
+
+
+def _verify_qwen3_8b_files() -> None:
+    d = _qwen3_8b_dir()
+    missing = [f for f in _QWEN3_8B_REQUIRED if not (d / f).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Qwen3-8B files missing under {d}: {missing}. "
+            f"Place the files there or set RKAI_QWEN3_8B_DIR to point at a custom path."
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Public catalog
 # --------------------------------------------------------------------------- #
@@ -290,6 +327,8 @@ class SystemLanguageModel:
     - ``default``                — placeholder ``ModelSpec`` (no paths; for demos).
     - ``qwen2_5_0_5b()``         — Qwen2.5-0.5B-Instruct
     - ``qwen3_1_7b()``           — Qwen3-1.7B
+    - ``qwen3_8b()``             — Qwen3-8B (pure text) bound to
+                                    ``/userdata/models/Qwen3-8B``
     - ``qwen2_5_vl_3b()``        — Qwen2.5-VL-3B (image)
     - ``qwen2_5_vl_7b()``        — Qwen2.5-VL-7B (image)
     - ``qwen3_vl_2b()``          — Qwen3-VL-2B (image)
@@ -318,6 +357,15 @@ class SystemLanguageModel:
     @classmethod
     def qwen3_1_7b(cls) -> ModelSpec:
         return _qwen3_spec()
+
+    @classmethod
+    def qwen3_8b(cls) -> ModelSpec:
+        """Return a :class:`ModelSpec` pre-bound to the Qwen3-8B files at
+        ``/userdata/models/Qwen3-8B/`` (override via ``RKAI_QWEN3_8B_DIR``);
+        raises :class:`FileNotFoundError` listing any missing files.
+        """
+        _verify_qwen3_8b_files()
+        return _qwen3_8b_spec().with_paths(**_default_qwen3_8b_paths())
 
     # ---- Vision LLM ----------------------------------------------------
     @classmethod

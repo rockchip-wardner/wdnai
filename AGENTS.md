@@ -46,9 +46,12 @@ name `rkai`.
   (TTS audio bytes, decoded multimodal images, …).
 - `src/rkai/model.py` — `ModelSpec` dataclass (paths + sampling +
   vocab + image_size + target/core_mask) + `SystemLanguageModel`
-  preset catalog: `qwen2_5_0_5b()`, `qwen3_1_7b()`, `qwen2_5_vl_3b()`
-  / `_7b()`, `qwen3_vl_2b()`, `qwen3_vl_4b_template()`, `qwen3_vl_4b()`,
-  `qwen3_tts()`. The `_4b()` preset binds to
+  preset catalog: `qwen2_5_0_5b()`, `qwen3_1_7b()`, `qwen3_8b()`
+  (pure-text, binds to `/userdata/models/Qwen3-8B/`, overridable via
+  `RKAI_QWEN3_8B_DIR`; raises `FileNotFoundError` listing missing
+  files), `qwen2_5_vl_3b()` / `_7b()`, `qwen3_vl_2b()`,
+  `qwen3_vl_4b_template()`, `qwen3_vl_4b()`, `qwen3_tts()`.
+  The `qwen3_vl_4b()` preset binds to
   `/userdata/models/Qwen3-VL-4B/` (overridable via
   `RKAI_QWEN3_VL_4B_DIR`) and raises `FileNotFoundError` listing
   missing files if the directory is incomplete.
