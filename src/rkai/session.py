@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
+import numpy as np
+
 from pydantic import BaseModel
 
 from ._callable import (
@@ -495,6 +497,17 @@ class LLMSession:
         if self._backend is not None:
             self._backend.close()
             self._backend = None
+
+    # ------------------------------------------------------------------ #
+    # Embedding passthroughs (kind="embedding" backend only)
+    # ------------------------------------------------------------------ #
+    def embed_text(self, text: str) -> np.ndarray:
+        """Return a normalized embedding vector for a text query."""
+        return self._backend.embed_text(text)
+
+    def embed_video(self, frames: List[np.ndarray], prompt: str = "") -> np.ndarray:
+        """Return a normalized embedding vector for a list of BGR video frames."""
+        return self._backend.embed_video_chunk(frames, text=prompt)
 
     # ------------------------------------------------------------------ #
     # Stability helpers

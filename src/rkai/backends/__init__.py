@@ -5,6 +5,7 @@ from typing import Dict, Optional, Type, Union
 
 from ..model import ModelSpec
 from ._common import resolve_device_id
+from .embedding import EmbeddingBackend
 from .text import TextBackend
 from .tts import TTSBackend
 from .vlm import VLMBackend
@@ -13,6 +14,7 @@ _REGISTRY: Dict[str, Type] = {
     "llm": TextBackend,
     "vlm": VLMBackend,
     "tts": TTSBackend,
+    "embedding": EmbeddingBackend,
 }
 
 
@@ -41,9 +43,12 @@ def build_backend(
     cls = _REGISTRY.get(spec.kind)
     if cls is None:
         raise ValueError(
-            f"Unknown kind: {spec.kind!r} (expected 'llm' / 'vlm' / 'tts' / 'asr')"
+            f"Unknown kind: {spec.kind!r} (expected 'llm' / 'vlm' / 'tts' / 'asr' / 'embedding')"
         )
     return cls(spec, npu=npu, device_id=device_id)
 
 
-__all__ = ["TextBackend", "VLMBackend", "TTSBackend", "build_backend", "resolve_device_id"]
+__all__ = [
+    "TextBackend", "VLMBackend", "TTSBackend", "EmbeddingBackend",
+    "build_backend", "resolve_device_id",
+]

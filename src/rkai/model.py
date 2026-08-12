@@ -24,7 +24,7 @@ from __future__ import annotations
 import os as _os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 # --------------------------------------------------------------------------- #
@@ -35,8 +35,8 @@ class ModelSpec:
     """All static configuration + dynamic paths needed for a single model."""
 
     name: str
-    kind: str                                # "llm" | "vlm" | "tts"
-    variant: str                             # "qwen2.5" | "qwen3" | "qwen2.5-vl" | "qwen3-vl" | "qwen3-tts"
+    kind: str                                # "llm" | "vlm" | "tts" | "embedding"
+    variant: str                             # "qwen2.5" | "qwen3" | "qwen2.5-vl" | "qwen3-vl" | "qwen3-tts" | "qwen3-vl-embedding"
 
     # ---- LLM / VLM / TTS resources ----
     # kind=llm uses rknn_path / weight_path; kind=vlm uses rknn_llm_path / rknn_vision_path;
@@ -317,6 +317,49 @@ def _verify_qwen3_8b_files() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Qwen3-VL-Embedding-2B: retrieval embedding model (no LLM token generation).
+# File layout matches Qwen3-VL-4B (llm/vision .1828.rknn + .weight + embed.bin
+# + tokenizer.gguf). The LLM model is loaded via the plain RKNN3Lite path (not
+# the llm_mode session) and produces a normalized 2048-dim embedding vector.
+# --------------------------------------------------------------------------- #
+_QWEN3_VL_EMBEDDING_2B_DIR_NAME = "Qwen3-VL-Embedding-2B"
+_QWEN3_VL_EMBEDDING_2B_REQUIRED = (
+    "llm_Qwen3-VL-Embedding-2B.1828.rknn",
+    "llm_Qwen3-VL-Embedding-2B.weight",
+    "vision_Qwen3-VL-Embedding-2B.1828.rknn",
+    "vision_Qwen3-VL-Embedding-2B.weight",
+    "Qwen3-VL-Embedding-2B.embed.bin",
+    "Qwen3-VL-Embedding-2B.tokenizer.gguf",
+)
+
+
+def _qwen3_vl_embedding_2b_dir() -> Path:
+    return _models_root() / _QWEN3_VL_EMBEDDING_2B_DIR_NAME
+
+
+def _default_qwen3_vl_embedding_2b_paths() -> dict:
+    """Return absolute paths to the Qwen3-VL-Embedding-2B files."""
+    d = _qwen3_vl_embedding_2b_dir()
+    return {
+        "rknn_llm_path":   str(d / "llm_Qwen3-VL-Embedding-2B.1828.rknn"),
+        "rknn_vision_path": str(d / "vision_Qwen3-VL-Embedding-2B.1828.rknn"),
+        "tokenizer_path":  str(d / "Qwen3-VL-Embedding-2B.tokenizer.gguf"),
+        "embed_path":      str(d / "Qwen3-VL-Embedding-2B.embed.bin"),
+    }
+
+
+def _verify_qwen3_vl_embedding_2b_files() -> None:
+    """Raise :class:`FileNotFoundError` listing any missing Qwen3-VL-Embedding-2B files."""
+    d = _qwen3_vl_embedding_2b_dir()
+    missing = [f for f in _QWEN3_VL_EMBEDDING_2B_REQUIRED if not (d / f).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Qwen3-VL-Embedding-2B files missing under {d}: {missing}. "
+            f"Place the files there or set RKAI_MODELS_DIR to override the root."
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Public catalog
 # --------------------------------------------------------------------------- #
 class SystemLanguageModel:
@@ -458,4 +501,27 @@ class SystemLanguageModel:
                 "online_rollback_tokens": 5,
                 "online_rollback_rounds": 4,
             },
+        )
+
+    @classmethod
+    def qwen3_vl_embedding(cls) -> ModelSpec:
+        """Return a :class:`ModelSpec` pre-bound to the Qwen3-VL-Embedding-2B files.
+
+        Retrieval embedding model (no token generation): the LLM is run via the
+        plain ``RKNN3Lite`` path with manual inputs and returns a normalized
+        2048-dim vector. Expected at ``/userdata/models/Qwen3-VL-Embedding-2B/``
+        (override the root with the ``RKAI_MODELS_DIR`` environment variable);
+        missing files raise :class:`FileNotFoundError`.
+        """
+        _verify_qwen3_vl_embedding_2b_files()
+        return ModelSpec(
+            name="qwen3-vl-embedding-2b",
+            kind="embedding",
+            variant="qwen3-vl-embedding",
+            target="rk1820",
+            core_mask=0xFF,
+            vocab_size=151936,
+            image_size=576,
+            max_context_len=2048,
+            **{**_default_qwen3_vl_embedding_2b_paths()},
         )
