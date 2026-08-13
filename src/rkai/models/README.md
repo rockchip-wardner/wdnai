@@ -97,3 +97,26 @@ Output WAV is 24 kHz mono 32-bit IEEE-float (format tag 3); the 5-sec
 To register a new TTS variant, lay down a sibling directory under
 `/userdata/models/<new-variant>/` with the same file naming and add
 a preset that points to it.
+
+### Qwen3-VL-Embedding-2B (retrieval embedding)
+
+A retrieval embedding model — **no token generation**. The LLM is
+loaded via the plain `RKNN3Lite` path (not the llm-mode session) and
+run with 7 manual inputs; `embed_text` / `embed_video_chunk` return a
+L2-normalized 2048-dim vector. File layout mirrors Qwen3-VL-4B
+(llm/vision `.1828.rknn` + `.weight` + embed table + tokenizer).
+Used by pyrkaiweb's `#page-video-content-search` via the
+`EmbeddingBackend` in `rkai/backends/embedding.py`
+(`SystemLanguageModel.qwen3_vl_embedding`).
+
+| File (`<root>/Qwen3-VL-Embedding-2B/…`)     | Purpose                              |
+| ------------------------------------------- | ------------------------------------ |
+| `llm_Qwen3-VL-Embedding-2B.1828.rknn` + `.weight`   | Embedding LLM (plain RKNN3Lite path) |
+| `vision_Qwen3-VL-Embedding-2B.1828.rknn` + `.weight`| Vision encoder (input 576×576)       |
+| `Qwen3-VL-Embedding-2B.embed.bin`           | Token embedding table (151936 × 2048) |
+| `Qwen3-VL-Embedding-2B.tokenizer.gguf`      | GPT-2 BPE + ByteLevel tokenizer      |
+
+`max_context_len` defaults to 2048 tokens; the vision feature is fed
+at 576×576 (matching the model's native input) and each video chunk
+contributes `FRAME_TOKENS` vision tokens (see
+`rkai/backends/embedding.py`).

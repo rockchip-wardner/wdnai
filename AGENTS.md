@@ -50,7 +50,10 @@ name `rkai`.
   (pure-text, binds to `/userdata/models/Qwen3-8B/`, overridable via
   `RKAI_QWEN3_8B_DIR`; raises `FileNotFoundError` listing missing
   files), `qwen2_5_vl_3b()` / `_7b()`, `qwen3_vl_2b()`,
-  `qwen3_vl_4b_template()`, `qwen3_vl_4b()`, `qwen3_tts()`.
+  `qwen3_vl_4b_template()`, `qwen3_vl_4b()`, `qwen3_tts()`,
+  `qwen3_vl_embedding()` (retrieval embedding, no token generation,
+  binds to `/userdata/models/Qwen3-VL-Embedding-2B/` and raises
+  `FileNotFoundError` listing missing files).
   The `qwen3_vl_4b()` preset binds to
   `/userdata/models/Qwen3-VL-4B/` (overridable via
   `RKAI_QWEN3_VL_4B_DIR`) and raises `FileNotFoundError` listing
@@ -82,8 +85,15 @@ name `rkai`.
   ~7 regular tokens and `rknn3` session_run would never find the
   expected IDs.
 - `src/rkai/backends/__init__.py` — `build_backend(spec)` factory:
-  `{"llm": TextBackend, "vlm": VLMBackend, "tts": TTSBackend}`
-  registry.
+  `{"llm": TextBackend, "vlm": VLMBackend, "tts": TTSBackend,
+  "embedding": EmbeddingBackend}` registry (asr is loaded on demand).
+- `src/rkai/backends/embedding.py` — `EmbeddingBackend` (kind=
+  "embedding"): loads llm/vision `.1828.rknn` + `.weight` + embed.bin
+  + tokenizer under `RKAI_MODELS_DIR/Qwen3-VL-Embedding-2B`, feeds
+  vision at 576x576, exposes `embed_text(text)` and
+  `embed_video_chunk(frames, text="")` returning L2-normalized
+  2048-dim vectors (the LLM runs through the plain RKNN3Lite path,
+  no token generation).
 - `src/rkai/backends/_common.py` — shared RKNN plumbing:
   `StreamSink` (collects tokens / text / perf from streaming
   callback), `make_result_callback` / `make_tokenizer_callback` /
