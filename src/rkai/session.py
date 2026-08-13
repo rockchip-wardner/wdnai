@@ -446,11 +446,11 @@ class LLMSession:
         if isinstance(raw_text, generating):
             result = raw_text
         elif isinstance(raw_text, dict):
-            result = _model_validate(generating, raw_text)
+            result = _safe_validate(generating, raw_text, raw_text)
         elif isinstance(raw_text, str):
             data = extract_json(raw_text)
             if isinstance(data, dict):
-                result = _model_validate(generating, data)
+                result = _safe_validate(generating, data, raw_text)
             elif data is None:
                 # The model didn't emit valid JSON. Hand back a
                 # model instance that carries the raw text in a
@@ -460,17 +460,8 @@ class LLMSession:
                 # ``model_config = ConfigDict(extra="allow")`` on the
                 # class; otherwise we construct a bare instance and
                 # set ``text`` as a normal Python attribute.
-                try:
-                    if "text" in getattr(generating, "model_fields", {}):
-                        result = generating.model_construct(
-                            _fields_set={"text"}, text=raw_text,
-                        )
-                    else:
-                        result = generating.model_construct()
-                        result.text = raw_text  # type: ignore[attr-defined]
-                except Exception:
-                    # Last-resort: return the raw string and let the
-                    # caller notice the missing fields.
+                result = _construct_text_instance(generating, raw_text)
+                if result is None:
                     return raw_text  # type: ignore[return-value]
             else:
                 result = _model_validate_json(generating, data)
@@ -606,3 +597,105 @@ def _model_validate_json(model: Type[T], data: str) -> T:
     if validator is None:  # pragma: no cover
         raise RuntimeError("No suitable pydantic validator found")
     return validator(data)  # type: ignore[return-value]
+
+
+def _construct_text_instance(
+    model: Type[T], raw_text: str,
+) -> Optional[T]:
+    """Build a model instance that carries ``raw_text`` in a ``text`` field.
+
+    Used as a fallback when the model output doesn't validate against the
+    schema: either the model returned a dict with the wrong field names
+    (e.g. ``{"description": …}`` instead of ``{"text": …}``) or it didn't
+    emit valid JSON at all. We preserve the model's content so the caller
+    doesn't lose the description / 推理内容, and we keep the schema
+    instance shape so downstream code (``isinstance(result, VLMDoc)``,
+    ``getattr(result, "level", None)``, etc.) keeps working.
+
+    Returns ``None`` when the model doesn't declare a ``text`` field *and*
+    doesn't allow extras — in that case the caller should fall back to
+    returning the raw string.
+    """
+    try:
+        if "text" in getattr(model, "model_fields", {}):
+            return model.model_construct(
+                _fields_set={"text"}, text=raw_text,
+            )
+        # No declared ``text`` field: try injecting as an extra.
+        return model.model_construct(text=raw_text)
+    except Exception:
+        return None
+
+
+def _extract_text_from_mismatched_dict(
+    data: Dict[str, Any],
+) -> Optional[str]:
+    """Best-effort: find the model's actual text content in a dict that
+    failed schema validation.
+
+    The Qwen2.5-VL legacy field name was ``description``; Qwen3-VL
+    sometimes still emits it (or ``content`` / ``message`` / ``caption``)
+    even when the schema hint says ``text``. We try a fixed list of
+    aliases in order, then fall back to the first long string field
+    that isn't a known severity/level tag.
+    """
+    aliases = ("text", "description", "content", "message", "caption", "summary")
+    for key in aliases:
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    # First non-trivial string field that isn't a severity / enum-ish key.
+    skip = {"level", "severity", "type", "category", "tag"}
+    for k, v in data.items():
+        if k in skip:
+            continue
+        if isinstance(v, str) and len(v.strip()) >= 4:
+            return v
+    return None
+
+
+def _safe_validate(
+    model: Type[T], data: Dict[str, Any], raw_text_for_fallback: str,
+) -> T:
+    """Run ``_model_validate`` and fall back on ``ValidationError``.
+
+    Some VLM backends occasionally emit a JSON object whose keys don't
+    match the schema (e.g. legacy ``{"description": …}`` field name, or
+    extra fields the model added on its own). Without this guard the
+    whole ``sess.respond`` call raises ``pydantic_core.ValidationError``
+    and the worker's ``DetectorEvent`` collapses to a "(推理失败)"
+    placeholder, wasting the 1s frame-inference cycle. By catching the
+    validation error and falling back to ``_construct_text_instance``
+    we keep the model's text content and stay on the same schema
+    branch the caller already wrote.
+
+    Any other exception (TypeError, RuntimeError, …) is re-raised so
+    real bugs aren't masked.
+
+    The fallback only applies when the target schema has a ``text``
+    field (e.g. ``VLMDoc``) — that's the common VLM structured-output
+    case where the model emits free-form text wrapped in a dict.
+    Structured-output schemas without a ``text`` field (e.g.
+    ``TargetDoc`` with ``x1, y1, x2, y2, desc``) re-raise the
+    ValidationError so the caller can deal with it explicitly; trying
+    to inject a ``text=`` kwarg there would silently produce a
+    half-populated instance.
+    """
+    try:
+        return _model_validate(model, data)
+    except Exception as e:  # noqa: BLE001
+        cls_name = type(e).__name__
+        if cls_name == "ValidationError" or "pydantic" in cls_name.lower():
+            if "text" not in getattr(model, "model_fields", {}):
+                raise
+            # Prefer the model's actual content (often sitting in a
+            # ``description``/``content`` key) over the raw string —
+            # the raw string usually wraps the JSON object as-is and
+            # would show up as a literal dict on the UI.
+            text_value = _extract_text_from_mismatched_dict(data)
+            if text_value is None:
+                text_value = raw_text_for_fallback
+            fallback = _construct_text_instance(model, text_value)
+            if fallback is not None:
+                return fallback
+        raise
