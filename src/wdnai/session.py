@@ -249,8 +249,11 @@ class LLMSession:
             n_channels = int(overrides.pop("n_channels", 1))
             sample_width = int(overrides.pop("sample_width", 2))
             text = self._backend.run_audio(
-                pcm, sample_rate=sample_rate,
-                n_channels=n_channels, sample_width=sample_width,
+                pcm,
+                sample_rate=sample_rate,
+                n_channels=n_channels,
+                sample_width=sample_width,
+                prompt=full_prompt,
                 **overrides,
             )
             return text, []

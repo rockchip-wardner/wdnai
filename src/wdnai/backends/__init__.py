@@ -40,15 +40,19 @@ def build_backend(
     if spec.kind == "asr":
         from .asr import ASRBackend  # type: ignore  # noqa: WPS433
         return ASRBackend(spec, npu=npu, device_id=device_id)
+    if spec.kind == "omni":
+        from .omni import OmniBackend  # type: ignore  # noqa: WPS433
+        return OmniBackend(spec, npu=npu, device_id=device_id)
     cls = _REGISTRY.get(spec.kind)
     if cls is None:
         raise ValueError(
-            f"Unknown kind: {spec.kind!r} (expected 'llm' / 'vlm' / 'tts' / 'asr' / 'embedding')"
+            f"Unknown kind: {spec.kind!r} (expected 'llm' / 'vlm' / 'tts' / 'omni' / 'asr' / 'embedding')"
         )
     return cls(spec, npu=npu, device_id=device_id)
 
 
 __all__ = [
     "TextBackend", "VLMBackend", "TTSBackend", "EmbeddingBackend",
+    "OmniBackend", "ASRBackend",
     "build_backend", "resolve_device_id",
 ]

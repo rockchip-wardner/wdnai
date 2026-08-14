@@ -35,12 +35,13 @@ class ModelSpec:
     """All static configuration + dynamic paths needed for a single model."""
 
     name: str
-    kind: str                                # "llm" | "vlm" | "tts" | "embedding"
-    variant: str                             # "qwen2.5" | "qwen3" | "qwen2.5-vl" | "qwen3-vl" | "qwen3-tts" | "qwen3-vl-embedding"
+    kind: str                                # "llm" | "vlm" | "tts" | "omni" | "asr" | "embedding"
+    variant: str                             # "qwen2.5" | "qwen3" | "qwen2.5-vl" | "qwen3-vl" | "qwen2.5-omni" | "qwen3-tts" | "qwen3-asr" | "qwen3-vl-embedding"
 
-    # ---- LLM / VLM / TTS resources ----
+    # ---- LLM / VLM / TTS / Omni / ASR resources ----
     # kind=llm uses rknn_path / weight_path; kind=vlm uses rknn_llm_path / rknn_vision_path;
-    # kind=tts uses tts_model_dir (the four .rknn paths are derived from it).
+    # kind=tts uses tts_model_dir; kind=omni uses omni_model_dir (audio + llm derived from it);
+    # kind=asr uses asr_model_dir (encoder + llm derived from it).
     rknn_path: str = ""
     weight_path: str = ""
     rknn_llm_path: str = ""
@@ -48,6 +49,7 @@ class ModelSpec:
     rknn_vision_path: str = ""
     weight_vision_path: str = ""
     tts_model_dir: str = ""
+    omni_model_dir: str = ""
     asr_model_dir: str = ""
     embed_path: str = ""
     tokenizer_path: str = ""
@@ -360,6 +362,61 @@ def _verify_qwen3_vl_embedding_2b_files() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Qwen2.5-Omni-3B: audio language model (wav-in, text-out). Fixed at
+# ``/userdata/models/Qwen2.5-Omni-3B/`` (override via env var). File layout::
+#
+#     Qwen2.5-Omni-3B-audio.1828.rknn  + .weight        (dynamic shape 0/1)
+#     Qwen2.5-Omni-3B-llm.1828.rknn    + .weight        (llm_mode)
+#     Qwen2.5-Omni-3B-llm.embed.bin    fp16 (vocab_size × 2048)
+#     Qwen2.5-Omni-3B-llm.tokenizer.gguf  GPT-2 BPE + ByteLevel
+#     mel_128_filters.txt              (128 × N_FFT/2 + 1) fp32
+# --------------------------------------------------------------------------- #
+_QWEN_2_5_OMNI_3B_DIR_DEFAULT = "/userdata/models/Qwen2.5-Omni-3B"
+_QWEN_2_5_OMNI_3B_REQUIRED = (
+    "Qwen2.5-Omni-3B-audio.1828.rknn",
+    "Qwen2.5-Omni-3B-audio.weight",
+    "Qwen2.5-Omni-3B-llm.1828.rknn",
+    "Qwen2.5-Omni-3B-llm.weight",
+    "Qwen2.5-Omni-3B-llm.embed.bin",
+    "Qwen2.5-Omni-3B-llm.tokenizer.gguf",
+    "mel_128_filters.txt",
+)
+
+
+def _qwen_2_5_omni_3b_dir() -> Path:
+    """Resolve the Qwen2.5-Omni-3B model directory.
+
+    Override via the ``WDNAI_QWEN_2_5_OMNI_3B_DIR`` env var (full path);
+    default ``/userdata/models/Qwen2.5-Omni-3B``.
+    """
+    return Path(_os.environ.get(
+        "WDNAI_QWEN_2_5_OMNI_3B_DIR", _QWEN_2_5_OMNI_3B_DIR_DEFAULT,
+    ))
+
+
+def _default_qwen_2_5_omni_3b_paths() -> dict:
+    """Return absolute paths to the Qwen2.5-Omni-3B files under the resolved directory."""
+    d = _qwen_2_5_omni_3b_dir()
+    return {
+        "omni_model_dir": str(d),
+        "tokenizer_path": str(d / "Qwen2.5-Omni-3B-llm.tokenizer.gguf"),
+        "embed_path":     str(d / "Qwen2.5-Omni-3B-llm.embed.bin"),
+    }
+
+
+def _verify_qwen_2_5_omni_3b_files() -> None:
+    """Raise :class:`FileNotFoundError` listing any missing Qwen2.5-Omni-3B files."""
+    d = _qwen_2_5_omni_3b_dir()
+    missing = [f for f in _QWEN_2_5_OMNI_3B_REQUIRED if not (d / f).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Qwen2.5-Omni-3B files missing under {d}: {missing}. "
+            "Place the files there or set WDNAI_QWEN_2_5_OMNI_3B_DIR to point "
+            "at a custom path."
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Public catalog
 # --------------------------------------------------------------------------- #
 class SystemLanguageModel:
@@ -382,6 +439,10 @@ class SystemLanguageModel:
     - ``qwen3_tts()``            — Qwen3-TTS bound to ``/userdata/models/Qwen3-TTS``;
                                     the 4 ``.1828.rknn`` files are looked up inside
                                     that directory.
+    - ``qwen_2_5_omni_3b()``     — Qwen2.5-Omni-3B (audio) bound to
+                                    ``/userdata/models/Qwen2.5-Omni-3B``; override
+                                    via ``WDNAI_QWEN_2_5_OMNI_3B_DIR``. The SDK
+                                    auto-prepends ``<audio>`` to the user prompt.
     """
 
     #: Default placeholder (no paths; for the ``model=default`` syntax in demo_vlm)
@@ -455,6 +516,46 @@ class SystemLanguageModel:
             target="rk1820",
             core_mask=0xFF,
             tts_model_dir=str(_models_root() / "Qwen3-TTS"),
+        )
+
+    # ---- Omni (audio language model) ------------------------------------
+    @classmethod
+    def qwen_2_5_omni_3b(cls) -> ModelSpec:
+        """Return a :class:`ModelSpec` pre-bound to the fixed Qwen2.5-Omni-3B files.
+
+        Audio language model (wav-in, text-out). The files are expected at
+        ``/userdata/models/Qwen2.5-Omni-3B/`` (override with the
+        ``WDNAI_QWEN_2_5_OMNI_3B_DIR`` environment variable). If any expected
+        file is missing a :class:`FileNotFoundError` is raised listing them.
+
+        The SDK auto-prepends ``<audio>`` to the user prompt before sending
+        it to the LLM, so callers just write a plain text instruction::
+
+            async with LLMSession(model=SystemLanguageModel.qwen_2_5_omni_3b()) as sess:
+                text = await sess.respond(
+                    prompt="请描述这段音频的内容",
+                    attachment=[Attachment(pcm, kind="audio")],
+                    sample_rate=..., n_channels=..., sample_width=...,
+                )
+        """
+        _verify_qwen_2_5_omni_3b_files()
+        return ModelSpec(
+            name="qwen2.5-omni-3b",
+            kind="omni",
+            variant="qwen2.5-omni",
+            target="rk1820",
+            core_mask=0xFF,
+            vocab_size=151936,
+            special_eos_id=151645,
+            max_context_len=1024,
+            **_default_qwen_2_5_omni_3b_paths(),
+            options={
+                "max_new_tokens": 1024,
+                "top_k": 1,
+                "top_p": 0.9,
+                "temperature": 1.0,
+                "repeat_penalty": 1.2,
+            },
         )
 
     # ---- ASR -----------------------------------------------------------
