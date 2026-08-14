@@ -370,13 +370,53 @@ class AudioPlayer:
                     print(f"[audio] sounddevice write failed: {exc}", flush=True)
                     self._warned = True
         elif self._backend == "aplay":
+            # aplay 启动后可能立刻退（headless 板子 / HDMI 默认 / 格式不
+            # 支持 / 权限问题）。原先 Popen 完只 catch BrokenPipeError，
+            # 不 poll()，stderr 也被收着没读 —— 既不诊断也每帧打一行错。
+            # 现在写之前先 poll() 一次，死了就 drain stderr + 关掉 backend，
+            # 后续帧走 available=False 早退，不再反复触发 Broken pipe。
+            proc = self._proc
+            if proc is not None and proc.poll() is not None:
+                rc = proc.returncode
+                err = ""
+                try:
+                    if proc.stderr is not None:
+                        err = proc.stderr.read().decode(
+                            "utf-8", errors="replace")
+                except Exception:
+                    pass
+                if not self._warned:
+                    print(
+                        f"[audio] aplay exited rc={rc} before any write; "
+                        f"disabling playback (stderr: {err.strip()[:500]})",
+                        flush=True,
+                    )
+                    self._warned = True
+                self._backend = None
+                self._proc = None
+                self._closed = True
+                return
             try:
                 self._proc.stdin.write(chunk.tobytes())
                 self._proc.stdin.flush()
             except (BrokenPipeError, OSError) as exc:
                 if not self._warned:
-                    print(f"[audio] aplay write failed: {exc}", flush=True)
+                    err = ""
+                    try:
+                        if proc is not None and proc.stderr is not None:
+                            err = proc.stderr.read().decode(
+                                "utf-8", errors="replace")
+                    except Exception:
+                        pass
+                    print(
+                        f"[audio] aplay write failed: {exc}; disabling "
+                        f"playback (stderr: {err.strip()[:500]})",
+                        flush=True,
+                    )
                     self._warned = True
+                self._backend = None
+                self._proc = None
+                self._closed = True
 
     def close(self):
         if self._closed:
