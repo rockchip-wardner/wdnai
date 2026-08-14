@@ -8,7 +8,7 @@
 
 可通过环境变量更改根目录：
 
-    RKAI_QWEN3_8B_DIR=/path/to/Qwen3-8B
+    WDNAI_QWEN3_8B_DIR=/path/to/Qwen3-8B
 
 Usage::
 
@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from rkai import LLMSession, SystemLanguageModel
+from wdnai import LLMSession, SystemLanguageModel
 
 LOG = logging.getLogger("summarize_text")
 
@@ -76,7 +76,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--max-new-tokens", type=int, default=None,
                    help="覆盖 spec.options['max_new_tokens']（不传则用 preset 默认）")
     p.add_argument("--model-dir", type=Path, default=None,
-                   help="覆盖模型根目录；等价于 RKAI_QWEN3_8B_DIR")
+                   help="覆盖模型根目录；等价于 WDNAI_QWEN3_8B_DIR")
     p.add_argument("--npu", type=int, default=None,
                    help="多卡场景下选第 K 张卡（0-based index）")
     p.add_argument("--perf", action="store_true",
@@ -96,7 +96,7 @@ async def main() -> None:
     )
 
     if args.model_dir:
-        os.environ["RKAI_QWEN3_8B_DIR"] = str(args.model_dir)
+        os.environ["WDNAI_QWEN3_8B_DIR"] = str(args.model_dir)
     model = SystemLanguageModel.qwen3_8b()
     if args.max_new_tokens is not None:
         model = model.with_options(max_new_tokens=args.max_new_tokens)

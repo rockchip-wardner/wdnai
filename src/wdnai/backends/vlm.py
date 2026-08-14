@@ -10,7 +10,7 @@ Flow (aligned with examples/Qwen2.5VL/test.py, Qwen3VL/test.py):
 5. Call ``llm.session_run(inputs=..., prompt=...)``.
 
 Video decoding is not handled here; callers feed pre-decoded frames via
-``rkv.VideoCapture`` and pass them as a list of ndarrays to ``run_images``.
+``wdnav.VideoCapture`` and pass them as a list of ndarrays to ``run_images``.
 """
 from __future__ import annotations
 

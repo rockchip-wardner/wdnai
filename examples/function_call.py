@@ -30,7 +30,7 @@ from typing import Annotated, Literal
 
 import cv2
 
-from rkai import (
+from wdnai import (
     Attachment,
     Callable,
     Field,

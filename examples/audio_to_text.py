@@ -1,6 +1,6 @@
 """Qwen3-ASR demo — wav-in, transcript-out.
 
-Pipeline is encapsulated in :class:`rkai.backends.asr.ASRBackend`;
+Pipeline is encapsulated in :class:`wdnai.backends.asr.ASRBackend`;
 this script handles WAV I/O and parses ``"language <lang>\\n<text>"``
 back into two fields.
 
@@ -17,7 +17,7 @@ Usage::
 stdout; the final transcript is the ``"language <lang>\\n<text>"``
 return value of ``ASRBackend.run_audio`` (same shape as offline).
 
-``RKAI_MODELS_DIR`` overrides the model root.
+``WDNAI_MODELS_DIR`` overrides the model root.
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from rkai import (
+from wdnai import (
     Attachment,
     LLMSession,
     SystemLanguageModel,
@@ -47,7 +47,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--wav", type=Path, default=Path("asr_en.wav"))
     p.add_argument("--model-dir", type=Path, default=None,
-                   help="覆盖模型根目录；默认 $RKAI_MODELS_DIR/Qwen3-ASR")
+                   help="覆盖模型根目录；默认 $WDNAI_MODELS_DIR/Qwen3-ASR")
     p.add_argument("--iter", type=int, default=10,
                    help="连续识别轮数（每轮 reset KV cache）")
     p.add_argument("--max-new-tokens", type=int, default=1024 * 6,

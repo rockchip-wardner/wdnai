@@ -6,7 +6,7 @@ to ``max_seq_len``; ``num_logits_to_keep = S-1`` avoids the 255-token
 clamping bug on sequences longer than 256 tokens. Ports the reference script
 ``examples/Qwen3_VL_Embedding/python/demo/rknn_qwen3_vl_embedding_video_test.py``.
 
-Exposes two entry points (wired into :class:`rkai.session.LLMSession`):
+Exposes two entry points (wired into :class:`wdnai.session.LLMSession`):
 
 - ``embed_text(text)`` — normalized 2048-dim vector for a text query.
 - ``embed_video_chunk(frames, text="")`` — normalized vector for a video
@@ -55,7 +55,7 @@ class EmbeddingBackend:
             )
         # Resolve NPU selection **after** RKNN3Lite is imported so the
         # native driver init order stays predictable (and doesn't race
-        # with a co-resident rkv process on dev boxes).
+        # with a co-resident wdnav process on dev boxes).
         resolved_device_id = resolve_device_id(RKNN3Lite, npu, device_id)
         self.spec = spec
         self._max_seq_len = spec.max_context_len

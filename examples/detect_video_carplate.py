@@ -12,7 +12,7 @@
 模型文件位于固定的本地路径 ``/userdata/models/Qwen3-VL-4B/``，可通过
 环境变量直接指定模型目录（调试时用）：
 
-    RKAI_QWEN3_VL_4B_DIR=/path/to/Qwen3-VL-4B  # 直接指定 4B 模型目录，默认 /userdata/models/Qwen3-VL-4B
+    WDNAI_QWEN3_VL_4B_DIR=/path/to/Qwen3-VL-4B  # 直接指定 4B 模型目录，默认 /userdata/models/Qwen3-VL-4B
 
 命令行参数::
 
@@ -53,8 +53,8 @@ from typing import Any, Optional, Tuple
 
 import cv2
 import numpy as np
-import rkv
-from rkai import Attachment, Generable, Field, LLMSession, SystemLanguageModel
+import wdnav
+from wdnai import Attachment, Generable, Field, LLMSession, SystemLanguageModel
 from typing import Literal
 from dataclasses import replace
 
@@ -170,7 +170,7 @@ async def _majority_vote_async(session, k: int, **kwargs) -> Any:
     identical (including bbox coordinates and plate_text) collapse to one
     bucket. ``~k×`` slower than a single inference but the official SDK
     ``majority_vote`` is documented as the recommended mitigation for
-    "NPU mis-decodes" (``src/rkai/session.py:485``).
+    "NPU mis-decodes" (``src/wdnai/session.py:485``).
 
     ``Counter.most_common(1)[0][0]`` always exists (Counter is non-empty
     by construction: we just appended k items), but mypy doesn't see that,
@@ -266,7 +266,7 @@ async def main() -> None:
     if not video_path.is_file():
         raise FileNotFoundError(f"视频文件不存在: {video_path}")
 
-    # 模型文件需要在 /userdata/models/Qwen3-VL-4B/ 下（可用 RKAI_QWEN3_VL_4B_DIR 覆盖）
+    # 模型文件需要在 /userdata/models/Qwen3-VL-4B/ 下（可用 WDNAI_QWEN3_VL_4B_DIR 覆盖）
     # Pruned vision RKNN: Python 用 qwen3vl_prune_single 算 patch features 喂进去,
     # 可在 32 倍数 image_size 之间切换(384/768/512)不用重新导出 RKNN。
     model = SystemLanguageModel.qwen3_vl_4b()
@@ -284,7 +284,7 @@ async def main() -> None:
     )
     session = LLMSession(model=model)
 
-    cap = rkv.VideoCapture(str(video_path))
+    cap = wdnav.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频: {video_path}")
     print(
@@ -360,7 +360,7 @@ async def main() -> None:
                     # single 模式返回 Event（同时含 carplate 和 plate_text）。
                     if not isinstance(result, (PlateBox, Event)):
                         # NPU mis-decode / schema 不匹配时，SDK 会 fallback 到
-                        # 直接返回 raw string（src/rkai/session.py:439）。这种
+                        # 直接返回 raw string（src/wdnai/session.py:439）。这种
                         # 帧直接 skip，不计数、不调度 OCR、不更新 display。
                         snippet = result if isinstance(result, str) else type(result).__name__
                         print(

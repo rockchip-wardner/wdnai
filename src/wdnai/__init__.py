@@ -1,9 +1,9 @@
-"""rkai — LLM / VLM / TTS access SDK for Rockchip NPUs (rknn3-toolkit-lite).
+"""wdnai — LLM / VLM / TTS access SDK for Rockchip NPUs (rknn3-toolkit-lite).
 
 Quick start (Qwen3-VL image):
 
     from typing import Literal
-    from rkai import Generable, Field, Attachment, LMOutput, LLMSession, SystemLanguageModel
+    from wdnai import Generable, Field, Attachment, LMOutput, LLMSession, SystemLanguageModel
 
     @Generable
     class Event(LMOutput):

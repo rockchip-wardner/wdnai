@@ -1,5 +1,5 @@
 Model files live at a fixed on-device location: `/userdata/models/<model-name>/`.
-Override the root with the `RKAI_MODELS_DIR` environment variable.
+Override the root with the `WDNAI_MODELS_DIR` environment variable.
 
 No network access is performed at any point; place the model files manually.
 
@@ -14,7 +14,7 @@ No network access is performed at any point; place the model files manually.
 │   ├── vision_Qwen3-VL-4B.1828.rknn    # Vision encoder RKNN (4.2 MB)
 │   ├── vision_Qwen3-VL-4B.weight       # Vision weights (234 MB)
 │   ├── Qwen3-VL-4B.embed.bin           # Token embedding table (742 MB, vocab 151936 × 2560-dim float16)
-│   └── Qwen3-VL-4B.tokenizer.gguf      # GGUF-format tokenizer (5.7 MB; loaded via rkai.gguf_tokenizer)
+│   └── Qwen3-VL-4B.tokenizer.gguf      # GGUF-format tokenizer (5.7 MB; loaded via wdnai.gguf_tokenizer)
 │
 ├── Qwen3-TTS/                         # pyrkaiweb's text-to-speech back end
 │   ├── text_projection.1828.rknn       # ① 文本侧 projector — 普通 RKNN 图，core_mask=0x01（1 核）
@@ -59,18 +59,18 @@ The 4B model is the **full** (non-pruned) vision export.
 by default and raises `FileNotFoundError` listing the missing files if
 the directory is incomplete. To add a new model variant, place
 another sibling directory under `/userdata/models/<new-variant>/` and
-add a preset + path helper in [rkai/model.py](../model.py).
+add a preset + path helper in [wdnai/model.py](../model.py).
 
 ### Qwen3-TTS (text-to-speech)
 
 The full Qwen3-TTS pipeline runs four RKNN3 models on the same RK1828
 PCIe card as the VLM. Used by pyrkaiweb's `#page-tts` (the
-Qwen3-TTS model itself is loaded via `TTSBackend` in `rkai/backends/tts.py`,
+Qwen3-TTS model itself is loaded via `TTSBackend` in `wdnai/backends/tts.py`,
 which wraps the in-tree `Qwen3TTSDriver` vendored into the same
-`rkai/backends/tts.py` module). The driver used to live in
+`wdnai/backends/tts.py` module). The driver used to live in
 `rknn3-toolkit-lite/examples/Qwen3-TTS/qwen3_tts_demo.py` and was
 imported at runtime via `sys.path` injection; it has since been
-ported into the SDK so `import rkai.backends.tts` no longer needs
+ported into the SDK so `import wdnai.backends.tts` no longer needs
 to find the upstream demo anywhere on disk.
 
 | #  | File (`<root>/Qwen3-TTS/…`)            | Purpose                                              | core_mask         |
@@ -106,7 +106,7 @@ run with 7 manual inputs; `embed_text` / `embed_video_chunk` return a
 L2-normalized 2048-dim vector. File layout mirrors Qwen3-VL-4B
 (llm/vision `.1828.rknn` + `.weight` + embed table + tokenizer).
 Used by pyrkaiweb's `#page-video-content-search` via the
-`EmbeddingBackend` in `rkai/backends/embedding.py`
+`EmbeddingBackend` in `wdnai/backends/embedding.py`
 (`SystemLanguageModel.qwen3_vl_embedding`).
 
 | File (`<root>/Qwen3-VL-Embedding-2B/…`)     | Purpose                              |
@@ -119,4 +119,4 @@ Used by pyrkaiweb's `#page-video-content-search` via the
 `max_context_len` defaults to 2048 tokens; the vision feature is fed
 at 576×576 (matching the model's native input) and each video chunk
 contributes `FRAME_TOKENS` vision tokens (see
-`rkai/backends/embedding.py`).
+`wdnai/backends/embedding.py`).

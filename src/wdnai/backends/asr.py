@@ -21,7 +21,7 @@ Online mode additionally calls ``on_asr_commit(committed, unfixed,
 language)`` after each round if provided. The example in
 ``examples/audio_to_text.py`` consumes both.
 
-Supported model layout (matches :class:`rkai.model.SystemLanguageModel.qwen3_asr`):
+Supported model layout (matches :class:`wdnai.model.SystemLanguageModel.qwen3_asr`):
 
     <model_dir>/
         encoder.1828.rknn            + encoder.weight
@@ -51,7 +51,7 @@ from ._common import (
     resolve_device_id,
 )
 
-LOG = logging.getLogger("rkai.backends.asr")
+LOG = logging.getLogger("wdnai.backends.asr")
 
 # --------------------------------------------------------------------------- #
 # Constants — match cpp/qwen3_asr.h + cpp/audio/rknn_qwen3_asr_audio.cc.

@@ -7,7 +7,7 @@ import numpy as np
 
 # --------------------------------------------------------------------------- #
 def _make_workspace():
-    tmp = tempfile.mkdtemp(prefix="rkai_mock_")
+    tmp = tempfile.mkdtemp(prefix="wdnai_mock_")
     emb = np.arange(64 * 8, dtype=np.uint16).view(np.float16).reshape(64, 8).copy()
     embed_path = os.path.join(tmp, "embed.bin")
     emb.tofile(embed_path)
@@ -43,7 +43,7 @@ class _FakeTensorAttr:
 class _FakeRknn:
     # Class-level list of mock device IDs returned by ``get_devices_id()``.
     # Tests that exercise the ``npu=`` path monkey-patch this to control
-    # what's resolvable via ``rkai.backends.resolve_device_id``.
+    # what's resolvable via ``wdnai.backends.resolve_device_id``.
     mock_devices = [b"0001:11:00.0", b"0003:31:00.0", b"deadbeef"]
 
     def __init__(self, llm_mode=False, deepstack_n=0, vocab_size=64):
@@ -110,9 +110,9 @@ class _MockFactory:
 def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
     """把 rknn3lite + transformers + 关键 helper 全部 monkey-patch 成 mock。"""
     import rknn3lite.api as api
-    import rkai.backends._common as common
-    import rkai.backends.text as text_mod
-    import rkai.backends.vlm as vlm_mod
+    import wdnai.backends._common as common
+    import wdnai.backends.text as text_mod
+    import wdnai.backends.vlm as vlm_mod
 
     # ---- 1) RKNN3Lite 构造器：返回 _FakeRknn ----
     def make(llm_mode=False, verbose=False):
@@ -164,7 +164,7 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
         # 2) 暂存，让后续 build_llm_callback 找得到
         last_rknn["obj"] = self.rknn
         # 3) 跑剩下的初始化
-        from rkai.backends._common import (
+        from wdnai.backends._common import (
             StreamSink, build_llm_args, apply_chat_template,
         )
         self.tokenizer = text_mod.load_tokenizer(spec.tokenizer_path)
@@ -173,7 +173,7 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
         cb = text_mod.build_llm_callback(self.tokenizer, self.embeds, self.sink)
         # Use the real resolver so ``npu`` / ``device_id`` flow through
         # identically to the unpatched backend.
-        from rkai.backends import resolve_device_id
+        from wdnai.backends import resolve_device_id
         resolved = resolve_device_id(RKNN3Lite, npu, device_id)
         if self.rknn.init_runtime(
             target=spec.target, core_mask=spec.core_mask,
@@ -203,12 +203,12 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
         self.variant = spec.variant
         last_rknn["obj"] = self.rknn_llm
 
-        from rkai.backends._common import (
+        from wdnai.backends._common import (
             StreamSink, build_llm_args, apply_chat_template,
         )
         self.tokenizer = vlm_mod.load_tokenizer(spec.tokenizer_path)
         self.embeds = vlm_mod.load_embed_table(spec.embed_path, spec.vocab_size)
-        from rkai.backends import resolve_device_id
+        from wdnai.backends import resolve_device_id
         resolved = resolve_device_id(RKNN3Lite, npu, device_id)
         if self.rknn_vision.init_runtime(
             target=spec.target, core_mask=spec.core_mask,
@@ -238,7 +238,7 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
 
 # --------------------------------------------------------------------------- #
 def test_text_qwen3():
-    from rkai import LLMSession, SystemLanguageModel
+    from wdnai import LLMSession, SystemLanguageModel
     embed, tok_dir = _make_workspace()
     _install_mocks(deepstack_n=0, vocab_size=64)
 
@@ -254,7 +254,7 @@ def test_text_qwen3():
 
 
 def test_text_qwen25():
-    from rkai import LLMSession, SystemLanguageModel
+    from wdnai import LLMSession, SystemLanguageModel
     embed, tok_dir = _make_workspace()
     _install_mocks(deepstack_n=0, vocab_size=64)
 
@@ -270,7 +270,7 @@ def test_text_qwen25():
 
 
 def test_image_qwen3vl():
-    from rkai import LLMSession, SystemLanguageModel
+    from wdnai import LLMSession, SystemLanguageModel
     from pydantic import BaseModel, Field
     from typing import Optional
 
@@ -300,7 +300,7 @@ def test_image_qwen3vl():
 
 
 def test_image_qwen25vl():
-    from rkai import LLMSession, SystemLanguageModel
+    from wdnai import LLMSession, SystemLanguageModel
     embed, tok_dir = _make_workspace()
     _install_mocks(deepstack_n=0, vocab_size=64)  # Qwen2.5-VL 没有 deepstack
 
@@ -318,7 +318,7 @@ def test_image_qwen25vl():
 
 def test_overrides_passed_to_session_run():
     """``max_new_tokens`` / ``enable_thinking`` / ``keep_history`` 能通过 overrides 透传。"""
-    from rkai import LLMSession, SystemLanguageModel
+    from wdnai import LLMSession, SystemLanguageModel
     embed, tok_dir = _make_workspace()
     _install_mocks(deepstack_n=0, vocab_size=64)
 
@@ -364,7 +364,7 @@ def test_overrides_passed_to_session_run():
 def test_session_respond_full_flow():
     """通过 LLMSession.respond() 走完整链路：prompt 注入 + JSON 解析 + pydantic。"""
     import asyncio
-    from rkai import LLMSession, SystemLanguageModel, Attachment
+    from wdnai import LLMSession, SystemLanguageModel, Attachment
     from pydantic import BaseModel, Field
     from typing import Optional
 
@@ -423,7 +423,7 @@ def test_session_respond_full_flow():
 # --------------------------------------------------------------------------- #
 def test_device_id_passed_through():
     """``LLMSession(model=..., device_id=b"...")`` 下传到 RKNN3Lite.init_runtime。"""
-    from rkai import LLMSession, SystemLanguageModel
+    from wdnai import LLMSession, SystemLanguageModel
 
     embed, tok_dir = _make_workspace()
     _install_mocks(deepstack_n=0, vocab_size=64)
@@ -454,7 +454,7 @@ def test_device_id_passed_through():
 
 def test_npu_index_resolves_via_get_devices_id():
     """``LLMSession(model=..., npu=K)`` 走 ``RKNN3Lite().get_devices_id()[K]``。"""
-    from rkai import LLMSession, SystemLanguageModel
+    from wdnai import LLMSession, SystemLanguageModel
 
     embed, tok_dir = _make_workspace()
     _install_mocks(deepstack_n=3, vocab_size=64)
@@ -484,7 +484,7 @@ def test_npu_index_resolves_via_get_devices_id():
 
 def test_npu_out_of_range_raises():
     """``npu`` 越界时抛 IndexError，错误消息列出可用列表。"""
-    from rkai import LLMSession, SystemLanguageModel
+    from wdnai import LLMSession, SystemLanguageModel
 
     embed, tok_dir = _make_workspace()
     _install_mocks(deepstack_n=0, vocab_size=64)
@@ -509,7 +509,7 @@ def test_npu_out_of_range_raises():
 
 def test_npu_and_device_id_mutually_exclusive():
     """同时传 npu + device_id 直接在 LLMSession.__init__ 抛 ValueError（不依赖 backend）。"""
-    from rkai import LLMSession, SystemLanguageModel
+    from wdnai import LLMSession, SystemLanguageModel
 
     embed, tok_dir = _make_workspace()
     _install_mocks(deepstack_n=0, vocab_size=64)

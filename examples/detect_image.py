@@ -9,7 +9,7 @@
 
 可通过环境变量更改根目录：
 
-    RKAI_MODELS_DIR=/path/to/models
+    WDNAI_MODELS_DIR=/path/to/models
 
 This example shows the v2 ``Attachment`` API:
 
@@ -23,7 +23,7 @@ from typing import List, Literal
 
 import cv2
 
-from rkai import (
+from wdnai import (
     Attachment,
     Callable,
     Field,

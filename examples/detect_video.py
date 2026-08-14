@@ -5,7 +5,7 @@
 模型文件位于固定的本地路径 ``/userdata/models/Qwen3-VL-4B/``，可通过
 环境变量直接指定模型目录（调试时用）：
 
-    RKAI_QWEN3_VL_4B_DIR=/path/to/Qwen3-VL-4B  # 直接指定 4B 模型目录，默认 /userdata/models/Qwen3-VL-4B
+    WDNAI_QWEN3_VL_4B_DIR=/path/to/Qwen3-VL-4B  # 直接指定 4B 模型目录，默认 /userdata/models/Qwen3-VL-4B
 """
 import argparse
 import asyncio
@@ -13,8 +13,8 @@ import sys
 from pathlib import Path
 
 import cv2
-import rkv
-from rkai import Attachment, Generable, Field, LLMSession, SystemLanguageModel
+import wdnav
+from wdnai import Attachment, Generable, Field, LLMSession, SystemLanguageModel
 from typing import Literal
 
 
@@ -61,18 +61,18 @@ async def main() -> None:
     if not video_path.is_file():
         raise FileNotFoundError(f"视频文件不存在: {video_path}")
 
-    if rkv.VideoCapture is None:
+    if wdnav.VideoCapture is None:
         raise RuntimeError(
-            "rkv.VideoCapture 不可用：rkv.video 模块加载失败（多半是 "
+            "wdnav.VideoCapture 不可用：wdnav.video 模块加载失败（多半是 "
             "librockchip_mpp.so.0 缺符号或 librockchip-mpp / librga 没装）。"
             "在装了原生库的环境上再跑这个脚本。"
         )
 
-    # 模型文件需要在 /userdata/models/Qwen3-VL-4B/ 下（可用 RKAI_QWEN3_VL_4B_DIR 覆盖）
+    # 模型文件需要在 /userdata/models/Qwen3-VL-4B/ 下（可用 WDNAI_QWEN3_VL_4B_DIR 覆盖）
     model = SystemLanguageModel.qwen3_vl_4b()
     session = LLMSession(model=model)
 
-    cap = rkv.VideoCapture(str(video_path))
+    cap = wdnav.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频: {video_path}")
     print(

@@ -53,7 +53,7 @@ def load_tokenizer_from_gguf(gguf_path: str):
     chat_template = kv.get("tokenizer.chat_template")
 
     # ---- Dump vocab / merges to a temp directory for the BPE builder ----
-    tmp = tempfile.mkdtemp(prefix="rkai_gguf_tok_")
+    tmp = tempfile.mkdtemp(prefix="wdnai_gguf_tok_")
     vocab_file = os.path.join(tmp, "vocab.json")
     merges_file = os.path.join(tmp, "merges.txt")
 

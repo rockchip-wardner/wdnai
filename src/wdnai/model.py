@@ -8,7 +8,7 @@ parameters, etc.). ``SystemLanguageModel`` is the catalog entry point, exposing
 
 Typical usage::
 
-    from rkai import SystemLanguageModel, LLMSession, Attachment
+    from wdnai import SystemLanguageModel, LLMSession, Attachment
 
     model = SystemLanguageModel.qwen3_vl_2b().with_paths(
         rknn_llm_path="/userdata/Qwen3-VL-2B-llm.rknn3",
@@ -233,7 +233,7 @@ def _qwen3vl_4b_spec(**overrides) -> ModelSpec:
 # Predefined paths: Qwen3-VL-4B lives at a fixed on-device location
 # (``/userdata/models/Qwen3-VL-4B/``). No network access is performed at any
 # point — the user is expected to place the files there manually.
-# Override the directory directly via the ``RKAI_QWEN3_VL_4B_DIR`` env var
+# Override the directory directly via the ``WDNAI_QWEN3_VL_4B_DIR`` env var
 # (intended for debugging; e.g. pointing at an ad-hoc export tree).
 # --------------------------------------------------------------------------- #
 _QWEN3_VL_4B_DIR_DEFAULT = "/userdata/models/Qwen3-VL-4B"
@@ -249,16 +249,16 @@ _QWEN3_VL_4B_REQUIRED = (
 
 def _models_root() -> Path:
     """Return the on-device root directory holding all fixed-location models."""
-    return Path(_os.environ.get("RKAI_MODELS_DIR", "/userdata/models"))
+    return Path(_os.environ.get("WDNAI_MODELS_DIR", "/userdata/models"))
 
 
 def _qwen3_vl_4b_dir() -> Path:
     """Resolve the Qwen3-VL-4B model directory.
 
-    Override via the ``RKAI_QWEN3_VL_4B_DIR`` env var (full path);
+    Override via the ``WDNAI_QWEN3_VL_4B_DIR`` env var (full path);
     default ``/userdata/models/Qwen3-VL-4B``.
     """
-    return Path(_os.environ.get("RKAI_QWEN3_VL_4B_DIR", _QWEN3_VL_4B_DIR_DEFAULT))
+    return Path(_os.environ.get("WDNAI_QWEN3_VL_4B_DIR", _QWEN3_VL_4B_DIR_DEFAULT))
 
 
 def _default_qwen3_vl_4b_paths() -> dict:
@@ -279,7 +279,7 @@ def _verify_qwen3_vl_4b_files() -> None:
     if missing:
         raise FileNotFoundError(
             f"Qwen3-VL-4B files missing under {d}: {missing}. "
-            f"Place the files there or set RKAI_QWEN3_VL_4B_DIR to point at a custom path."
+            f"Place the files there or set WDNAI_QWEN3_VL_4B_DIR to point at a custom path."
         )
 
 
@@ -292,7 +292,7 @@ _QWEN3_8B_REQUIRED = (
 
 
 def _qwen3_8b_dir() -> Path:
-    override = _os.environ.get("RKAI_QWEN3_8B_DIR")
+    override = _os.environ.get("WDNAI_QWEN3_8B_DIR")
     return Path(override) if override else _models_root() / "Qwen3-8B"
 
 
@@ -312,7 +312,7 @@ def _verify_qwen3_8b_files() -> None:
     if missing:
         raise FileNotFoundError(
             f"Qwen3-8B files missing under {d}: {missing}. "
-            f"Place the files there or set RKAI_QWEN3_8B_DIR to point at a custom path."
+            f"Place the files there or set WDNAI_QWEN3_8B_DIR to point at a custom path."
         )
 
 
@@ -355,7 +355,7 @@ def _verify_qwen3_vl_embedding_2b_files() -> None:
     if missing:
         raise FileNotFoundError(
             f"Qwen3-VL-Embedding-2B files missing under {d}: {missing}. "
-            f"Place the files there or set RKAI_MODELS_DIR to override the root."
+            f"Place the files there or set WDNAI_MODELS_DIR to override the root."
         )
 
 
@@ -378,7 +378,7 @@ class SystemLanguageModel:
     - ``qwen3_vl_4b_template()`` — Qwen3-VL-4B template (no default paths)
     - ``qwen3_vl_4b()``          — Qwen3-VL-4B bound to ``/userdata/models/Qwen3-VL-4B``
                                     (the user is expected to place the files there;
-                                     override the path with ``RKAI_QWEN3_VL_4B_DIR``)
+                                     override the path with ``WDNAI_QWEN3_VL_4B_DIR``)
     - ``qwen3_tts()``            — Qwen3-TTS bound to ``/userdata/models/Qwen3-TTS``;
                                     the 4 ``.1828.rknn`` files are looked up inside
                                     that directory.
@@ -404,7 +404,7 @@ class SystemLanguageModel:
     @classmethod
     def qwen3_8b(cls) -> ModelSpec:
         """Return a :class:`ModelSpec` pre-bound to the Qwen3-8B files at
-        ``/userdata/models/Qwen3-8B/`` (override via ``RKAI_QWEN3_8B_DIR``);
+        ``/userdata/models/Qwen3-8B/`` (override via ``WDNAI_QWEN3_8B_DIR``);
         raises :class:`FileNotFoundError` listing any missing files.
         """
         _verify_qwen3_8b_files()
@@ -433,7 +433,7 @@ class SystemLanguageModel:
         """Return a :class:`ModelSpec` pre-bound to the fixed Qwen3-VL-4B files.
 
         The files are expected at ``/userdata/models/Qwen3-VL-4B/`` (override with
-        the ``RKAI_QWEN3_VL_4B_DIR`` environment variable). If any expected file
+        the ``WDNAI_QWEN3_VL_4B_DIR`` environment variable). If any expected file
         is missing a :class:`FileNotFoundError` is raised listing them.
         """
         _verify_qwen3_vl_4b_files()
@@ -444,7 +444,7 @@ class SystemLanguageModel:
         """Return a :class:`ModelSpec` pre-bound to the fixed Qwen3-TTS files.
 
         The directory is expected at ``/userdata/models/Qwen3-TTS/`` (override
-        the root with the ``RKAI_MODELS_DIR`` environment variable). The TTS
+        the root with the ``WDNAI_MODELS_DIR`` environment variable). The TTS
         backend derives the four ``<role>.1828.rknn`` / ``<role>.weight`` paths
         from that directory at construction time.
         """
@@ -462,7 +462,7 @@ class SystemLanguageModel:
     def qwen3_asr(cls) -> ModelSpec:
         """Return a :class:`ModelSpec` bound to the on-device Qwen3-ASR files.
 
-        Model dir defaults to ``$RKAI_MODELS_DIR/Qwen3-ASR/``
+        Model dir defaults to ``$WDNAI_MODELS_DIR/Qwen3-ASR/``
         (resolves to ``/userdata/models/Qwen3-ASR/``). Layout::
 
             encoder.1828.rknn            + encoder.weight         (offline)
@@ -510,7 +510,7 @@ class SystemLanguageModel:
         Retrieval embedding model (no token generation): the LLM is run via the
         plain ``RKNN3Lite`` path with manual inputs and returns a normalized
         2048-dim vector. Expected at ``/userdata/models/Qwen3-VL-Embedding-2B/``
-        (override the root with the ``RKAI_MODELS_DIR`` environment variable);
+        (override the root with the ``WDNAI_MODELS_DIR`` environment variable);
         missing files raise :class:`FileNotFoundError`.
         """
         _verify_qwen3_vl_embedding_2b_files()

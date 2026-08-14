@@ -53,7 +53,7 @@ class LLMSession:
     coprocessors, or an SoC name like ``"rk3588"`` for ADB targets).
     Both ``None`` selects the default device. Resolution happens
     inside the backend's ``__init__`` so the RKNN3 native driver
-    init stays lazy and never races with a co-resident ``rkv``
+    init stays lazy and never races with a co-resident ``wdnav``
     process.
     """
 
@@ -152,17 +152,17 @@ class LLMSession:
 
         full_prompt = self._compose_prompt(prompt, generating, tool_specs)
         if debug:
-            print(f"[rkai.debug] prompt      = {prompt!r}")
-            print(f"[rkai.debug] full_prompt = {full_prompt!r}")
-            print(f"[rkai.debug] attachments={[a.to_payload() for a in attachments]}")
-            print(f"[rkai.debug] tools  = {tool_specs}")
+            print(f"[wdnai.debug] prompt      = {prompt!r}")
+            print(f"[wdnai.debug] full_prompt = {full_prompt!r}")
+            print(f"[wdnai.debug] attachments={[a.to_payload() for a in attachments]}")
+            print(f"[wdnai.debug] tools  = {tool_specs}")
         text, attachments_out = self._dispatch(full_prompt, attachments, **overrides)
 
         if debug:
-            print(f"[rkai.debug] raw    = {text!r}")
+            print(f"[wdnai.debug] raw    = {text!r}")
             sink = getattr(self._backend, "sink", None)
             if sink is not None and sink.perf:
-                print(f"[rkai.debug] perf   = {sink.perf}")
+                print(f"[wdnai.debug] perf   = {sink.perf}")
 
         # Output classification — passive, the caller decides what to do:
         #
@@ -187,17 +187,17 @@ class LLMSession:
                 instance = dispatch_tool_call(tools, name, arguments)
                 if instance is not None:
                     if debug:
-                        print(f"[rkai.debug] tool_call -> {instance!r}")
+                        print(f"[wdnai.debug] tool_call -> {instance!r}")
                     return instance
                 if debug:
-                    print(f"[rkai.debug] tool_call: no @Callable named {name!r} "
+                    print(f"[wdnai.debug] tool_call: no @Callable named {name!r} "
                           f"(or args failed validation)")
 
         result = self._parse_output(
             text, generating=generating, attachments_out=attachments_out,
         )
         if debug:
-            print(f"[rkai.debug] parsed = {result!r}")
+            print(f"[wdnai.debug] parsed = {result!r}")
         return result
 
     # ------------------------------------------------------------------ #

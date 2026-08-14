@@ -48,7 +48,7 @@ class TextBackend:
 
         # Resolve NPU selection **after** RKNN3Lite is imported so the
         # native driver init order stays predictable (and doesn't race
-        # with a co-resident rkv process on dev boxes).
+        # with a co-resident wdnav process on dev boxes).
         resolved_device_id = resolve_device_id(RKNN3Lite, npu, device_id)
 
         # callback / init

@@ -22,7 +22,7 @@ def Generable(cls: type) -> type:
 
     Usage::
 
-        from rkai import Generable, Field
+        from wdnai import Generable, Field
         from typing import Literal, Optional
 
         @Generable
@@ -34,7 +34,7 @@ def Generable(cls: type) -> type:
             )
 
         # Inherit fields from another pydantic-friendly class:
-        from rkai import LMOutput
+        from wdnai import LMOutput
         @Generable
         class TTSResult(LMOutput):
             text: str = Field(description="synthesised transcript")
@@ -83,7 +83,7 @@ def Generable(cls: type) -> type:
     #
     # We try in order: (1) the user's class' ``__module__``; (2) the
     # caller frame's module (where @Generable was applied); (3) fall
-    # back to ``rkai._generable``.
+    # back to ``wdnai._generable``.
     caller_module = None
     try:
         caller_frame = inspect.stack()[1]

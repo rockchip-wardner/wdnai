@@ -5,14 +5,14 @@ prefill construction, talker/code_predictor/speech_decoder pipeline,
 audio playback) is vendored in this module — originally imported
 from ``rknn3-toolkit-lite/examples/Qwen3-TTS/qwen3_tts_demo.py``
 via ``sys.path`` injection, which made the SDK un-importable on
-hosts without the upstream demo directory. ``import rkai.backends.tts``
+hosts without the upstream demo directory. ``import wdnai.backends.tts``
 is now self-contained.
 
 ``run_text(prompt)`` returns the prompt unchanged along with a
 single :class:`Attachment` carrying the synthesised WAV bytes; the
 SDK assigns that attachment to ``LMOutput.attachment``.
 
-Model layout on disk (matches :mod:`rkai.models`):
+Model layout on disk (matches :mod:`wdnai.models`):
 
     <model_dir>/
         text_projection.1828.rknn + .weight
@@ -29,7 +29,7 @@ module — no external ``qwen3tts_speaker_embed.h`` is needed.
 
 The directory is resolved from the ``ModelSpec`` in this order:
 ``spec.tts_model_dir`` → ``spec.options["model_dir"]`` →
-``$TTS_MODEL_DIR`` → ``$RKAI_MODELS_DIR/Qwen3-TTS`` →
+``$TTS_MODEL_DIR`` → ``$WDNAI_MODELS_DIR/Qwen3-TTS`` →
 ``/userdata/models/Qwen3-TTS``.
 
 Optional overrides (forwarded from ``LLMSession.respond(**overrides)``):
@@ -80,7 +80,7 @@ except Exception as exc:  # pragma: no cover - import error path
 from ..attachment import Attachment
 from ._common import resolve_device_id
 
-LOG = logging.getLogger("rkai.backends.tts")
+LOG = logging.getLogger("wdnai.backends.tts")
 
 
 # --------------------------------------------------------------------------- #
@@ -542,7 +542,7 @@ def _resolve_tts_model_dir(spec) -> Path:
     env = os.environ.get("TTS_MODEL_DIR")
     if env:
         return Path(env)
-    root = os.environ.get("RKAI_MODELS_DIR", "/userdata/models")
+    root = os.environ.get("WDNAI_MODELS_DIR", "/userdata/models")
     return Path(root) / "Qwen3-TTS"
 
 
@@ -1377,7 +1377,7 @@ class Qwen3TTSDriver:
 
         decoder_t = threading.Thread(
             target=self._decoder_worker_with_stop,
-            name="qwen3tts-rkai",
+            name="qwen3tts-wdnai",
             args=(stop_event, on_step, on_audio_chunk),
             daemon=True,
         )

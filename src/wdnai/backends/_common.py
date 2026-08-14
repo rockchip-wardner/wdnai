@@ -34,7 +34,7 @@ def resolve_device_id(
     The enumeration is performed lazily here — callers should invoke
     this **inside** a backend's ``__init__`` (after ``RKNN3Lite`` is
     already imported) so the RKNN3 native driver init does not race
-    with ``rkv`` in the same process.
+    with ``wdnav`` in the same process.
     """
     if device_id is not None:
         if isinstance(device_id, str):

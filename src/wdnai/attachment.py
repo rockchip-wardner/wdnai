@@ -11,14 +11,14 @@ from typing import TYPE_CHECKING, List, Optional, Union
 if TYPE_CHECKING:  # noqa: F401
     import numpy as np
 
-# ``rkv`` is an optional peer dependency. ``Attachment`` only needs the
-# ``DecodedFrame`` class to detect ``rkv.VideoCapture.read0()`` outputs;
-# keep the import lazy so a system without ``rkv`` installed can still
-# import ``rkai`` and use the ndarray / text / bytes constructors.
+# ``wdnav`` is an optional peer dependency. ``Attachment`` only needs the
+# ``DecodedFrame`` class to detect ``wdnav.VideoCapture.read0()`` outputs;
+# keep the import lazy so a system without ``wdnav`` installed can still
+# import ``wdnai`` and use the ndarray / text / bytes constructors.
 try:
-    from rkv.mpp import DecodedFrame as _RKVDecodedFrame  # noqa: F401
+    from wdnav.mpp import DecodedFrame as _WdnavDecodedFrame  # noqa: F401
 except ImportError:
-    _RKVDecodedFrame = None  # type: ignore[assignment]
+    _WdnavDecodedFrame = None  # type: ignore[assignment]
 
 
 class Attachment:
@@ -28,10 +28,10 @@ class Attachment:
 
     - Single image: ``Attachment(img)`` where ``img`` is a BGR ndarray.
     - Multiple images: ``Attachment([img1, img2, ...])``.
-    - 0-copy frame from ``rkv.VideoCapture.read0()``: ``Attachment(frame0)``
-      where ``frame0`` is an ``rkv.mpp.DecodedFrame``. Internally calls
+    - 0-copy frame from ``wdnav.VideoCapture.read0()``: ``Attachment(frame0)``
+      where ``frame0`` is an ``wdnav.mpp.DecodedFrame``. Internally calls
       ``frame0.numpy()`` (RGA DMA→CPU materialisation) and proceeds as a
-      regular image attachment. ``rkv`` is an optional peer dependency —
+      regular image attachment. ``wdnav`` is an optional peer dependency —
       if it is not installed, the constructor falls through to the
       usual ``TypeError`` for unsupported types.
     - Text: ``Attachment("the prompt text")`` or ``Attachment("…", kind="text")``.
@@ -70,8 +70,8 @@ class Attachment:
         self.data: bytes = b""
         self.mime_type = mime_type
 
-        # ---------- 0-copy frame: rkv.mpp.DecodedFrame ----------
-        # ``rkv.VideoCapture.read0()`` returns a ``DecodedFrame`` whose
+        # ---------- 0-copy frame: wdnav.mpp.DecodedFrame ----------
+        # ``wdnav.VideoCapture.read0()`` returns a ``DecodedFrame`` whose
         # backing storage is a DMA-BUF fd (kernel-side, owned by MPP).
         # Calling ``.numpy()`` hands the fd to RGA, which materialises
         # the frame into a contiguous BGR ndarray in one hardware pass.
@@ -79,7 +79,7 @@ class Attachment:
         # ``_build_image_inputs``) runs unchanged — equivalent to
         # ``Attachment(frame0.numpy())`` but lets the caller keep the
         # DecodedFrame handle until ``Attachment`` is constructed.
-        if _RKVDecodedFrame is not None and isinstance(content, _RKVDecodedFrame):
+        if _WdnavDecodedFrame is not None and isinstance(content, _WdnavDecodedFrame):
             arr = content.numpy()
             if _np is None or not isinstance(arr, _np.ndarray):
                 raise TypeError(

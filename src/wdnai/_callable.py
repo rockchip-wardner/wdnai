@@ -16,7 +16,7 @@ loops and custom dispatch logic.
 Usage::
 
     from typing import Annotated
-    from rkai import Generable, Callable, Field
+    from wdnai import Generable, Callable, Field
 
     @Callable
     class Alarm:
@@ -120,7 +120,7 @@ def _resolve_user_module(cls: type) -> Tuple[str, Dict[str, Any]]:
     if mod is not None:
         for k, v in vars(mod).items():
             caller_globals.setdefault(k, v)
-    return cls_module or "rkai._callable", caller_globals
+    return cls_module or "wdnai._callable", caller_globals
 
 
 # --------------------------------------------------------------------------- #
@@ -240,8 +240,8 @@ def _build_tool_spec(new_cls: type) -> Dict[str, Any]:
         "parameters": parameters_schema,
         "_cls": new_cls,
     }
-    new_cls.__rkai_callable__ = True        # legacy marker
-    new_cls.__rkai_tool__ = spec            # new: full tool spec
+    new_cls.__wdnai_callable__ = True        # legacy marker
+    new_cls.__wdnai_tool__ = spec            # new: full tool spec
     return spec
 
 
@@ -270,7 +270,7 @@ def Callable(cls=None, *, name: Optional[str] = None, description: Optional[str]
         if description is not None:
             spec["description"] = description
         # Re-stamp in case name/description overrides changed.
-        new_cls.__rkai_tool__ = spec
+        new_cls.__wdnai_tool__ = spec
         return new_cls
 
     if cls is not None and isinstance(cls, type):
@@ -290,7 +290,7 @@ def get_tool_specs(tools: Optional[List[type]]) -> List[Dict[str, Any]]:
     """
     out: List[Dict[str, Any]] = []
     for t in tools or []:
-        spec = getattr(t, "__rkai_tool__", None)
+        spec = getattr(t, "__wdnai_tool__", None)
         if spec is None:
             raise TypeError(
                 f"Tool {t!r} is not decorated with @Callable; only "
@@ -372,7 +372,7 @@ def dispatch_tool_call(
     that case.
     """
     for t in tools or []:
-        spec = getattr(t, "__rkai_tool__", None)
+        spec = getattr(t, "__wdnai_tool__", None)
         if not spec or spec["name"] != name:
             continue
         cls = spec["_cls"]

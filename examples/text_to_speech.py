@@ -3,7 +3,7 @@
 整套 TTS 流水线（HF tokenizer → text_projection prefill → talker 自
 回归 → code_predictor → speech_decoder → 24 kHz mono float32 WAV
 bytes）全部封装在 SDK 的 ``TTSBackend`` 里（参见
-``.venv/src/rkai/src/rkai/backends/tts.py``），调用方只负责：
+``.venv/src/wdnai/src/wdnai/backends/tts.py``），调用方只负责：
 
 1. 构造 ``model = SystemLanguageModel.qwen3_tts()``
 2. ``session = LLMSession(model=model)``
@@ -26,11 +26,11 @@ bytes）全部封装在 SDK 的 ``TTSBackend`` 里（参见
         codec_embed.fp16.bin
         tokenizer.json
 
-可用环境变量 ``RKAI_MODELS_DIR`` 覆盖根目录。
+可用环境变量 ``WDNAI_MODELS_DIR`` 覆盖根目录。
 
 执行：
 
-    .venv/bin/python .venv/src/rkai/examples/text_to_speech.py \\
+    .venv/bin/python .venv/src/wdnai/examples/text_to_speech.py \\
         --text "你好世界" --ref-speaker girl_base
 """
 from __future__ import annotations
@@ -44,7 +44,7 @@ from typing import List
 
 import numpy as np
 
-from rkai import (
+from wdnai import (
     Attachment,
     Field,
     Generable,
@@ -95,7 +95,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     p.add_argument("--output", "-o", type=Path, default=Path("output.wav"),
                    help="输出 WAV 文件路径")
     p.add_argument("--model-dir", type=Path, default=None,
-                   help="覆盖模型根目录；默认 $RKAI_MODELS_DIR/Qwen3-TTS")
+                   help="覆盖模型根目录；默认 $WDNAI_MODELS_DIR/Qwen3-TTS")
     p.add_argument("--non-streaming-mode", type=int, default=0, choices=[0, 1],
                    help="1 = 使用 non-streaming prefill（对应 C++ non_streaming_mode=1）")
     p.add_argument("-v", "--verbose", action="store_true")
