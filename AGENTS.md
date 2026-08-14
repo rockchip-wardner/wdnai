@@ -7,7 +7,7 @@ name `wdnai`.
 
 > Vendored in-tree as `.venv/src/wdnai/` (editable install from
 > `git@10.10.10.10/wardner/wdnai.git`). It is *not* on PyPI. See
-> `pyrkaiweb/AGENTS.md` "One-time setup" for the install command.
+> `wdnwebui/AGENTS.md` "One-time setup" for the install command.
 
 
 ## Repo map (one-line each)
@@ -175,13 +175,13 @@ name `wdnai`.
 - **RKNN 导入必须懒加载**：`from rknn3lite.api import RKNN3Lite` 仅出现在
   backend 模块的 `__init__` / 调用栈内部；`src/wdnai/__init__.py` 顶部永远
   不要 import `rknn3lite`，否则一台非 RK 机器上 `import wdnai` 会因为加载
-  RKNN3 native libs 而 segfault（与 `pyrkaiweb` 里 `WdnaiDetector._load_wdnai`
+  RKNN3 native libs 而 segfault（与 `wdnwebui` 里 `WdnaiDetector._load_wdnai`
   的约束同源）。
 - **rknn3lite 是同步 C API，`LLMSession.respond` 是 async 但目前不丢线程池**：
   backend 的 `run` / `run_text` / `run_images` 是同步阻塞调用；`respond`
   当前直接在事件循环里跑（≈ 1s @ 4B）。如果上层要在事件循环里并行多次
   `respond`，调用方自行 `asyncio.gather` 或者丢 `loop.run_in_executor`。
-  pyrkaiweb 的 `WdnaiDetector` 已经在自己的 `Thread` 里跑整条 `respond` 链。
+  wdnwebui 的 `WdnaiDetector` 已经在自己的 `Thread` 里跑整条 `respond` 链。
 - **JSON hint 的 schema 渲染用 `str(dict)`，不要换成 `json.dumps(indent=2)`**：
   legacy 实现（141ee17）写的就是 `f"{user_msg}\n\n{hint}\n```json\n{schema}\n```"`
   其中 `schema` 是 pydantic 的 `repr(dict)`（单行、单引号 key、Python
@@ -212,7 +212,7 @@ name `wdnai`.
   `device_id="rk3588"` 等 SoC 名；网络 ADB 传 `"IP[:Port]"`。解析在
   `_common.resolve_device_id()` 里完成，**只在 backend `__init__` 里**
   调用（`LLMSession.__init__` 自身不触发 `get_devices_id()`，保持 RKNN3
-  native driver 懒加载——与 `pyrkaiweb` 里 `WdnaiDetector._load_wdnai` 同源
+  native driver 懒加载——与 `wdnwebui` 里 `WdnaiDetector._load_wdnai` 同源
   约束）。
 
 ### 文本推理（LLM）
@@ -314,7 +314,7 @@ async with LLMSession(model=model) as sess:
 - **除非我要求，否则不要自动 git commit**。
 - **不要把 `from rknn3lite.api import RKNN3Lite` 提到 `src/wdnai/__init__.py`
   或 `backends/__init__.py` 顶部**。RKNN3 native libs 在 import 时会 init
-  NPU driver；在 `pyrkaiweb` 这种多模块共存的进程里和 `wdnav` 的 mpp init
+  NPU driver；在 `wdnwebui` 这种多模块共存的进程里和 `wdnav` 的 mpp init
   抢资源会 segfault。保持当前"只在具体 backend `__init__` / 私有方法内
   懒导入"的形态。
 - **开发支持新类型的输入/输出的LLM模型时，首先在examples目录下新建调用该模型的
@@ -328,7 +328,7 @@ async with LLMSession(model=model) as sess:
   切碎，`rknn3` 找不到对应 ID，整个推理直接挂掉。
 - **不要硬编码 `/userdata/models/...`**：所有路径都从 `WDNAI_MODELS_DIR`
   （根）和 `WDNAI_QWEN3_VL_4B_DIR`（Qwen3-VL-4B 子目录）解析；
-  `pyrkaiweb` 的 `app/main.py` 在 `create_app()` 时把 `base.model_path`
+  `wdnwebui` 的 `app/main.py` 在 `create_app()` 时把 `base.model_path`
   写进 `os.environ["WDNAI_MODELS_DIR"]` —— SDK 在第一次 `_models_root()`
   调用时读取。
 - **`.1828.rknn` 命名**：`<role>.1828.rknn`（RK1828 NPU 量化版本）是新增
