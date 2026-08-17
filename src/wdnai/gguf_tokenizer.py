@@ -93,7 +93,7 @@ def load_tokenizer_from_gguf(gguf_path: str):
         eos_token=decode_id_to_str(tokens, eos_id),
         bos_token=decode_id_to_str(tokens, bos_id),
         pad_token=decode_id_to_str(tokens, pad_id),
-        unk_token=decode_id_to_str(tokens, 0),
+        unk_token=None,
         add_bos_token=add_bos,
         additional_special_tokens=extra,
     )
