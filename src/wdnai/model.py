@@ -237,15 +237,40 @@ def _qwen3vl_4b_spec(**overrides) -> ModelSpec:
 # point — the user is expected to place the files there manually.
 # Override the directory directly via the ``WDNAI_QWEN3_VL_4B_DIR`` env var
 # (intended for debugging; e.g. pointing at an ad-hoc export tree).
+#
+# Vision model naming uses a per-resolution suffix so multiple native
+# training resolutions can coexist on the same NPU card:
+#
+#     vision_Qwen3-VL-4B.384x384.1828.rknn + .weight   # required
+#     vision_Qwen3-VL-4B.768x768.1828.rknn + .weight   # optional
+#
+# ``VLMBackend`` auto-discovers every ``vision_Qwen3-VL-4B.*x*.1828.rknn``
+# sibling under the directory at load time and picks the variant
+# closest to the input image's longest side per call. The 384x384
+# pair is required because the legacy ``spec.image_size=384`` fallback
+# depends on it.
 # --------------------------------------------------------------------------- #
 _QWEN3_VL_4B_DIR_DEFAULT = "/userdata/models/Qwen3-VL-4B"
 _QWEN3_VL_4B_REQUIRED = (
     "llm_Qwen3-VL-4B.1828.rknn",
     "llm_Qwen3-VL-4B.weight",
-    "vision_Qwen3-VL-4B.1828.rknn",
-    "vision_Qwen3-VL-4B.weight",
+    # 384x384 is the always-required base resolution — VLMBackend falls
+    # back to it (and uses it for the spec.image_size fallback) when
+    # no other variants exist.
+    "vision_Qwen3-VL-4B.384x384.1828.rknn",
+    "vision_Qwen3-VL-4B.384x384.weight",
     "Qwen3-VL-4B.embed.bin",
     "Qwen3-VL-4B.tokenizer.gguf",
+)
+# Optional vision variants — VLMBackend discovers them at init and
+# picks per-call based on the input image's longest side. Each entry
+# must be a pair (``.1828.rknn`` + ``.weight``); missing pairs cause
+# that variant to be silently skipped (logged as a warning).
+_QWEN3_VL_4B_OPTIONAL = (
+    # 768x768 — used for high-resolution inputs where the 384x384
+    # encoder would discard too much detail.
+    "vision_Qwen3-VL-4B.768x768.1828.rknn",
+    "vision_Qwen3-VL-4B.768x768.weight",
 )
 
 
@@ -264,18 +289,31 @@ def _qwen3_vl_4b_dir() -> Path:
 
 
 def _default_qwen3_vl_4b_paths() -> dict:
-    """Return absolute paths to the Qwen3-VL-4B files under the resolved directory."""
+    """Return absolute paths to the Qwen3-VL-4B files under the resolved directory.
+
+    The ``rknn_vision_path`` points to the **384x384** vision model;
+    ``VLMBackend`` then discovers the optional 768x768 sibling in the
+    same directory at runtime. Both ``vision_*.384x384.1828.rknn`` and
+    ``vision_*.384x384.weight`` must exist for the preset to be usable.
+    """
     d = _qwen3_vl_4b_dir()
     return {
         "rknn_llm_path":   str(d / "llm_Qwen3-VL-4B.1828.rknn"),
-        "rknn_vision_path": str(d / "vision_Qwen3-VL-4B.1828.rknn"),
+        "rknn_vision_path": str(d / "vision_Qwen3-VL-4B.384x384.1828.rknn"),
         "tokenizer_path":  str(d / "Qwen3-VL-4B.tokenizer.gguf"),
         "embed_path":      str(d / "Qwen3-VL-4B.embed.bin"),
     }
 
 
 def _verify_qwen3_vl_4b_files() -> None:
-    """Raise :class:`FileNotFoundError` listing any missing Qwen3-VL-4B files."""
+    """Raise :class:`FileNotFoundError` listing any missing Qwen3-VL-4B files.
+
+    Required files (must be present): see ``_QWEN3_VL_4B_REQUIRED``.
+    Optional files (warn if any pair is half-present): see
+    ``_QWEN3_VL_4B_OPTIONAL``. We only warn for the optional list so a
+    half-installed 768x768 doesn't break the preset — the backend
+    will skip the half-present variant at runtime.
+    """
     d = _qwen3_vl_4b_dir()
     missing = [f for f in _QWEN3_VL_4B_REQUIRED if not (d / f).is_file()]
     if missing:
@@ -283,6 +321,24 @@ def _verify_qwen3_vl_4b_files() -> None:
             f"Qwen3-VL-4B files missing under {d}: {missing}. "
             f"Place the files there or set WDNAI_QWEN3_VL_4B_DIR to point at a custom path."
         )
+    # Optional variants — warn (don't raise) for half-present pairs.
+    import logging as _logging
+    _log = _logging.getLogger("wdnai.model")
+    for stem in ("vision_Qwen3-VL-4B.768x768",):
+        rknn = d / f"{stem}.1828.rknn"
+        weight = d / f"{stem}.weight"
+        if rknn.is_file() and not weight.is_file():
+            _log.warning(
+                "Qwen3-VL-4B: %s.1828.rknn present but %s.weight missing; "
+                "VLMBackend will skip this variant.",
+                stem, stem,
+            )
+        elif weight.is_file() and not rknn.is_file():
+            _log.warning(
+                "Qwen3-VL-4B: %s.weight present but %s.1828.rknn missing; "
+                "VLMBackend will skip this variant.",
+                stem, stem,
+            )
 
 
 _QWEN3_8B_REQUIRED = (

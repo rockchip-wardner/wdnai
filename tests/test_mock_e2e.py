@@ -195,6 +195,19 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
         vp = spec.rknn_vision_path
         if self.rknn_vision.load_rknn(vp, vp.replace(".rknn3", ".weight")) != 0:
             raise RuntimeError("vision load failed")
+        # Wrap the single mock vision RKNN into a one-element
+        # ``_vision_variants`` list so the multi-resolution-aware
+        # ``_pick_variant`` / ``_build_image_inputs`` code paths find
+        # it. Production ``VLMBackend.__init__`` builds the same list
+        # from directory discovery; the mock short-circuits to a single
+        # variant at ``spec.image_size``.
+        from wdnai.backends.vlm import _VisionVariant
+        self._vision_variants = [_VisionVariant(
+            image_size=spec.image_size,
+            rknn=self.rknn_vision,
+            rknn_path=vp,
+            weight_path=vp.replace(".rknn3", ".weight"),
+        )]
         # llm
         self.rknn_llm = RKNN3Lite(llm_mode=True, verbose=spec.verbose)
         lp = spec.rknn_llm_path
@@ -529,6 +542,441 @@ def test_npu_and_device_id_mutually_exclusive():
 
 
 # --------------------------------------------------------------------------- #
+def test_discover_vision_paths_multi_resolution():
+    """``_discover_vision_paths`` finds every ``<prefix>.<WxH>.1828.rknn`` sibling.
+
+    The naming convention is: ``vision_<name>.<W>x<H>.1828.rknn`` + a
+    matching ``vision_<name>.<W>x<H>.weight``. Discovery is per
+    ``<prefix>``, so a directory containing both
+    ``vision_Qwen3-VL-4B.384x384.*`` and
+    ``vision_Qwen3-VL-4B.768x768.*`` returns two entries sorted by
+    image_size ascending.
+    """
+    import os
+    import tempfile
+    from wdnai.backends.vlm import _discover_vision_paths
+
+    with tempfile.TemporaryDirectory(prefix="wdnai_vision_") as d:
+        d_path = d
+        # Multi-resolution layout
+        for size in (384, 768):
+            base = f"vision_Qwen3-VL-4B.{size}x{size}"
+            with open(os.path.join(d_path, f"{base}.1828.rknn"), "wb") as f:
+                f.write(b"\x00" * 16)
+            with open(os.path.join(d_path, f"{base}.weight"), "wb") as f:
+                f.write(b"\x00" * 16)
+
+        # Anchor: point at the 384x384 file so the backend scans the
+        # right directory.
+        anchor = os.path.join(d_path, "vision_Qwen3-VL-4B.384x384.1828.rknn")
+        variants = _discover_vision_paths(anchor)
+        sizes = sorted([s for s, _r, _w in variants])
+        assert sizes == [384, 768], f"expected [384, 768], got {sizes}"
+        for s, rknn_p, weight_p in variants:
+            assert rknn_p.endswith(f".{s}x{s}.1828.rknn")
+            assert weight_p.endswith(f".{s}x{s}.weight")
+        print("[discover] multi-resolution ->", variants)
+
+
+def test_discover_vision_paths_legacy_single_file():
+    """Legacy ``<prefix>.1828.rknn`` (no ``.<WxH>.`` suffix) returns one entry."""
+    import os
+    import tempfile
+    from wdnai.backends.vlm import _discover_vision_paths
+
+    with tempfile.TemporaryDirectory(prefix="wdnai_vision_legacy_") as d:
+        d_path = d
+        with open(os.path.join(d_path, "vision_Qwen3-VL-4B.1828.rknn"), "wb") as f:
+            f.write(b"\x00" * 16)
+        with open(os.path.join(d_path, "vision_Qwen3-VL-4B.weight"), "wb") as f:
+            f.write(b"\x00" * 16)
+
+        anchor = os.path.join(d_path, "vision_Qwen3-VL-4B.1828.rknn")
+        variants = _discover_vision_paths(anchor)
+        assert len(variants) == 1
+        size, rknn_p, weight_p = variants[0]
+        assert size == -1  # legacy sentinel; caller resolves from spec.image_size
+        assert rknn_p == anchor
+        assert weight_p.endswith(".weight")
+        print("[discover] legacy single file ->", variants)
+
+
+def test_discover_vision_paths_skips_half_present_variants():
+    """A ``.1828.rknn`` without its ``.weight`` sibling is skipped."""
+    import os
+    import tempfile
+    from wdnai.backends.vlm import _discover_vision_paths
+
+    with tempfile.TemporaryDirectory(prefix="wdnai_vision_half_") as d:
+        d_path = d
+        # 384x384: complete pair
+        with open(os.path.join(d_path, "vision_X.384x384.1828.rknn"), "wb") as f:
+            f.write(b"\x00")
+        with open(os.path.join(d_path, "vision_X.384x384.weight"), "wb") as f:
+            f.write(b"\x00")
+        # 768x768: missing .weight — must be skipped
+        with open(os.path.join(d_path, "vision_X.768x768.1828.rknn"), "wb") as f:
+            f.write(b"\x00")
+        # no .weight sibling for 768x768
+
+        anchor = os.path.join(d_path, "vision_X.384x384.1828.rknn")
+        variants = _discover_vision_paths(anchor)
+        sizes = sorted([s for s, _r, _w in variants])
+        assert sizes == [384], f"expected only 384, got {sizes}"
+        print("[discover] skip half-present variant ->", sizes)
+
+
+def test_discover_vision_paths_ignores_other_prefixes():
+    """Discovery is scoped to the anchor's prefix; other models are ignored."""
+    import os
+    import tempfile
+    from wdnai.backends.vlm import _discover_vision_paths
+
+    with tempfile.TemporaryDirectory(prefix="wdnai_vision_other_") as d:
+        d_path = d
+        # Our model: 384x384 only
+        with open(os.path.join(d_path, "vision_Qwen3-VL-4B.384x384.1828.rknn"), "wb") as f:
+            f.write(b"\x00")
+        with open(os.path.join(d_path, "vision_Qwen3-VL-4B.384x384.weight"), "wb") as f:
+            f.write(b"\x00")
+        # Different model (embedding) also in the same dir — must NOT be returned
+        with open(os.path.join(d_path, "vision_Qwen3-VL-Embedding-2B.1828.rknn"), "wb") as f:
+            f.write(b"\x00")
+        with open(os.path.join(d_path, "vision_Qwen3-VL-Embedding-2B.weight"), "wb") as f:
+            f.write(b"\x00")
+
+        anchor = os.path.join(d_path, "vision_Qwen3-VL-4B.384x384.1828.rknn")
+        variants = _discover_vision_paths(anchor)
+        sizes = sorted([s for s, _r, _w in variants])
+        assert sizes == [384], f"other-model files leaked into discovery: {variants}"
+        # All paths must point at Qwen3-VL-4B (not embedding)
+        for _s, rknn_p, _w in variants:
+            assert "Qwen3-VL-4B" in rknn_p
+            assert "Embedding" not in rknn_p
+        print("[discover] prefix-scoped ->", variants)
+
+
+def test_pick_variant_closest_by_longest_side():
+    """``VLMBackend._pick_variant`` picks the variant whose image_size
+    is closest to the input image's longest side; ties broken by smaller size.
+    """
+    from wdnai.backends.vlm import _VisionVariant
+
+    class _StubRknn:
+        # ``_VisionVariant`` doesn't call any RKNN3Lite methods during
+        # ``_pick_variant``; this stub is only here to satisfy the
+        # constructor.
+        pass
+
+    fake_backend = type(
+        "_StubBackend",
+        (),
+        {"_vision_variants": [
+            _VisionVariant(image_size=384, rknn=_StubRknn(),
+                           rknn_path="/fake/384.rknn", weight_path="/fake/384.weight"),
+            _VisionVariant(image_size=768, rknn=_StubRknn(),
+                           rknn_path="/fake/768.rknn", weight_path="/fake/768.weight"),
+        ]},
+    )()
+
+    # ``_pick_variant`` is a method — bind it to the stub
+    from wdnai.backends.vlm import VLMBackend
+    pick = VLMBackend._pick_variant.__get__(fake_backend, type(fake_backend))
+
+    # Tiny image → 384 (closer than 768)
+    img = np.zeros((100, 100, 3), dtype=np.uint8)
+    v = pick(img)
+    assert v.image_size == 384, f"tiny image should pick 384, got {v.image_size}"
+
+    # High-res image (1500 wide) → 768 (closer than 384)
+    img = np.zeros((900, 1500, 3), dtype=np.uint8)
+    v = pick(img)
+    assert v.image_size == 768, f"1500-wide image should pick 768, got {v.image_size}"
+
+    # Mid image (576 square) → 384: |384-576|=192, |768-576|=192 → tie → smaller wins
+    img = np.zeros((576, 576, 3), dtype=np.uint8)
+    v = pick(img)
+    assert v.image_size == 384, f"576-square tie should pick 384, got {v.image_size}"
+
+    # Boundary: 600-wide → 768 wins (|384-600|=216, |768-600|=168)
+    img = np.zeros((400, 600, 3), dtype=np.uint8)
+    v = pick(img)
+    assert v.image_size == 768, f"600-wide should pick 768, got {v.image_size}"
+
+    # Portrait image: max(h, w) drives the decision
+    img = np.zeros((2000, 500, 3), dtype=np.uint8)  # 2000 tall
+    v = pick(img)
+    assert v.image_size == 768, f"2000-tall portrait should pick 768, got {v.image_size}"
+
+    print("[pick] longest-side selection ok")
+
+
+def test_pick_variant_single_variant_short_circuits():
+    """A single-variant backend always returns its only variant, regardless of size."""
+    from wdnai.backends.vlm import _VisionVariant, VLMBackend
+
+    class _StubRknn:
+        pass
+
+    fake_backend = type(
+        "_StubBackend",
+        (),
+        {"_vision_variants": [
+            _VisionVariant(image_size=384, rknn=_StubRknn(),
+                           rknn_path="/fake/384.rknn", weight_path="/fake/384.weight"),
+        ]},
+    )()
+
+    pick = VLMBackend._pick_variant.__get__(fake_backend, type(fake_backend))
+    for hw in [(100, 100), (640, 480), (1920, 1080), (50, 50)]:
+        img = np.zeros((hw[1], hw[0], 3), dtype=np.uint8)
+        v = pick(img)
+        assert v.image_size == 384, f"single-variant: {hw} -> {v.image_size}"
+    print("[pick] single-variant short-circuit ok")
+
+
+# --------------------------------------------------------------------------- #
+def test_available_image_sizes_returns_variant_sizes():
+    """``VLMBackend.available_image_sizes()`` returns the sorted
+    list of variant image sizes — used by wdnwebui's 音视频描述
+    page ``#vd-detect-size`` dropdown to populate dynamically."""
+    from wdnai.backends.vlm import _VisionVariant, VLMBackend
+
+    class _StubRknn:
+        pass
+
+    # Two-variant backend
+    backend = object.__new__(VLMBackend)
+    backend._vision_variants = [
+        _VisionVariant(image_size=384, rknn=_StubRknn(),
+                       rknn_path="/f/384.rknn", weight_path="/f/384.weight"),
+        _VisionVariant(image_size=768, rknn=_StubRknn(),
+                       rknn_path="/f/768.rknn", weight_path="/f/768.weight"),
+    ]
+    sizes = backend.available_image_sizes()
+    assert sizes == [384, 768], f"expected [384, 768], got {sizes}"
+
+    # Single-variant backend (legacy single-resolution install)
+    backend._vision_variants = [
+        _VisionVariant(image_size=384, rknn=_StubRknn(),
+                       rknn_path="/f/384.rknn", weight_path="/f/384.weight"),
+    ]
+    sizes = backend.available_image_sizes()
+    assert sizes == [384], f"expected [384], got {sizes}"
+
+    print("[available_image_sizes] returns variant sizes sorted")
+
+
+def test_pick_variant_image_size_override_exact_match():
+    """``_pick_variant(image_size=N)`` returns the variant whose
+    ``image_size`` matches ``N`` exactly — no auto-pick heuristic
+    is involved."""
+    from wdnai.backends.vlm import _VisionVariant, VLMBackend
+
+    class _StubRknn:
+        pass
+
+    backend = object.__new__(VLMBackend)
+    backend._vision_variants = [
+        _VisionVariant(image_size=384, rknn=_StubRknn(),
+                       rknn_path="/f/384.rknn", weight_path="/f/384.weight"),
+        _VisionVariant(image_size=768, rknn=_StubRknn(),
+                       rknn_path="/f/768.rknn", weight_path="/f/768.weight"),
+    ]
+    pick = VLMBackend._pick_variant.__get__(backend, type(backend))
+
+    # Exact match → returns that variant even when an auto-pick would
+    # have picked the other (here, an 800x600 frame would auto-pick
+    # 768, but image_size=384 must override).
+    img = np.zeros((600, 800, 3), dtype=np.uint8)
+    v = pick(img, image_size=384)
+    assert v.image_size == 384, f"override should win, got {v.image_size}"
+
+    v = pick(img, image_size=768)
+    assert v.image_size == 768, f"explicit 768 should win, got {v.image_size}"
+
+    # Single-variant backend: image_size override is irrelevant; the
+    # only variant is returned regardless of requested size.
+    backend._vision_variants = [
+        _VisionVariant(image_size=384, rknn=_StubRknn(),
+                       rknn_path="/f/384.rknn", weight_path="/f/384.weight"),
+    ]
+    v = pick(image_size=768)
+    assert v.image_size == 384, f"single-variant: any size → 384, got {v.image_size}"
+
+    print("[pick_variant] image_size override exact match")
+
+
+def test_preprocess_to_variant_dispatches_by_n_dims():
+    """``_preprocess_to_variant`` must inspect ``in_attr.n_dims`` at
+    runtime, not ``spec.use_prune``, because the 4B exports in this
+    env have different export formats per resolution:
+
+      * 384 file (full NHWC):  ``in_attr.n_dims == 4``  → NHWC
+      * 768 file (pruned):    ``in_attr.n_dims != 4``  → patchified
+
+    Mismatching the two is what caused the regression with the
+    previous ``use_prune=False`` dispatch.
+    """
+    from types import SimpleNamespace
+    from wdnai.backends.vlm import _VisionVariant, VLMBackend
+
+    class _StubRknn:
+        def get_inputs_tensor_attr(self):
+            # The 384/768 stubs report different ``n_dims`` so we
+            # can verify that the dispatch key in
+            # ``_preprocess_to_variant`` follows the runtime query,
+            # not a preset config flag.
+            if self._image_size == 384:
+                return [SimpleNamespace(n_dims=4, shape=(1, 384, 384, 3))]
+            return [SimpleNamespace(n_dims=2, shape=(2304, 1536))]
+
+    v_384 = _VisionVariant(
+        image_size=384, rknn=_StubRknn(), rknn_path="/f/384.rknn", weight_path="/f/384.weight",
+    )
+    v_384.rknn._image_size = 384
+    v_768 = _VisionVariant(
+        image_size=768, rknn=_StubRknn(), rknn_path="/f/768.rknn", weight_path="/f/768.weight",
+    )
+    v_768.rknn._image_size = 768
+
+    backend = object.__new__(VLMBackend)
+    backend.spec = SimpleNamespace(use_prune=False)   # preset says full
+    backend.variant = VLMBackend.VARIANT_3VL
+    backend._vision_variants = [v_384, v_768]
+
+    # Patch the prune helper so we can assert it was (or was not)
+    # called without importing the real rknn. Leave ``resize`` real
+    # so the input is actually resized to the variant's image_size
+    # before ``_preprocess_to_variant`` reshapes it.
+    import wdnai.backends.vlm as vlm_mod
+    calls = {"prune": 0}
+    def _fake_prune(_nchw):
+        calls["prune"] += 1
+        return np.zeros((1, 1), dtype=np.float32)
+    orig_prune = vlm_mod.qwen3vl_prune_single
+    vlm_mod.qwen3vl_prune_single = _fake_prune
+    try:
+        img = np.zeros((100, 100, 3), dtype=np.uint8)  # arbitrary source size
+        # 384 variant (n_dims=4) → must take the NHWC raw path,
+        # NOT the prune path.  Shape assertion below confirms.
+        out = backend._preprocess_to_variant(img, v_384)
+        assert out.shape == (1, 384, 384, 3), (
+            f"384 n_dims=4 should produce (1,384,384,3) NHWC, got {out.shape}"
+        )
+        assert calls["prune"] == 0, "384 path must NOT call qwen3vl_prune_single"
+
+        # 768 variant (n_dims=2) → must take the prune / patchified
+        # path.  Shape assertion confirms the prune helper was called
+        # and produced a 2-D (num_patches, embed_dim) tensor.
+        out = backend._preprocess_to_variant(img, v_768)
+        assert out.ndim == 2, f"768 n_dims=2 should produce 2-D tensor, got ndim={out.ndim}"
+        assert calls["prune"] == 1, "768 path must call qwen3vl_prune_single exactly once"
+    finally:
+        vlm_mod.qwen3vl_prune_single = orig_prune
+    print("[preprocess] dispatches by in_attr.n_dims (384=NHWC, 768=pruned)")
+
+
+def test_pick_variant_image_size_override_nearest_fallback():
+    """When ``image_size`` doesn't match any variant, fall back to
+    nearest (smaller on tie) and log a warning — preserves the
+    safety net for legacy single-resolution installs that don't have
+    the requested resolution."""
+    import logging as _logging
+    from wdnai.backends.vlm import _VisionVariant, VLMBackend
+
+    class _StubRknn:
+        pass
+
+    backend = object.__new__(VLMBackend)
+    backend._vision_variants = [
+        _VisionVariant(image_size=384, rknn=_StubRknn(),
+                       rknn_path="/f/384.rknn", weight_path="/f/384.weight"),
+        _VisionVariant(image_size=768, rknn=_StubRknn(),
+                       rknn_path="/f/768.rknn", weight_path="/f/768.weight"),
+    ]
+    pick = VLMBackend._pick_variant.__get__(backend, type(backend))
+
+    # 512 not exposed → nearest wins. |384-512|=128 < |768-512|=256 → 384.
+    v = pick(image_size=512)
+    assert v.image_size == 384, f"512 not exposed → nearest 384, got {v.image_size}"
+
+    # 1000 closer to 768 than 384 → 768.
+    v = pick(image_size=1000)
+    assert v.image_size == 768, f"1000 → 768, got {v.image_size}"
+
+    # 576 (tie) → smaller wins → 384.
+    v = pick(image_size=576)
+    assert v.image_size == 384, f"576 tie → 384, got {v.image_size}"
+
+    print("[pick_variant] nearest fallback works for unknown sizes")
+
+
+def test_run_images_forwards_image_size():
+    """``VLMBackend.run_images(image_size=N)`` is the entry point the
+    wdnwebui detector hits. The kwarg flows into ``_pick_variant``
+    and overrides auto-pick."""
+    from wdnai.backends.vlm import _VisionVariant, VLMBackend
+
+    class _StubRknn:
+        def get_inputs_tensor_attr(self):
+            from types import SimpleNamespace
+            return [SimpleNamespace(n_dims=4, shape=(1, 384, 384, 3))]
+        def get_outputs_tensor_attr(self):
+            return [SimpleNamespace(aligned_size=4096)]
+        def inference(self, inputs):
+            return [np.zeros((1, 32), dtype=np.float32)]
+
+    backend = object.__new__(VLMBackend)
+    backend.spec = type("S", (), {
+        "name": "fake", "variant": "qwen3-vl", "image_size": 384,
+        "use_prune": False,
+    })()
+    backend.variant = "qwen3-vl"
+    backend._vision_variants = [
+        _VisionVariant(image_size=384, rknn=_StubRknn(),
+                       rknn_path="/f/384.rknn", weight_path="/f/384.weight"),
+        _VisionVariant(image_size=768, rknn=_StubRknn(),
+                       rknn_path="/f/768.rknn", weight_path="/f/768.weight"),
+    ]
+    backend.rknn_vision = backend._vision_variants[0].rknn
+    backend.tokenizer = None
+    backend.embeds = None
+    backend.sink = None
+
+    # Spy on ``_pick_variant`` to capture the ``image_size=`` kwarg
+    # forwarded by ``_build_image_inputs``. The kwarg is consumed
+    # inside ``_pick_variant`` to choose the variant, then
+    # ``_vision_infer`` is called with the pinned variant (no
+    # further image_size arg).
+    pick_calls = []
+    orig_pick = backend._pick_variant
+    def spy_pick(img_bgr=None, *, image_size=None):
+        pick_calls.append({"img_shape": img_bgr.shape if img_bgr is not None else None,
+                           "image_size": image_size})
+        return orig_pick(img_bgr, image_size=image_size)
+    backend._pick_variant = spy_pick
+
+    # 800x600 frame + image_size=384 → the chosen variant must be 384
+    # (override wins even though auto-pick would have chosen 768).
+    img = np.zeros((600, 800, 3), dtype=np.uint8)
+    backend._build_image_inputs([img], image_size=384)
+
+    # The first call (auto-pick based on first image) carries
+    # image_size=384; subsequent calls from the loop may carry
+    # image_size=None (they fall back to auto-pick per image but
+    # force-fit to the chosen variant).
+    assert pick_calls, "_pick_variant was not called"
+    assert pick_calls[0]["image_size"] == 384, (
+        f"_build_image_inputs must forward image_size=384 to "
+        f"_pick_variant, got {pick_calls[0]['image_size']}"
+    )
+
+    backend._pick_variant = orig_pick
+    print("[run_images] image_size=384 forwarded to _pick_variant")
+
+
+# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     test_text_qwen3()
     test_text_qwen25()
@@ -540,4 +988,14 @@ if __name__ == "__main__":
     test_npu_index_resolves_via_get_devices_id()
     test_npu_out_of_range_raises()
     test_npu_and_device_id_mutually_exclusive()
+    test_discover_vision_paths_multi_resolution()
+    test_discover_vision_paths_legacy_single_file()
+    test_discover_vision_paths_skips_half_present_variants()
+    test_discover_vision_paths_ignores_other_prefixes()
+    test_pick_variant_closest_by_longest_side()
+    test_pick_variant_single_variant_short_circuits()
+    test_available_image_sizes_returns_variant_sizes()
+    test_pick_variant_image_size_override_exact_match()
+    test_pick_variant_image_size_override_nearest_fallback()
+    test_run_images_forwards_image_size()
     print("\nALL MOCK TESTS PASSED")

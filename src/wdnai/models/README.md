@@ -8,13 +8,15 @@ No network access is performed at any point; place the model files manually.
 
 ```
 /userdata/models/
-├── Qwen3-VL-4B/
-│   ├── llm_Qwen3-VL-4B.1828.rknn       # LLM RKNN (25 MB)
-│   ├── llm_Qwen3-VL-4B.weight          # LLM weights (2.3 GB)
-│   ├── vision_Qwen3-VL-4B.1828.rknn    # Vision encoder RKNN (4.2 MB)
-│   ├── vision_Qwen3-VL-4B.weight       # Vision weights (234 MB)
-│   ├── Qwen3-VL-4B.embed.bin           # Token embedding table (742 MB, vocab 151936 × 2560-dim float16)
-│   └── Qwen3-VL-4B.tokenizer.gguf      # GGUF-format tokenizer (5.7 MB; loaded via wdnai.gguf_tokenizer)
+├── Qwen3-VL-4B/                                  # vision-language (multi-resolution vision)
+│   ├── llm_Qwen3-VL-4B.1828.rknn                 # LLM RKNN (25 MB)
+│   ├── llm_Qwen3-VL-4B.weight                    # LLM weights (2.3 GB)
+│   ├── vision_Qwen3-VL-4B.384x384.1828.rknn      # Vision encoder RKNN @ 384x384 (4.2 MB) — REQUIRED
+│   ├── vision_Qwen3-VL-4B.384x384.weight         # Vision weights @ 384x384 (234 MB)   — REQUIRED
+│   ├── vision_Qwen3-VL-4B.768x768.1828.rknn      # Vision encoder RKNN @ 768x768 (≈14 MB) — OPTIONAL
+│   ├── vision_Qwen3-VL-4B.768x768.weight         # Vision weights @ 768x768 (≈700 MB)   — OPTIONAL
+│   ├── Qwen3-VL-4B.embed.bin                     # Token embedding table (742 MB, vocab 151936 × 2560-dim float16)
+│   └── Qwen3-VL-4B.tokenizer.gguf                # GGUF-format tokenizer (5.7 MB; loaded via wdnai.gguf_tokenizer)
 │
 ├── Qwen3-TTS/                         # pyrkaiweb's text-to-speech back end
 │   ├── text_projection.1828.rknn       # ① 文本侧 projector — 普通 RKNN 图，core_mask=0x01（1 核）
@@ -60,6 +62,18 @@ by default and raises `FileNotFoundError` listing the missing files if
 the directory is incomplete. To add a new model variant, place
 another sibling directory under `/userdata/models/<new-variant>/` and
 add a preset + path helper in [wdnai/model.py](../model.py).
+
+**Multi-resolution vision**: the directory may carry multiple
+`<role>.<WxH>.1828.rknn` + `<role>.<WxH>.weight` pairs — `VLMBackend`
+auto-discovers them at init and picks the one whose training resolution
+is closest to the input image's longest side per call. The 384x384
+pair is required (it's the `spec.image_size=384` fallback); additional
+resolutions (e.g. 768x768 for high-detail inputs) are loaded when both
+files in the pair exist. Memory cost scales linearly with the number
+of variants resident on the NPU — bump `memory_estimate_mb` in
+[wdnwebui](../)'s `MODEL_PRESETS` if you ship both 384x384 and 768x768
+together. To add a new resolution tier, drop a new pair into the
+directory; no preset change is needed.
 
 ### Qwen3-TTS (text-to-speech)
 
@@ -108,6 +122,14 @@ L2-normalized 2048-dim vector. File layout mirrors Qwen3-VL-4B
 Used by pyrkaiweb's `#page-video-content-search` via the
 `EmbeddingBackend` in `wdnai/backends/embedding.py`
 (`SystemLanguageModel.qwen3_vl_embedding`).
+
+Unlike Qwen3-VL-4B, this model uses a **single fixed** vision
+resolution (576x576); the multi-resolution discovery in `VLMBackend`
+does not apply here. The legacy single-file naming
+(`vision_Qwen3-VL-Embedding-2B.1828.rknn`, no `<WxH>` suffix) is what
+the embedding backend loads — `VLMBackend`'s discovery helper would
+fall through to the legacy single-file path automatically when no
+`<WxH>` siblings are present.
 
 | File (`<root>/Qwen3-VL-Embedding-2B/…`)     | Purpose                              |
 | ------------------------------------------- | ------------------------------------ |

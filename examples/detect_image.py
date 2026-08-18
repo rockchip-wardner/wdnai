@@ -18,6 +18,12 @@ This example shows the v2 ``Attachment`` API:
 * ``generating`` accepts an ``@Generable`` class that inherits from
   ``LMOutput`` so the parsed result carries an ``attachment`` slot the
   SDK can populate automatically (TTS-style binaries).
+
+When the ``Qwen3-VL-4B/`` directory carries both the 384x384 and the
+768x768 vision model pairs, ``LLMSession`` auto-loads both at init and
+picks the closest variant per call based on the input image's longest
+side. See [wdnai/models/README.md](../src/wdnai/models/README.md) for
+the multi-resolution naming convention.
 """
 from typing import List, Literal
 

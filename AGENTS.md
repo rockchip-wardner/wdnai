@@ -110,20 +110,34 @@ name `wdnai`.
   exposes `run(prompt, **overrides)`. Overrides `max_new_tokens` /
   `enable_thinking` / `keep_history` are passed straight to
   `rknn.session_run`.
-- `src/wdnai/backends/vlm.py` — `VLMBackend`: two `RKNN3Lite` handles
-  (vision + llm). Variant-dispatched preprocessing
-  (`VARIANT_25VL="qwen2.5-vl"` vs `VARIANT_3VL="qwen3-vl"`):
+- `src/wdnai/backends/vlm.py` — `VLMBackend`: one `RKNN3Lite` LLM
+  handle + **N** vision handles (one per discovered native resolution
+  variant). At init, `_load_vision_variants` calls
+  `_discover_vision_paths` to scan `spec.rknn_vision_path`'s directory
+  for every `<prefix>.<WxH>.1828.rknn` sibling. Qwen3-VL-4B ships
+  with both 384x384 (required) and 768x768 (optional) pairs; legacy
+  installations with a single `vision_<name>.1828.rknn` (no `<WxH>`
+  suffix) fall through to the single-file path. Each variant gets its
+  own RKNN3Lite context sharing the LLM's `device_id`. Variant-
+  dispatched preprocessing (`VARIANT_25VL="qwen2.5-vl"` vs
+  `VARIANT_3VL="qwen3-vl"`):
   - `use_prune=True` → `qwen25vl_prune(...)` /
     `qwen3vl_prune_single(...)` (2D feature, matches the example
     scripts).
   - `use_prune=False` → NHWC `(1, H, W, 3)`; Qwen3-VL full vision
     model expects a 2-image stack (the "two-frame input" video mode),
     so a single image is duplicated along axis 0.
+  **Per-call variant selection** (`_pick_variant`): the variant whose
+  `image_size` is closest to the first image's longest side wins; ties
+  broken by smaller size. All images in one call share one variant
+  (the LLM consumes a single `RKNN3Image` with concatenated tokens +
+  a single `image_width` / `image_height`); images that would prefer a
+  different variant are force-fit to the chosen one with a warning.
   Outputs the vision feature → `RKNN3Image` (vision tags set to
   `<|vision_start|>` / `<|vision_end|>` / `<|image_pad|>`). Qwen3-VL
   additionally concatenates 3 deepstack aux tensors (output indices
-  1..3) into `RKNN3AuxTensorWrapper`s with the vision output's
-  `aligned_size`.
+  1..3) into `RKNN3AuxTensorWrapper`s with the chosen variant's
+  vision output's `aligned_size`.
 - `src/wdnai/backends/tts.py` — `TTSBackend` + vendored
   `Qwen3TTSDriver` (1542 lines, originally in
   `rknn3-toolkit-lite/examples/Qwen3-TTS/qwen3_tts_demo.py` and
