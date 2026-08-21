@@ -250,7 +250,6 @@ def _qwen3vl_4b_spec(**overrides) -> ModelSpec:
 # pair is required because the legacy ``spec.image_size=384`` fallback
 # depends on it.
 # --------------------------------------------------------------------------- #
-_QWEN3_VL_4B_DIR_DEFAULT = "/userdata/models/Qwen3-VL-4B"
 _QWEN3_VL_4B_REQUIRED = (
     "llm_Qwen3-VL-4B.1828.rknn",
     "llm_Qwen3-VL-4B.weight",
@@ -283,9 +282,15 @@ def _qwen3_vl_4b_dir() -> Path:
     """Resolve the Qwen3-VL-4B model directory.
 
     Override via the ``WDNAI_QWEN3_VL_4B_DIR`` env var (full path);
-    default ``/userdata/models/Qwen3-VL-4B``.
+    fallback ``$WDNAI_MODELS_DIR/Qwen3-VL-4B`` (which itself defaults
+    to ``/userdata/models/Qwen3-VL-4B`` when ``WDNAI_MODELS_DIR`` is
+    unset). Mirrors ``_qwen3_8b_dir`` so every model dir honors the
+    same ``WDNAI_MODELS_DIR`` root — the wdnwebui 基础配置 page writes
+    ``base.model_path`` into ``WDNAI_MODELS_DIR`` at boot, and the
+    SDK must follow it for all presets, not just two of them.
     """
-    return Path(_os.environ.get("WDNAI_QWEN3_VL_4B_DIR", _QWEN3_VL_4B_DIR_DEFAULT))
+    override = _os.environ.get("WDNAI_QWEN3_VL_4B_DIR")
+    return Path(override) if override else _models_root() / "Qwen3-VL-4B"
 
 
 def _default_qwen3_vl_4b_paths() -> dict:
@@ -313,9 +318,28 @@ def _verify_qwen3_vl_4b_files() -> None:
     ``_QWEN3_VL_4B_OPTIONAL``. We only warn for the optional list so a
     half-installed 768x768 doesn't break the preset — the backend
     will skip the half-present variant at runtime.
+
+    Legacy single-file fallback for the 384x384 vision pair: older
+    installations shipped ``vision_Qwen3-VL-4B.1828.rknn`` /
+    ``vision_Qwen3-VL-4B.weight`` without the ``<WxH>`` suffix.
+    ``VLMBackend._discover_vision_paths`` already falls back to that
+    single-file path at runtime when no ``<WxH>`` siblings are found,
+    so mirror the same fallback here — pass the preflight on either
+    naming and let the loader pick which to load.
     """
     d = _qwen3_vl_4b_dir()
-    missing = [f for f in _QWEN3_VL_4B_REQUIRED if not (d / f).is_file()]
+    _LEGACY_VISION_384_FALLBACK = {
+        "vision_Qwen3-VL-4B.384x384.1828.rknn": "vision_Qwen3-VL-4B.1828.rknn",
+        "vision_Qwen3-VL-4B.384x384.weight":    "vision_Qwen3-VL-4B.weight",
+    }
+    missing = []
+    for f in _QWEN3_VL_4B_REQUIRED:
+        if (d / f).is_file():
+            continue
+        legacy = _LEGACY_VISION_384_FALLBACK.get(f)
+        if legacy and (d / legacy).is_file():
+            continue
+        missing.append(f)
     if missing:
         raise FileNotFoundError(
             f"Qwen3-VL-4B files missing under {d}: {missing}. "
@@ -427,7 +451,6 @@ def _verify_qwen3_vl_embedding_2b_files() -> None:
 #     Qwen2.5-Omni-3B-llm.tokenizer.gguf  GPT-2 BPE + ByteLevel
 #     mel_128_filters.txt              (128 × N_FFT/2 + 1) fp32
 # --------------------------------------------------------------------------- #
-_QWEN_2_5_OMNI_3B_DIR_DEFAULT = "/userdata/models/Qwen2.5-Omni-3B"
 _QWEN_2_5_OMNI_3B_REQUIRED = (
     "Qwen2.5-Omni-3B-audio.1828.rknn",
     "Qwen2.5-Omni-3B-audio.weight",
@@ -443,11 +466,13 @@ def _qwen_2_5_omni_3b_dir() -> Path:
     """Resolve the Qwen2.5-Omni-3B model directory.
 
     Override via the ``WDNAI_QWEN_2_5_OMNI_3B_DIR`` env var (full path);
-    default ``/userdata/models/Qwen2.5-Omni-3B``.
+    fallback ``$WDNAI_MODELS_DIR/Qwen2.5-Omni-3B`` (which itself defaults
+    to ``/userdata/models/Qwen2.5-Omni-3B`` when ``WDNAI_MODELS_DIR`` is
+    unset). Mirrors ``_qwen3_8b_dir`` so every model dir honors the same
+    ``WDNAI_MODELS_DIR`` root.
     """
-    return Path(_os.environ.get(
-        "WDNAI_QWEN_2_5_OMNI_3B_DIR", _QWEN_2_5_OMNI_3B_DIR_DEFAULT,
-    ))
+    override = _os.environ.get("WDNAI_QWEN_2_5_OMNI_3B_DIR")
+    return Path(override) if override else _models_root() / "Qwen2.5-Omni-3B"
 
 
 def _default_qwen_2_5_omni_3b_paths() -> dict:
@@ -489,15 +514,18 @@ class SystemLanguageModel:
     - ``qwen2_5_vl_7b()``        — Qwen2.5-VL-7B (image)
     - ``qwen3_vl_2b()``          — Qwen3-VL-2B (image)
     - ``qwen3_vl_4b_template()`` — Qwen3-VL-4B template (no default paths)
-    - ``qwen3_vl_4b()``          — Qwen3-VL-4B bound to ``/userdata/models/Qwen3-VL-4B``
-                                    (the user is expected to place the files there;
-                                     override the path with ``WDNAI_QWEN3_VL_4B_DIR``)
+    - ``qwen3_vl_4b()``          — Qwen3-VL-4B bound to ``$WDNAI_MODELS_DIR/Qwen3-VL-4B``
+                                    (default ``/userdata/models/Qwen3-VL-4B``; override
+                                     the root via ``WDNAI_MODELS_DIR`` or pin a custom
+                                     path via ``WDNAI_QWEN3_VL_4B_DIR``)
     - ``qwen3_tts()``            — Qwen3-TTS bound to ``/userdata/models/Qwen3-TTS``;
                                     the 4 ``.1828.rknn`` files are looked up inside
                                     that directory.
     - ``qwen_2_5_omni_3b()``     — Qwen2.5-Omni-3B (audio) bound to
-                                    ``/userdata/models/Qwen2.5-Omni-3B``; override
-                                    via ``WDNAI_QWEN_2_5_OMNI_3B_DIR``. The SDK
+                                    ``$WDNAI_MODELS_DIR/Qwen2.5-Omni-3B`` (default
+                                    ``/userdata/models/Qwen2.5-Omni-3B``; override the
+                                    root via ``WDNAI_MODELS_DIR`` or pin a custom path
+                                    via ``WDNAI_QWEN_2_5_OMNI_3B_DIR``). The SDK
                                     auto-prepends ``<audio>`` to the user prompt.
     """
 
@@ -549,9 +577,11 @@ class SystemLanguageModel:
     def qwen3_vl_4b(cls) -> ModelSpec:
         """Return a :class:`ModelSpec` pre-bound to the fixed Qwen3-VL-4B files.
 
-        The files are expected at ``/userdata/models/Qwen3-VL-4B/`` (override with
-        the ``WDNAI_QWEN3_VL_4B_DIR`` environment variable). If any expected file
-        is missing a :class:`FileNotFoundError` is raised listing them.
+        The files are expected at ``$WDNAI_MODELS_DIR/Qwen3-VL-4B/`` (default
+        ``/userdata/models/Qwen3-VL-4B/`` when ``WDNAI_MODELS_DIR`` is unset;
+        override the root with ``WDNAI_MODELS_DIR`` or pin a custom path with
+        ``WDNAI_QWEN3_VL_4B_DIR``). If any expected file is missing a
+        :class:`FileNotFoundError` is raised listing them.
         """
         _verify_qwen3_vl_4b_files()
         return _qwen3vl_4b_spec().with_paths(**_default_qwen3_vl_4b_paths())
@@ -580,9 +610,11 @@ class SystemLanguageModel:
         """Return a :class:`ModelSpec` pre-bound to the fixed Qwen2.5-Omni-3B files.
 
         Audio language model (wav-in, text-out). The files are expected at
-        ``/userdata/models/Qwen2.5-Omni-3B/`` (override with the
-        ``WDNAI_QWEN_2_5_OMNI_3B_DIR`` environment variable). If any expected
-        file is missing a :class:`FileNotFoundError` is raised listing them.
+        ``$WDNAI_MODELS_DIR/Qwen2.5-Omni-3B/`` (default
+        ``/userdata/models/Qwen2.5-Omni-3B/`` when ``WDNAI_MODELS_DIR`` is unset;
+        override the root with ``WDNAI_MODELS_DIR`` or pin a custom path with
+        ``WDNAI_QWEN_2_5_OMNI_3B_DIR``). If any expected file is missing a
+        :class:`FileNotFoundError` is raised listing them.
 
         The SDK auto-prepends ``<audio>`` to the user prompt before sending
         it to the LLM, so callers just write a plain text instruction::
