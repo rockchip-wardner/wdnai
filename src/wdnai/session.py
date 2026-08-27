@@ -618,14 +618,30 @@ def _construct_text_instance(
     Returns ``None`` when the model doesn't declare a ``text`` field *and*
     doesn't allow extras — in that case the caller should fall back to
     returning the raw string.
+
+    **v0.x 修复**：原来对没有 ``text`` 字段的 schema（如 ``TargetDoc`` 的
+    ``x1/y1/x2/y2/desc``）会 fallback ``model.model_construct(text=raw_text)``。
+    pydantic 默认 ``extra="ignore"`` 会把这个 ``text`` 当 extra 字段收下，
+    返回的实例 ``type().__name__ == "TargetDoc"`` 但所有 schema 字段保持
+    默认值（``model_dump() = {}``）—— 调用方（如 compute_worker 的
+    ``infer_handler``）看到 "TargetDoc instance" 就 ``reply["result_data"] =
+    _dump``，主进程 proxy 端 ``TargetDoc.model_validate({})`` 抛 5 个字段
+    missing 的 ValidationError，fallback 到 ``_ProxyResult(text=None)``，
+    detector 端既拿到空 text 又不是 TargetDoc 实例，最终 silently drop
+    整帧。对没有 ``text`` 字段的 schema，**必须返回 None**，让 caller 走
+    raw string 路径 —— 调用方可以自己读 raw text / 决定要不要报错，至少
+    不再假装 parse 成功了。
     """
     try:
         if "text" in getattr(model, "model_fields", {}):
             return model.model_construct(
                 _fields_set={"text"}, text=raw_text,
             )
-        # No declared ``text`` field: try injecting as an extra.
-        return model.model_construct(text=raw_text)
+        # No declared ``text`` field: cannot meaningfully carry the raw
+        # text on this schema without misleading the caller. Return None
+        # so ``_parse_output`` falls back to returning the raw string
+        # unchanged.
+        return None
     except Exception:
         return None
 
@@ -675,14 +691,24 @@ def _safe_validate(
     Any other exception (TypeError, RuntimeError, …) is re-raised so
     real bugs aren't masked.
 
-    The fallback only applies when the target schema has a ``text``
-    field (e.g. ``VLMDoc``) — that's the common VLM structured-output
-    case where the model emits free-form text wrapped in a dict.
-    Structured-output schemas without a ``text`` field (e.g.
-    ``TargetDoc`` with ``x1, y1, x2, y2, desc``) re-raise the
-    ValidationError so the caller can deal with it explicitly; trying
-    to inject a ``text=`` kwarg there would silently produce a
-    half-populated instance.
+    **v0.x 修复**：原来对没有 ``text`` 字段的 schema（如 ``TargetDoc`` 的
+    ``x1/y1/x2/y2/desc``）走 ``raise`` 分支，让 ``ValidationError`` 一直
+    抛到 ``respond()`` 边界，worker 把整条 inference 当成 error 报告。
+    Qwen3.5-VL-4B 这类 4B 小模型对纯坐标 schema 跟得勉强，模型实际
+    输出的可能是：
+
+    - JSON schema 本身（``{"description": "...", "title": "TargetDoc",
+      "type": "object"}``，即它把 schema 复读回来了）
+    - 字段名错的 dict（``{"description": "..."}``，没 ``x1/y1/x2/y2/desc``）
+    - 完全不是 JSON 的纯文本
+
+    对这些情况，把 ``ValidationError`` 抛回去会让用户看到 "(推理失败)"
+    占位、waste 整条 inference cycle。更友好的做法是返回
+    ``raw_text_for_fallback``（让 caller 拿到模型的真实输出，可以
+    decide 是显示 "(解析失败)" 还是自己再尝试 regex 解析 bbox），
+    而不是 raise。caller 拿到的是 str 而不是 schema instance，自然
+    不会走 ``isinstance(result, TargetDoc)`` 分支，整条路径退化到
+    把 raw text 当 VLMDoc.text 渲染给用户。
     """
     try:
         return _model_validate(model, data)
@@ -690,7 +716,12 @@ def _safe_validate(
         cls_name = type(e).__name__
         if cls_name == "ValidationError" or "pydantic" in cls_name.lower():
             if "text" not in getattr(model, "model_fields", {}):
-                raise
+                # No ``text`` field — no meaningful in-schema fallback
+                # for the text content. Return the raw text so the
+                # caller can surface it (or signal parse failure)
+                # instead of getting an opaque "5 fields missing"
+                # ValidationError.
+                return raw_text_for_fallback  # type: ignore[return-value]
             # Prefer the model's actual content (often sitting in a
             # ``description``/``content`` key) over the raw string —
             # the raw string usually wraps the JSON object as-is and

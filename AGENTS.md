@@ -49,15 +49,25 @@ name `wdnai`.
   preset catalog: `qwen2_5_0_5b()`, `qwen3_1_7b()`, `qwen3_8b()`
   (pure-text, binds to `/userdata/models/Qwen3-8B/`, overridable via
   `WDNAI_QWEN3_8B_DIR`; raises `FileNotFoundError` listing missing
-  files), `qwen2_5_vl_3b()` / `_7b()`, `qwen3_vl_2b()`,
-  `qwen3_vl_4b_template()`, `qwen3_vl_4b()`, `qwen3_tts()`,
-  `qwen3_vl_embedding()` (retrieval embedding, no token generation,
-  binds to `/userdata/models/Qwen3-VL-Embedding-2B/` and raises
+  files), `qwen3_5_4b()` (Qwen3.5-4B pure-text; **vocab_size=248320**,
+  **special_eos_id=248046** — different from Qwen3), `qwen2_5_vl_3b()` /
+  `_7b()`, `qwen3_vl_2b()`, `qwen3_vl_4b_template()`, `qwen3_vl_4b()`,
+  `qwen3_5_vl_4b()` (Qwen3.5-VL-4B; same vocab as text-only variant;
+  384×384 + 768×768 vision variants auto-discovered in the model
+  directory), `qwen3_tts()`, `qwen3_vl_embedding()` (retrieval
+  embedding, no token generation, binds to
+  `/userdata/models/Qwen3-VL-Embedding-2B/` and raises
   `FileNotFoundError` listing missing files).
   The `qwen3_vl_4b()` preset binds to
   `/userdata/models/Qwen3-VL-4B/` (overridable via
   `WDNAI_QWEN3_VL_4B_DIR`) and raises `FileNotFoundError` listing
-  missing files if the directory is incomplete.
+  missing files if the directory is incomplete. The `qwen3_5_4b()`
+  and `qwen3_5_vl_4b()` presets both live under
+  `/userdata/models/Qwen3.5-4B/` (override via `WDNAI_QWEN3_5_4B_DIR`
+  / `WDNAI_QWEN3_5_4B_VL_DIR`); the text-only and VLM RKNN files
+  differ (`Qwen3.5-4B.1828.rknn` vs `llm_Qwen3.5-4B-VL.1828.rknn`)
+  because the VLM-mode LLM has MRoPE baked into the graph for image
+  position encoding.
 - `src/wdnai/session.py` — `LLMSession`: `async def respond(prompt,
   attachment, generating, tools, debug, perf, **overrides)`. Owns
   one backend (chosen by `ModelSpec.kind`). Responsibilities:
@@ -202,6 +212,12 @@ name `wdnai`.
   原生类型名 `str` / `dict`）。Qwen3-VL 对 schema 格式敏感，换成
   `json.dumps(..., indent=2)` 后同样图片产出的 JSON 不一样，必须保留
   legacy shape。`_safe_schema` 统一跨 pydantic v1/v2 的 schema dict。
+- **Qwen3.5 的 vocab / eos 与 Qwen3 不同**：Qwen3 走 151,936 / 151,645
+  的小词表，Qwen3.5 走 248,320 / 248,046 的大词表（多语言扩展）。沿用
+  Qwen3 vocab_size 加载 Qwen3.5 的 ``.embed.bin`` 会被 ``reshape`` 整除
+  失败；empirical 上 ``Qwen3.5-4B.embed.bin = 1,271,398,400 bytes =
+  635,699,200 fp16 values = 248,320 × 2560``。这两个值直接读 GGUF
+  tokenizer header（``tok.vocab_size`` / ``tok.eos_token_id``）。
 - **多模态占位符必须注册为 `additional_special_tokens`**：`gguf_tokenizer.py`
   在构建 BPE 后会把 `<|vision_start|>` 等加进 `additional_special_tokens`，
   否则 ByteLevel pre-tokenizer 会把它们切碎成 ~7 个普通 token，`rknn3`

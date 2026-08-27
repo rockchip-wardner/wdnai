@@ -233,6 +233,13 @@ def build_llm_args(spec) -> List[Dict[str, Any]]:
         "special_eos_id": spec.special_eos_id,
         "max_context_len": spec.max_context_len,
         "keep_history": o.get("keep_history", 0),
+        # Optional frequency / presence penalty. Default 0.0 (= disabled),
+        # matches the C++ ``rknn3_sampling_params`` zero-init. Qwen3.5-VL
+        # tunes ``presence_penalty=1.5`` (see examples/Qwen3_5_VL/cpp/main.cc)
+        # to discourage repetition on long multimodal generations; the
+        # rest of the presets keep the default of 0.0.
+        "frequency_penalty": o.get("frequency_penalty", 0.0),
+        "presence_penalty":  o.get("presence_penalty", 0.0),
     }]
 
 
