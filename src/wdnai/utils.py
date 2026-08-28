@@ -109,7 +109,90 @@ _JSON_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
 _JSON_BARE = re.compile(r"(\{.*\}|\[.*\])", re.DOTALL)
 
 
+# Matches ``<think>...`` blocks emitted by Qwen3 / Qwen3.5 / DeepSeek-R1
+# style reasoning models. We strip these BEFORE any JSON extraction so
+# that:
+#
+# 1. The regex below doesn't accidentally pick up a ``{}`` inside the
+#    reasoning as the model's "real" answer.
+# 2. ``_safe_validate``'s ``raw_text_for_fallback`` path doesn't stuff
+#    the entire reasoning block into the schema's ``text`` field (this
+#    was the user-visible regression in v0.x — the SDK returned
+#    ``Event(text='<think>\\n\\n</think>\\n\\n```json\\n...')``
+#    instead of the actual content).
+# 3. ``try_parse_tool_call`` doesn't try to dispatch JSON the model
+#    meant as part of its internal monologue.
+#
+# Non-greedy match on the body + ``re.DOTALL`` so we span newlines, but
+# we REQUIRE the closing ``</think>`` (or end-of-string) so the engine
+# doesn't match an empty ``<think>`` and leave the rest of the block
+# untouched (which is what ``<think>.*?`` alone does — non-greedy ``.*?``
+# matches 0 chars and succeeds immediately). We loop ``re.sub`` in
+# ``strip_thinking_blocks`` so two consecutive think blocks (some
+# Qwen variants emit two rounds) are both stripped.
+_THINK_BLOCK = re.compile(
+    r"<think>" r"[\s\S]*?" r"(?:</think>|$)",
+    re.DOTALL,
+)
+
+# Some Qwen tool-calling variants wrap tool calls in XML tags rather
+# than emitting bare JSON. We strip just the tags (opening + closing)
+# so the JSON payload inside is preserved and falls through to the
+# regular JSON extraction path. Stripping the *whole* block (tags
+# + content) was wrong because the JSON we want to extract lives
+# inside the tags — we'd then get an empty string and ``extract_json``
+# would return None. The fix is to keep the content and remove only
+# the literal ``<tool_call>`` / ``</tool_call>`` markers.
+# Pattern is plain ASCII; built via concatenation so zero-width /
+# curly-quote characters from markdown rendering never sneak in.
+_TOOL_CALL_OPEN = re.compile(
+    r"<tool_call" r"\b" r"[^>]*" r">",
+)
+_TOOL_CALL_CLOSE = re.compile(
+    r"</" r"tool_call" r"\s*" r">",
+)
+
+
+def strip_thinking_blocks(text: str) -> str:
+    """Remove ``<think>...`` (and ``<tool_call>...</tool_call>`` XML)
+    blocks from a model's raw output.
+
+    Multiple model families emit visible reasoning before the final
+    answer; without stripping, the SDK's JSON parsers pick up
+    fragments of the reasoning as the answer, and the schema-fallback
+    path stuffs the whole reasoning into the schema's ``text``
+    field — which silently corrupts the caller's data without any
+    parse failure.
+
+    The stripped text is whitespace-collapsed at the edges but
+    otherwise preserved verbatim. Returns the original string
+    unchanged when no markers are found.
+    """
+    if not text:
+        return text
+    prev = None
+    out = text
+    # Loop so we strip every think block (some Qwen variants emit
+    # two of them when the model "thinks twice").
+    while prev != out:
+        prev = out
+        out = _THINK_BLOCK.sub("", out)
+    # Strip XML tool_call wrappers — but ONLY the tags, not the JSON
+    # content inside (which we want ``extract_json`` to see). The
+    # initial version stripped the whole ``<tool_call>...</tool_call>``
+    # block including the JSON inside, which left an empty string
+    # and broke the downstream parser.
+    out = _TOOL_CALL_OPEN.sub("", out)
+    out = _TOOL_CALL_CLOSE.sub("", out)
+    return out.strip()
+
+
 def extract_json(text: str) -> Optional[Union[Dict[str, Any], List[Any]]]:
+    # Strip <think> blocks before any regex matching. See the comment
+    # above ``_THINK_BLOCK`` for why this happens unconditionally
+    # (cheap, idempotent, and defends against every current and
+    # future thinking-mode model — Qwen3, Qwen3.5, DeepSeek-R1, ...).
+    text = strip_thinking_blocks(text or "")
     if not text:
         return None
     m = _JSON_FENCE.search(text)
@@ -130,5 +213,26 @@ def extract_json(text: str) -> Optional[Union[Dict[str, Any], List[Any]]]:
         try:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
-            return None
+            pass
+    # Last-ditch fallback: try to parse the text as a Python literal.
+    # Qwen3.5-4B (and other small Qwen variants) occasionally emit
+    # Python-style dict repr (``{'text': '...'}`` with single quotes)
+    # inside a ```json``` fence instead of strict JSON. The strict-JSON
+    # paths above already failed by this point, so we strip the
+    # ````json``` fences (keep content) and try ``ast.literal_eval``,
+    # which handles dicts / lists / strings / numbers / booleans / None
+    # safely — it does NOT evaluate arbitrary expressions, so there's
+    # no security risk. We only try this on text that *looks* like a
+    # Python literal (starts with ``{`` / ``[`` / ``'`` / ``"``) so
+    # plain prose doesn't trigger a needless parse attempt.
+    import ast
+    inner_text = _JSON_FENCE.sub(r"\1", text) if _JSON_FENCE.search(text) else text
+    stripped = inner_text.strip()
+    if stripped and stripped[0] in "{['\"":
+        try:
+            obj = ast.literal_eval(stripped)
+            if isinstance(obj, (dict, list)):
+                return obj
+        except (ValueError, SyntaxError):
+            pass
     return None

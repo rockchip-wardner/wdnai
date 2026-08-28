@@ -1,6 +1,7 @@
 """端到端 mock 测试：用伪 RKNN3Lite + 伪 tokenizer 把整条链路跑一遍。"""
 import os
 import tempfile
+from typing import Annotated
 
 import numpy as np
 
@@ -977,6 +978,570 @@ def test_run_images_forwards_image_size():
 
 
 # --------------------------------------------------------------------------- #
+def test_strip_thinking_blocks_basic():
+    """``strip_thinking_blocks`` removes ``<think>...`` and ``<tool_call>...</tool_call>`` blocks."""
+    from wdnai.utils import strip_thinking_blocks
+
+    # Plain think block — single-pass
+    assert strip_thinking_blocks(
+        '<think>reasoning</think>{"text":"ok"}'
+    ) == '{"text":"ok"}'
+
+    # Empty think block (the user's actual bug) + JSON fence
+    assert strip_thinking_blocks(
+        '<think>\n\n</think>\n\n```json\n{"text":"plate"}\n```'
+    ) == '```json\n{"text":"plate"}\n```'
+
+    # Multi-block (some Qwen variants emit two think rounds)
+    assert strip_thinking_blocks(
+        '<think>a</think>foo<think>b</think>bar'
+    ) == "foobar"
+
+    # XML tool_call wrapper — only the tags are stripped; the JSON
+    # payload inside is preserved so ``extract_json`` can find it.
+    assert strip_thinking_blocks(
+        '<tool_call>{"name":"x","arguments":{}}</tool_call>keep'
+    ) == '{"name":"x","arguments":{}}keep'
+
+    # Idempotent on plain text
+    assert strip_thinking_blocks("plain text") == "plain text"
+
+    # Empty / None-ish
+    assert strip_thinking_blocks("") == ""
+    assert strip_thinking_blocks(None) is None  # type: ignore[arg-type]
+
+    # Unclosed think tag — non-greedy ``.*?`` reaches end-of-string and
+    # the closing ``(?:</think>|$)`` alt matches ``$`` so the whole
+    # trailing block is consumed.
+    assert strip_thinking_blocks("<think>only open") == ""
+
+    print("[strip] basic cases OK")
+
+
+def test_extract_json_strips_think_blocks():
+    """``extract_json`` finds the JSON fence AFTER stripping any leading think block."""
+    from wdnai.utils import extract_json
+
+    # Think block + JSON fence: must extract the JSON, not a {} inside
+    # the think block (which doesn't exist here, but the regex would
+    # otherwise be confused if it did).
+    out = extract_json(
+        '<think>reasoning with {} in it</think>\n```json\n{"text":"plate"}\n```'
+    )
+    assert out == {"text": "plate"}, f"got {out!r}"
+
+    # Think block + bare JSON
+    out = extract_json('<think>r</think>{"text":"plate"}')
+    assert out == {"text": "plate"}, f"got {out!r}"
+
+    # Think block + plain text (no JSON anywhere) → None
+    assert extract_json("<think>reasoning</think>no json here") is None
+
+    print("[extract_json] think-block stripping OK")
+
+
+def test_extract_text_from_mismatched_dict_recurses():
+    """``_extract_text_from_mismatched_dict`` drills into ``arguments`` / ``response`` / ``data``."""
+    from wdnai.session import _extract_text_from_mismatched_dict
+
+    # Top-level hit (legacy case) — unchanged behaviour
+    assert _extract_text_from_mismatched_dict({"text": "hi"}) == "hi"
+    assert _extract_text_from_mismatched_dict({"description": "hi"}) == "hi"
+
+    # Nested inside ``arguments`` (the tool-call-wrap case)
+    assert _extract_text_from_mismatched_dict(
+        {"name": "ocr", "arguments": {"text": "京A88***"}}
+    ) == "京A88***"
+
+    # Nested inside ``response`` (some models wrap in response/data)
+    assert _extract_text_from_mismatched_dict(
+        {"response": {"content": "answer"}}
+    ) == "answer"
+    assert _extract_text_from_mismatched_dict(
+        {"data": {"summary": "answer"}}
+    ) == "answer"
+
+    # Depth cap: 2 levels deep is OK, 3+ returns None
+    assert _extract_text_from_mismatched_dict(
+        {"a": {"b": {"c": {"text": "deep"}}}}
+    ) is None
+
+    # Non-dict input → None
+    assert _extract_text_from_mismatched_dict("not a dict") is None  # type: ignore[arg-type]
+    assert _extract_text_from_mismatched_dict(None) is None  # type: ignore[arg-type]
+
+    # Skip-list includes tool-call identifier keys so they don't
+    # shadow the real content via the "first non-trivial string" path.
+    # ``name="x"`` is short (1 char), so the existing len>=4 check
+    # already filters it; this test pins that behaviour explicitly.
+    out = _extract_text_from_mismatched_dict(
+        {"name": "tool", "arguments": {"content": "real answer"}}
+    )
+    assert out == "real answer", f"tool-identifier 'name' leaked through: {out!r}"
+
+    print("[extract_text] recursion + skip-list OK")
+
+
+def test_safe_validate_raw_text_strips_think():
+    """``_safe_validate``'s raw-text fallback strips ``<think>`` blocks defensively."""
+    from pydantic import BaseModel, Field
+    from wdnai.session import _safe_validate
+
+    class Event(BaseModel):
+        text: str = Field(description="event description")
+
+    # Valid case — should pass straight through.
+    out = _safe_validate(Event, {"text": "ok"}, "<think>reasoning</think>")
+    assert out.text == "ok"
+
+    # Schema-mismatch + raw_text has a think block: fallback to raw_text
+    # but the think block MUST be stripped. Before the fix the model
+    # would see ``Event(text='<think>reasoning\n\n...')`` — full
+    # reasoning dumped into the schema's ``text`` field.
+    bad = {"name": "ocr", "arguments": {"text": "answer"}}  # no top-level text
+    raw = '<think>\nreasoning\n</think>\n```json\n{"name":"ocr","arguments":{"text":"answer"}}\n```'
+    out = _safe_validate(Event, bad, raw)
+    # ``arguments.text`` is recovered via the recursive helper, then
+    # ``strip_thinking_blocks`` strips any think content for safety.
+    assert out.text == "answer", f"got {out.text!r}"
+
+    # When even recursion can't find anything (the JSON really is
+    # garbage), we fall back to the raw text — but still strip the
+    # think block.
+    bad2 = {"random_key": [1, 2, 3]}
+    raw2 = "<think>long internal monologue</think>real text after"
+    out2 = _safe_validate(Event, bad2, raw2)
+    assert out2.text == "real text after", f"got {out2.text!r}"
+
+    print("[_safe_validate] raw-text fallback strips think OK")
+
+
+def _build_session_with_fake_output(text: str):
+    """Build a LLMSession whose ``_run_llm`` returns ``text`` verbatim."""
+    import asyncio
+    from wdnai import LLMSession, SystemLanguageModel
+
+    embed, tok_dir = _make_workspace()
+    _install_mocks(deepstack_n=3, vocab_size=64)
+    spec = SystemLanguageModel.qwen3_vl_2b().with_paths(
+        rknn_llm_path="/fake_llm.rknn3",
+        rknn_vision_path="/fake_v.rknn3",
+        tokenizer_path=tok_dir, embed_path=embed,
+    )
+    sess = LLMSession(model=spec)
+
+    # Monkey-patch the actual call path so the model returns ``text``.
+    # ``VLMBackend.run_images`` is the async entry; we patch
+    # ``_run_llm`` which is the synchronous inner call.
+    sess._backend._run_llm = lambda *a, **kw: text  # type: ignore[assignment]
+
+    return sess
+
+
+def test_respond_thinking_block_stripped_in_schema():
+    """respond() with ``generating=Event`` strips a leading think
+    block AND extracts the JSON cleanly — the schema's ``text``
+    field carries the answer, not the think content.
+    """
+    import asyncio
+    from pydantic import BaseModel, Field
+
+    class Event(BaseModel):
+        text: str = Field(description="event description")
+
+    fake_text = '<think>reasoning</think>\n```json\n{"text":"answer"}\n```'
+    sess = _build_session_with_fake_output(fake_text)
+    try:
+        out = asyncio.run(sess.respond(
+            prompt="describe",
+            attachment=__import__("wdnai").Attachment(
+                np.zeros((480, 640, 3), dtype=np.uint8)
+            ),
+            generating=Event,
+        ))
+        assert isinstance(out, Event), f"want Event, got {type(out).__name__}"
+        assert out.text == "answer", f"want 'answer', got {out.text!r}"
+    finally:
+        sess.close()
+    print("[respond] think block stripped before schema parse OK")
+
+
+def test_respond_hallucinated_tool_name_recovers_schema():
+    """respond() with ``tools=[Crop]`` + ``generating=Event``: model
+    emits a tool-call JSON with a hallucinated name (``"ocr"``).
+    Before the fix, the dispatch silently returned None and the
+    schema-fallback path stuffed the raw text (think block included)
+    into ``Event.text``. After the fix, we try ``arguments`` against
+    the schema and recover the real answer.
+    """
+    import asyncio
+    from typing import Annotated, Literal
+    from pydantic import BaseModel, Field
+    from wdnai import Callable
+
+    class Event(BaseModel):
+        text: str = Field(description="plate number or '无'")
+
+    @Callable(description="plate crop tool")
+    class Crop:
+        bbox: Annotated[list[float], "0-1000 bbox [x1,y1,x2,y2]"]
+
+    # Exact reproduction of the user's bug report.
+    fake_text = (
+        '<think>\n\n</think>\n\n'
+        '```json\n'
+        '{"name": "ocr", "arguments": {"text": "京A88***"}}\n'
+        '```'
+    )
+    sess = _build_session_with_fake_output(fake_text)
+    try:
+        out = asyncio.run(sess.respond(
+            prompt="detect plate",
+            attachment=__import__("wdnai").Attachment(
+                np.zeros((480, 640, 3), dtype=np.uint8)
+            ),
+            generating=Event,
+            tools=[Crop],
+        ))
+        # ``name="ocr"`` is not registered, so Crop isn't picked;
+        # the new fallback validates ``arguments={"text":"京A88***"}``
+        # against Event → Event instance.
+        assert isinstance(out, Event), f"want Event, got {type(out).__name__}: {out!r}"
+        assert out.text == "京A88***", f"want '京A88***', got {out.text!r}"
+        # Crucially, NOT the raw think-block+JSON blob.
+        assert "<think>" not in out.text
+        assert "```" not in out.text
+    finally:
+        sess.close()
+    print("[respond] hallucinated tool name -> schema recovery OK")
+
+
+def test_respond_hallucinated_tool_name_with_invalid_arguments_falls_through():
+    """When the hallucinated tool name's ``arguments`` also doesn't
+    match the schema, fall through to the generic JSON parse path —
+    same as before the fix. We must not regress on existing
+    behaviour."""
+    import asyncio
+    from typing import Annotated, Literal
+    from pydantic import BaseModel, Field
+    from wdnai import Callable
+
+    class Event(BaseModel):
+        text: str = Field(description="event description")
+
+    @Callable(description="plate crop tool")
+    class Crop:
+        bbox: Annotated[list[float], "0-1000 bbox"]
+
+    # Arguments don't validate as Event (no ``text`` field, has bogus key).
+    fake_text = (
+        '<think>r</think>```json\n'
+        '{"name": "ocr", "arguments": {"foo": 1}}\n'
+        '```'
+    )
+    sess = _build_session_with_fake_output(fake_text)
+    try:
+        out = asyncio.run(sess.respond(
+            prompt="detect",
+            attachment=__import__("wdnai").Attachment(
+                np.zeros((480, 640, 3), dtype=np.uint8)
+            ),
+            generating=Event,
+            tools=[Crop],
+        ))
+        # The arguments-as-schema path fails; we then try the outer
+        # dict against Event (also fails because no ``text``); finally
+        # the raw text is wrapped (with think block stripped) into
+        # Event.text — which is the legacy safe behaviour.
+        assert isinstance(out, Event), f"want Event, got {type(out).__name__}: {out!r}"
+        # Crucially, no think block leaked.
+        assert "<think>" not in out.text
+        assert "</think>" not in out.text
+    finally:
+        sess.close()
+    print("[respond] invalid hallucinated args -> safe fallback OK")
+
+
+def test_respond_tool_call_xml_wrapper_stripped():
+    """When the model wraps the tool-call JSON in ``<tool_call>...</tool_call>``
+    XML tags (some Qwen variants do this), the strip-then-extract
+    pipeline recovers the JSON inside."""
+    import asyncio
+    from typing import Annotated, Literal
+    from pydantic import BaseModel, Field
+    from wdnai import Callable
+
+    class Event(BaseModel):
+        text: str = Field(description="event description")
+
+    @Callable(description="plate crop tool")
+    class Crop:
+        bbox: Annotated[list[float], "0-1000 bbox"]
+
+    fake_text = (
+        '<tool_call>\n'
+        '{"name": "Crop", "arguments": {"bbox": [100, 200, 300, 400]}}\n'
+        '</tool_call>'
+    )
+    sess = _build_session_with_fake_output(fake_text)
+    try:
+        out = asyncio.run(sess.respond(
+            prompt="detect",
+            attachment=__import__("wdnai").Attachment(
+                np.zeros((480, 640, 3), dtype=np.uint8)
+            ),
+            tools=[Crop],
+        ))
+        # The XML wrapper is stripped; the inner JSON parses as a
+        # valid Crop tool call → Crop instance returned.
+        assert isinstance(out, Crop), f"want Crop, got {type(out).__name__}: {out!r}"
+        assert out.bbox == [100, 200, 300, 400]
+    finally:
+        sess.close()
+    print("[respond] XML tool_call wrapper stripped OK")
+
+
+def test_extract_json_python_literal_fallback():
+    """Qwen3.5-4B sometimes emits Python-style dict repr (``{'text':
+    '…'}``) instead of strict JSON when the schema hint is short.
+    ``extract_json`` should accept it via ``ast.literal_eval`` so the
+    downstream schema-validation doesn't fall through to the raw-text
+    fallback path.
+    """
+    from wdnai.utils import extract_json
+
+    out = extract_json("{'text': '京A88***'}")
+    assert out == {"text": "京A88***"}, f"got {out!r}"
+
+    # Works inside a think block too (strip runs first).
+    out = extract_json('<think>r</think>{"text": "京A88***"}')
+    assert out == {"text": "京A88***"}
+
+    # Lists too.
+    out = extract_json("[1, 2, 3]")
+    assert out == [1, 2, 3], f"got {out!r}"
+
+    # Plain text must NOT trigger literal_eval — keeps the function
+    # safe and avoids needless parse attempts.
+    assert extract_json("hello world") is None
+    # Only triggers on text that LOOKS like a literal — leading ``{``
+    # / ``[`` / ``'`` / ``"``.
+    assert extract_json("plain {not really json}") is None
+    print("[extract_json] Python literal fallback OK")
+
+
+def test_extract_text_handles_schema_envelope():
+    """When the schema is echoed back as ``{"Event": {...}}`` (Qwen
+    sometimes does this on the second-stage OCR call), the recursive
+    extraction should drill into the nested dict instead of returning
+    the bare key name "Event".
+    """
+    from wdnai.session import _extract_text_from_mismatched_dict
+
+    # Top-level text wins over envelope nesting
+    assert _extract_text_from_mismatched_dict(
+        {"Event": {"text": "plate"}, "text": "override"}
+    ) == "override"
+
+    # Envelope case: drill into "Event" → "text"
+    out = _extract_text_from_mismatched_dict({"Event": {"text": "plate"}})
+    assert out == "plate", f"envelope case failed, got {out!r}"
+
+    # Envelope + think in text field
+    out = _extract_text_from_mismatched_dict(
+        {"Event": {"text": "<think>r</think>real"}}
+    )
+    assert out == "real", f"got {out!r}"
+    print("[extract_text] schema envelope handled OK")
+
+
+def test_render_tools_block_uses_nous_fncall_format():
+    """``render_tools_block`` emits the canonical NousFnCallPrompt
+    (Hermes-style) tool prompt — the format Qwen3 / Qwen3.5 were SFT-ed
+    on. This is what stops the model from hallucinating tool names
+    like ``"ocr"``.
+
+    Reference: qwen_agent/llm/fncall_prompts/nous_fncall_prompt.py:FN_CALL_TEMPLATE
+    """
+    from wdnai._callable import Callable as _Callable, render_tools_block
+
+    @_Callable(description="plate crop tool")
+    class Crop:
+        bbox: Annotated[list[float], "0-1000 bbox"]
+
+    specs = [{
+        "name": "Crop",
+        "description": "plate crop tool",
+        "parameters": {
+            "type": "object",
+            "properties": {"bbox": {"type": "array", "items": {"type": "number"}}},
+            "required": ["bbox"],
+        },
+    }]
+    out = render_tools_block(specs)
+
+    # Canonical elements per NousFnCallPrompt.FN_CALL_TEMPLATE
+    assert "<tools>" in out and "</tools>" in out, "missing <tools> block"
+    # Tool defs are OpenAI-compatible: {"type": "function", "function": {...}}
+    assert '"type": "function"' in out, "missing type=function wrapper"
+    assert '"name": "Crop"' in out, "tool name not literal (was placeholder)"
+    assert "<tool_call>" in out and "</tool_call>" in out, (
+        "missing <tool_call>...</tool_call> wrapper in call instruction"
+    )
+    # Legacy placeholder must be gone (it confuses Qwen3)
+    assert "<tool_name>" not in out, "legacy <tool_name> placeholder still present"
+    # Defensive: the call template should mention literal tool name (or
+    # at least the literal-word "function-name") so the model sees a
+    # real example of what to emit.
+    assert "function-name" in out or "Crop" in out
+    print("[render_tools_block] NousFnCallPrompt format OK")
+
+
+def test_compose_prompt_choice_block_uses_tool_call_wrapper():
+    """When both ``tools=`` and ``generating=`` are given, the
+    "Pick one of two ways" block must reference the canonical
+    ``<tool_call>...</tool_call>`` wrapper, not the legacy ``<tool_name>``
+    placeholder.
+    """
+    from pydantic import BaseModel, Field
+    from wdnai._callable import Callable as _Callable
+    from wdnai.session import LLMSession
+
+    class Event(BaseModel):
+        text: str = Field(description="event")
+
+    @_Callable(description="crop")
+    class Crop:
+        bbox: Annotated[list[float], "0-1000 bbox"]
+
+    tool_specs = [{"name": "Crop", "description": "crop",
+                   "parameters": {"type": "object", "properties": {}}}]
+    full = LLMSession._compose_prompt("请检测车牌", Event, tool_specs)
+    # Canonical wrapper present
+    assert "<tool_call>" in full and "</tool_call>" in full
+    # Legacy placeholder gone
+    assert "<tool_name>" not in full
+    # Tool block also has the canonical structure
+    assert "<tools>" in full and "</tools>" in full
+    # Schema hint still uses repr(dict) (legacy shape — see _safe_schema)
+    assert "Event" in full, "schema hint must still mention Event"
+    print("[compose_prompt] choice_block uses NousFnCallPrompt format OK")
+
+
+def test_try_parse_tool_call_handles_hermes_string_arguments():
+    """Hermes spec allows ``arguments`` to be a JSON string instead
+    of an inline dict. ``try_parse_tool_call`` should transparently
+    decode it so ``dispatch_tool_call`` always sees a dict.
+    """
+    from wdnai._callable import try_parse_tool_call
+
+    # Hermes-style: arguments is a JSON-encoded string
+    text = (
+        '<tool_call>\n'
+        '{"name": "Crop", "arguments": "{\\"bbox\\": [1, 2, 3, 4]}"}\n'
+        '</tool_call>'
+    )
+    parsed = try_parse_tool_call(text)
+    assert parsed == ("Crop", {"bbox": [1, 2, 3, 4]}), f"got {parsed!r}"
+
+    # Legacy: arguments is inline dict — still works
+    text2 = '{"name": "Crop", "arguments": {"bbox": [1, 2, 3, 4]}}'
+    parsed2 = try_parse_tool_call(text2)
+    assert parsed2 == ("Crop", {"bbox": [1, 2, 3, 4]}), f"got {parsed2!r}"
+    print("[try_parse_tool_call] Hermes string-arguments decoded OK")
+
+
+def test_safe_validate_fallback_strips_json_fence_and_tool_call_wrapper():
+    """The schema-validation raw-text fallback must remove ````json```` fence
+    AND ``<tool_call>``/``</tool_call>`` tags so the schema's ``text``
+    field doesn't carry literal wrapper markup.
+    """
+    from pydantic import BaseModel, Field
+    from wdnai.session import _safe_validate
+
+    class Event(BaseModel):
+        text: str = Field(description="event text")
+
+    # Schema-mismatched JSON; raw_text has both ```json``` fence AND
+    # ``<tool_call>`` wrapper — the fallback must clean both.
+    bad = {"name": "ocr", "arguments": {"region": [10, 20, 30, 40]}}
+    raw = (
+        '<think>reasoning</think>'
+        '```json\n'
+        '<tool_call>\n'
+        '{"name": "ocr", "arguments": {"region": [10, 20, 30, 40]}}\n'
+        '</tool_call>\n'
+        '```'
+    )
+    out = _safe_validate(Event, bad, raw)
+    # No wrapper markup should leak
+    assert "<think>" not in out.text
+    assert "</think>" not in out.text
+    assert "```" not in out.text, f"json fence leaked: {out.text!r}"
+    assert "<tool_call>" not in out.text
+    assert "</tool_call>" not in out.text
+    # Inner JSON preserved (it's our best-guess for the model's
+    # intent when schema validation genuinely fails)
+    assert "ocr" in out.text or "region" in out.text
+    print("[_safe_validate] fence + tool_call wrapper both stripped OK")
+
+
+def test_render_tools_block_empty():
+    """No tools → empty string (no spurious markup in prompt)."""
+    from wdnai._callable import render_tools_block
+    assert render_tools_block([]) == ""
+    print("[render_tools_block] empty input → empty output OK")
+
+
+def test_qwen3_5_vl_with_new_prompt_calls_crop_correctly():
+    """End-to-end smoke test: with the new NousFnCallPrompt-format
+    prompt, the mock backend that returns
+    ``<tool_call>{"name": "Crop", "arguments": {"bbox": [...]}}</tool_call>``
+    must be dispatched to a Crop instance.
+
+    This pins the full contract: prompt format + strip pipeline +
+    dispatch + schema validation. Without the prompt rewrite the
+    model hallucinated ``"ocr"`` instead of the registered ``Crop``.
+    """
+    import asyncio
+    from typing import Annotated
+    from pydantic import BaseModel, Field
+    from wdnai import Attachment, Callable as _Callable
+
+    class Event(BaseModel):
+        text: str = Field(description="event text")
+
+    @_Callable(description="plate crop tool")
+    class Crop:
+        bbox: Annotated[list[float], "0-1000 bbox"]
+
+    # Model output in the new canonical Hermes format — this is
+    # exactly what Qwen3.5-VL-4B emits when the prompt is correctly
+    # formatted per NousFnCallPrompt.
+    fake_text = (
+        '<think>\nreasoning\n</think>'
+        '<tool_call>\n'
+        '{"name": "Crop", "arguments": {"bbox": [100, 200, 300, 400]}}\n'
+        '</tool_call>'
+    )
+    sess = _build_session_with_fake_output(fake_text)
+    try:
+        out = asyncio.run(sess.respond(
+            prompt="detect plate",
+            attachment=Attachment(np.zeros((480, 640, 3), dtype=np.uint8)),
+            generating=Event,
+            tools=[Crop],
+        ))
+        assert isinstance(out, Crop), (
+            f"want Crop, got {type(out).__name__}: {out!r}"
+        )
+        assert out.bbox == [100, 200, 300, 400]
+    finally:
+        sess.close()
+    print("[end-to-end] new prompt format dispatches Crop correctly")
+
+
+# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     test_text_qwen3()
     test_text_qwen25()
@@ -998,4 +1563,20 @@ if __name__ == "__main__":
     test_pick_variant_image_size_override_exact_match()
     test_pick_variant_image_size_override_nearest_fallback()
     test_run_images_forwards_image_size()
+    # --- thinking-mode bug fix coverage ---
+    test_strip_thinking_blocks_basic()
+    test_extract_json_strips_think_blocks()
+    test_extract_text_from_mismatched_dict_recurses()
+    test_safe_validate_raw_text_strips_think()
+    test_respond_thinking_block_stripped_in_schema()
+    test_respond_hallucinated_tool_name_recovers_schema()
+    test_respond_hallucinated_tool_name_with_invalid_arguments_falls_through()
+    test_respond_tool_call_xml_wrapper_stripped()
+    # --- NousFnCallPrompt (Hermes) tool-call format ---
+    test_render_tools_block_uses_nous_fncall_format()
+    test_render_tools_block_empty()
+    test_compose_prompt_choice_block_uses_tool_call_wrapper()
+    test_try_parse_tool_call_handles_hermes_string_arguments()
+    test_safe_validate_fallback_strips_json_fence_and_tool_call_wrapper()
+    test_qwen3_5_vl_with_new_prompt_calls_crop_correctly()
     print("\nALL MOCK TESTS PASSED")

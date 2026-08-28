@@ -4,6 +4,7 @@ classes alike)."""
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy as np
@@ -20,7 +21,7 @@ from .attachment import Attachment
 from .backends import build_backend
 from .lm_output import LMOutput
 from .model import ModelSpec
-from .utils import extract_json
+from .utils import extract_json, strip_thinking_blocks
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -191,7 +192,43 @@ class LLMSession:
                     return instance
                 if debug:
                     print(f"[wdnai.debug] tool_call: no @Callable named {name!r} "
-                          f"(or args failed validation)")
+                          f"(or args failed validation); will try parsing "
+                          f"arguments as the generating= schema")
+
+                # NEW (thinking-mode hallucinated-tool-name recovery):
+                # Qwen3 / Qwen3.5 and other reasoning models sometimes
+                # wrap the schema payload in tool-call JSON with a
+                # hallucinated ``name`` that doesn't match any registered
+                # tool. Without this fallback the dispatch silently
+                # returns None and we fall through to ``_parse_output``
+                # with the *outer* dict (``{"name": "...", "arguments":
+                # {...}}``), which the schema validator then rejects —
+                # and the schema-fallback path would stuff the entire
+                # raw text (think-block included, before the strip fix)
+                # into the schema's ``text`` field.
+                #
+                # Try validating ``arguments`` against the generating=
+                # schema first. If it validates, return that. If not,
+                # continue to the regular JSON-parse path (the dict is
+                # still informative for the schema validator even when
+                # this branch fails).
+                if generating is not None and isinstance(arguments, dict):
+                    try:
+                        instance = _model_validate(generating, arguments)
+                        if debug:
+                            print(
+                                f"[wdnai.debug] tool_call.arguments "
+                                f"validated as {generating.__name__}: "
+                                f"{instance!r}"
+                            )
+                        return instance
+                    except Exception as e:  # noqa: BLE001
+                        if debug:
+                            print(
+                                f"[wdnai.debug] tool_call.arguments "
+                                f"failed {generating.__name__} validation: "
+                                f"{type(e).__name__}: {e}"
+                            )
 
         result = self._parse_output(
             text, generating=generating, attachments_out=attachments_out,
@@ -307,15 +344,24 @@ class LLMSession:
             # "pick one" instruction up top so the model doesn't
             # silently default to whichever format has the strongest
             # tail instruction.
+            #
+            # Uses the canonical Qwen3 Hermes-style ``<tool_call>``
+            # wrapper (see ``render_tools_block`` for the rationale).
+            # The schema hint uses the legacy ``repr(dict)`` shape
+            # because Qwen models are sensitive to schema formatting
+            # (json.dumps(indent=2) was tried in 141ee17 and produced
+            # visibly different output — see ``_safe_schema``).
             schema = _safe_schema(generating)
             choice_block = (
                 "# Response format\n"
                 "Pick **exactly one** of the following two ways. "
                 "Do NOT output both. Do NOT include any explanation.\n\n"
-                "**Option A — Call a tool.** Output ONLY this JSON:\n"
-                "```json\n"
-                "{\"name\": \"<tool_name>\", \"arguments\": {<arguments matching the tool's parameters>}}\n"
-                "```\n\n"
+                "**Option A — Call a tool.** Wrap a JSON object with "
+                "the function name and arguments in <tool_call></tool_call> "
+                "XML tags:\n"
+                "<tool_call>\n"
+                '{"name": <function-name>, "arguments": <args-json-object>}\n'
+                "</tool_call>\n\n"
                 "**Option B — Structured response.** Output ONLY a JSON "
                 "object matching this schema:\n"
                 "```json\n"
@@ -634,8 +680,17 @@ def _construct_text_instance(
     """
     try:
         if "text" in getattr(model, "model_fields", {}):
+            # Strip ``<think>...</think>`` / ``<tool_call>...</tool_call>``
+            # wrappers / ```json``` fences from the raw text before
+            # stuffing it into the schema's ``text`` field. Without
+            # this, the second-stage OCR call (which has no tools=
+            # and so gets no schema hint re-injection) sometimes
+            # receives the model's literal think block + JSON fence
+            # as the "plate number", e.g.
+            # ``Event(text='<think>...</think>\n```json\n{"text":...}\n```')``.
+            clean_text = _strip_fence_for_fallback(raw_text)
             return model.model_construct(
-                _fields_set={"text"}, text=raw_text,
+                _fields_set={"text"}, text=clean_text,
             )
         # No declared ``text`` field: cannot meaningfully carry the raw
         # text on this schema without misleading the caller. Return None
@@ -647,30 +702,104 @@ def _construct_text_instance(
 
 
 def _extract_text_from_mismatched_dict(
-    data: Dict[str, Any],
+    data: Dict[str, Any], _depth: int = 0,
 ) -> Optional[str]:
     """Best-effort: find the model's actual text content in a dict that
-    failed schema validation.
+    failed schema validation. Recurses into nested dicts up to depth 2.
 
-    The Qwen2.5-VL legacy field name was ``description``; Qwen3-VL
-    sometimes still emits it (or ``content`` / ``message`` / ``caption``)
-    even when the schema hint says ``text``. We try a fixed list of
-    aliases in order, then fall back to the first long string field
-    that isn't a known severity/level tag.
+    The original implementation only scanned the top level. That
+    silently missed the common case where the model wraps the
+    schema fields inside ``{"arguments": {...}}`` (i.e. tool-call
+    JSON whose tool name didn't match anything registered, so the
+    SDK fell through to the schema parse path) — the actual content
+    is in ``arguments["text"]``, not at the top level. With
+    recursion, we recover the model's intent instead of falling
+    back to the raw-text dump (which would otherwise include the
+    ``<think>`` reasoning block if stripping was incomplete).
+
+    Container keys we drill into: ``arguments``, ``args``,
+    ``parameters``, ``response``, ``result``, ``data``, ``output``.
+    Depth is capped at 2 so a pathological / cyclic payload can't
+    hang the caller; in practice a depth-1 recursion already covers
+    every tool-call-style wrap we see in practice.
     """
+    if _depth > 2 or not isinstance(data, dict):
+        return None
     aliases = ("text", "description", "content", "message", "caption", "summary")
     for key in aliases:
         v = data.get(key)
         if isinstance(v, str) and v.strip():
-            return v
+            return strip_thinking_blocks(v)
+    # Recurse into known container keys (tool-call-style wraps). We do
+    # this BEFORE the "first non-trivial string" fallback because Qwen
+    # models sometimes echo the schema envelope ``{"Event": {...}}``
+    # when they lose the schema hint — recursing first finds the inner
+    # ``text`` field instead of returning the bare key name "Event".
+    container_keys = (
+        "arguments", "args", "parameters",
+        "response", "result", "data", "output",
+    )
+    for k in container_keys:
+        sub = data.get(k)
+        if isinstance(sub, dict):
+            found = _extract_text_from_mismatched_dict(sub, _depth=_depth + 1)
+            if found is not None:
+                return found
     # First non-trivial string field that isn't a severity / enum-ish key.
-    skip = {"level", "severity", "type", "category", "tag"}
+    # Also recurse into nested dicts here (catches ``{"Event": {"text":
+    # ...}}`` and similar envelope echoes that aren't in ``container_keys``).
+    skip = {
+        "level", "severity", "type", "category", "tag",
+        "name", "tool", "function",  # tool-call identifier keys
+    }
     for k, v in data.items():
         if k in skip:
             continue
+        if isinstance(v, dict):
+            found = _extract_text_from_mismatched_dict(v, _depth=_depth + 1)
+            if found is not None:
+                return found
         if isinstance(v, str) and len(v.strip()) >= 4:
-            return v
+            return strip_thinking_blocks(v)
     return None
+
+
+def _strip_fence_for_fallback(text: str) -> str:
+    """Strip markers that would pollute the schema's ``text`` field
+    when the schema validation fails and we fall back to the raw
+    model output as the schema's text content.
+
+    Three classes of markers are stripped:
+
+    1. ``<think>...</think>`` blocks — model reasoning the user
+       shouldn't see (already done by
+       :func:`wdnai.utils.strip_thinking_blocks`; we call it here
+       defensively so the fallback path is self-contained).
+    2. `````json`` / `````` Markdown fences wrapping the JSON
+       payload — without this strip, the schema's text would carry
+       the literal ```json`` prefix.
+    3. ``<tool_call>`` / ``</tool_call>`` XML wrappers — the model
+       uses these to delimit tool calls (Hermes / Qwen-Agent style);
+       the JSON between them is meaningful but the tags themselves
+       are noise in the user-facing fallback.
+
+    The remaining text is whitespace-collapsed at the edges but the
+    inner JSON object is *kept* — we don't try to extract and reformat
+    because the fallback is a last-resort dump, not a structured parse.
+    """
+    if not text:
+        return text
+    out = strip_thinking_blocks(text)
+    # Markdown ```json...``` / ```...``` fences (greedy across newlines
+    # so multi-line JSON fences are handled in one pass).
+    out = re.sub(r"```(?:json)?\s*\n?", "", out)
+    out = re.sub(r"\s*```", "", out)
+    # Lone ``<tool_call>`` / ``</tool_call>`` XML tags. The JSON
+    # between them was kept by ``strip_thinking_blocks`` (which only
+    # strips the tags themselves); this regex is a no-op safety net
+    # for any stragglers if that behaviour changes.
+    out = re.sub(r"</?tool_call>", "", out)
+    return out.strip()
 
 
 def _safe_validate(
@@ -709,6 +838,12 @@ def _safe_validate(
     而不是 raise。caller 拿到的是 str 而不是 schema instance，自然
     不会走 ``isinstance(result, TargetDoc)`` 分支，整条路径退化到
     把 raw text 当 VLMDoc.text 渲染给用户。
+
+    **v0.x 修复 2 (Qwen3.x Hermes tool-call wrapper)**：当模型走
+    ``<tool_call>...</tool_call>`` 格式且工具名/字段对不上 schema 时，
+    fallback 路径之前会把 `````json`` fence + ``<tool_call>`` 标签都
+    留在 raw text 里，导致 ``Event.text='```json\n{"name":"ocr",...}</tool_call>'``。
+    现在 ``_strip_fence_for_fallback`` 把这些 wrapper 全剥掉。
     """
     try:
         return _model_validate(model, data)
@@ -717,18 +852,24 @@ def _safe_validate(
         if cls_name == "ValidationError" or "pydantic" in cls_name.lower():
             if "text" not in getattr(model, "model_fields", {}):
                 # No ``text`` field — no meaningful in-schema fallback
-                # for the text content. Return the raw text so the
-                # caller can surface it (or signal parse failure)
-                # instead of getting an opaque "5 fields missing"
-                # ValidationError.
-                return raw_text_for_fallback  # type: ignore[return-value]
+                # for the text content. Return the raw text (with any
+                # ``<think>`` / ``<tool_call>`` / ```json``` markers
+                # stripped) so the caller can surface it (or signal
+                # parse failure) instead of getting an opaque "5 fields
+                # missing" ValidationError.
+                return _strip_fence_for_fallback(raw_text_for_fallback)  # type: ignore[return-value]
             # Prefer the model's actual content (often sitting in a
-            # ``description``/``content`` key) over the raw string —
-            # the raw string usually wraps the JSON object as-is and
-            # would show up as a literal dict on the UI.
+            # ``description``/``content`` key, possibly nested in
+            # ``arguments``) over the raw string — the raw string
+            # usually wraps the JSON object as-is and would show up
+            # as a literal dict on the UI. Even the recovered text
+            # gets its ``<think>`` / fence / ``<tool_call>`` markers
+            # stripped defensively.
             text_value = _extract_text_from_mismatched_dict(data)
             if text_value is None:
-                text_value = raw_text_for_fallback
+                text_value = _strip_fence_for_fallback(raw_text_for_fallback)
+            else:
+                text_value = _strip_fence_for_fallback(text_value)
             fallback = _construct_text_instance(model, text_value)
             if fallback is not None:
                 return fallback

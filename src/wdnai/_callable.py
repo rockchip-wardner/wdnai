@@ -307,39 +307,85 @@ def get_tool_specs(tools: Optional[List[type]]) -> List[Dict[str, Any]]:
 def render_tools_block(tool_specs: List[Dict[str, Any]]) -> str:
     """Render the tool definitions + the call instruction for injection
     into the model prompt.
+
+    The format follows Qwen-Agent's ``NousFnCallPrompt`` (Hermes-style
+    tool use — the canonical format for Qwen3 / Qwen3.5 / Qwen2.5; see
+    https://qwen.readthedocs.io/en/latest/framework/function_call.html
+    and ``qwen_agent/llm/fncall_prompts/nous_fncall_prompt.py``).
+
+    The legacy wdnai format used a ``<tool_name>`` placeholder which
+    Qwen3.x models can't follow — they have been SFT-ed on the literal
+    ``<tool_call>``/``</tool_call>`` XML wrapper + a ``<tools>`` block
+    of ``{"type": "function", "function": {...}}`` JSON, and they
+    hallucinate tool names (e.g. ``"ocr"``) when the prompt only shows
+    a generic placeholder. Switching to the canonical format:
+
+      * puts each tool's *literal* name (``Crop``, ``Alarm``, …) in the
+        definitions so the model never has to guess;
+      * tells the model to wrap its call in ``<tool_call>...</tool_call>``,
+        which the parser already strips in
+        :func:`wdnai.utils.strip_thinking_blocks` — no new parsing path
+        needed;
+      * uses the OpenAI-compatible ``{"type": "function", "function":
+        {...}}`` schema that matches both the HF transformers chat
+        template and vLLM's ``--tool-call-parser hermes``.
+
+    See also ``Qwen-Agent/qwen_agent/llm/fncall_prompts/nous_fncall_prompt.py:FN_CALL_TEMPLATE``.
     """
     if not tool_specs:
         return ""
-    blocks: List[str] = []
-    for spec in tool_specs:
-        desc = spec["description"] or "(no description)"
-        params_json = json.dumps(spec["parameters"], indent=2, ensure_ascii=False)
-        blocks.append(
-            f"## {spec['name']}\n"
-            f"Description: {desc}\n"
-            f"Parameters:\n```json\n{params_json}\n```"
-        )
-    tools_md = "\n\n".join(blocks)
+    # Tool definitions in OpenAI-compatible ``{"type": "function",
+    # "function": {...}}`` shape, one JSON object per line inside the
+    # ``<tools>...</tools>`` block. The model reads this block verbatim
+    # to discover the available functions and their schemas.
+    tool_entries = [
+        json.dumps({"type": "function", "function": {
+            "name": spec["name"],
+            "description": spec["description"] or "(no description)",
+            "parameters": spec["parameters"],
+        }}, ensure_ascii=False)
+        for spec in tool_specs
+    ]
+    tool_descs = "\n".join(tool_entries)
     return (
-        "# Tools\n"
-        "You can call any of the following tools. To call a tool, "
-        "respond with **only** a JSON object in this exact format:\n"
-        "```json\n"
-        "{\"name\": \"<tool_name>\", \"arguments\": {<arguments matching the tool's parameters>}}\n"
-        "```\n"
-        "If no tool applies, reply with plain text.\n\n"
-        f"{tools_md}"
+        "# Tools\n\n"
+        "You may call one or more functions to assist with the user query.\n\n"
+        "You are provided with function signatures within <tools></tools> XML tags:\n"
+        "<tools>\n"
+        f"{tool_descs}\n"
+        "</tools>\n\n"
+        "For each function call, return a json object with function name and "
+        "arguments within <tool_call></tool_call> XML tags:\n"
+        "<tool_call>\n"
+        '{"name": <function-name>, "arguments": <args-json-object>}\n'
+        "</tool_call>"
     )
 
 
 def try_parse_tool_call(text: str) -> Optional[Tuple[str, Any]]:
     """If ``text`` contains a tool-call JSON, return ``(name, arguments)``.
 
-    Otherwise return ``None``. Key aliases accepted:
-    ``name`` / ``tool`` / ``function`` for the identifier;
-    ``arguments`` / ``args`` / ``parameters`` for the payload. If no
-    argument key is present, every top-level key other than the name
-    is treated as the argument payload.
+    Otherwise return ``None``.
+
+    Accepts two layouts:
+
+    * **Hermes / Qwen-Agent style** (canonical for Qwen3 / Qwen3.5 /
+      Qwen2.5 — see ``NousFnCallPrompt``): the JSON is wrapped in
+      ``<tool_call>...</tool_call>`` tags (stripped by
+      :func:`wdnai.utils.strip_thinking_blocks` before this point).
+    * **Legacy bare JSON**: ``{"name": ..., "arguments": {...}}`` or
+      ``{"function": ..., "args": {...}}`` etc. (kept for
+      backwards-compat with older exports / different prompt styles).
+
+    Key aliases accepted: ``name`` / ``tool`` / ``function`` for the
+    identifier; ``arguments`` / ``args`` / ``parameters`` for the
+    payload. ``arguments`` may itself be a *JSON string* (Hermes spec
+    embeds the JSON-encoded string) — we ``json.loads`` it
+    transparently in that case so the caller's :func:`dispatch_tool_call`
+    always sees a dict.
+
+    If no argument key is present, every top-level key other than the
+    name is treated as the argument payload.
     """
     data = extract_json(text)
     if not isinstance(data, dict):
@@ -352,6 +398,18 @@ def try_parse_tool_call(text: str) -> Optional[Tuple[str, Any]]:
         or data.get("args")
         or data.get("parameters")
     )
+    # Hermes spec allows ``arguments`` to be a JSON string rather than
+    # an inline dict. Decode transparently so dispatch_tool_call
+    # always validates against a dict.
+    if isinstance(args, str):
+        try:
+            decoded = json.loads(args)
+            if isinstance(decoded, dict):
+                args = decoded
+        except json.JSONDecodeError:
+            # Keep the raw string; dispatch_tool_call will try to
+            # parse it again and surface a ValidationError on failure.
+            pass
     if args is None:
         args = {k: v for k, v in data.items()
                 if k not in {"name", "tool", "function"}}
