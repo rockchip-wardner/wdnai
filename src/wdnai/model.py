@@ -285,11 +285,26 @@ def _qwen3_5_vl_spec(**overrides) -> ModelSpec:
     embeddings. The text-only RKNN lacks MRoPE and cannot consume
     vision tokens.
 
-    Sampling parameters follow ``examples/Qwen3_5_VL/cpp/main.cc``
-    defaults: ``top_k=1``, ``top_p=0.9``, ``temperature=1.0``,
-    ``repeat_penalty=1.0``, ``frequency_penalty=0.0``,
-    ``presence_penalty=1.5`` (the last is non-default and was
-    deliberately tuned for Qwen3.5 in the rknn3 demo).
+    Sampling parameters mostly follow ``examples/Qwen3_5_VL/cpp/main.cc``
+    defaults: ``top_k=1``, ``top_p=0.9``, ``repeat_penalty=1.0``,
+    ``frequency_penalty=0.0``, ``presence_penalty=1.5`` (the last is
+    non-default and was deliberately tuned for Qwen3.5 in the rknn3
+    demo).
+
+    **Notable deviation from the demo**: ``temperature=1e-6`` instead
+    of the demo's ``temperature=1.0``. The C++ demo targets free-form
+    chat-style generation where temperature=1.0 is desirable for
+    variety. But every production caller in this repo uses
+    ``session.respond(generating=...)`` for **structured output** — the
+    Qwen3-VL team specifically chose greedy (1e-6) for the 4B class to
+    avoid bbox / JSON-token hallucination (see ``_qwen3vl_4b_spec``:
+    "4B default is greedy to avoid hallucinations after 384x384
+    downsampling"). Qwen3.5-VL 4B behaves the same way; empirical
+    evidence from the video-target-detection page (which expects 0–1000
+    normalized bbox coords) showed temperature=1.0 producing wildly
+    wrong / degenerate boxes (~1×0 px), while 1e-6 produces
+    well-localized boxes across frames. Callers needing creative
+    sampling should override via ``.with_options(temperature=...)``.
 
     The vision preprocessing path is identical to Qwen3-VL pruned
     mode (``qwen3vl_prune_single`` in :mod:`wdnai.utils`): the
@@ -312,7 +327,12 @@ def _qwen3_5_vl_spec(**overrides) -> ModelSpec:
             "max_new_tokens": 1024,
             "top_k": 1,
             "top_p": 0.9,
-            "temperature": 1.0,
+            # Greedy (1e-6) instead of demo's 1.0: see docstring — every
+            # production caller here runs structured-output schemas (e.g.
+            # TargetDoc bbox / Event text), where 4B-class exports
+            # hallucinate at high temperature. Qwen3-VL-4B has the same
+            # fix; this is its Qwen3.5 sibling.
+            "temperature": 1e-6,
             "repeat_penalty": 1.0,
             "frequency_penalty": 0.0,
             "presence_penalty": 1.5,   # Qwen3.5 demo default — see main.cc
