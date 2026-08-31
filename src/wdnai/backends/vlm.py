@@ -56,9 +56,9 @@ import numpy as np
 
 from ..utils import (
     bgr_to_rgb,
+    letterbox_resize,
     qwen25vl_prune,
     qwen3vl_prune_single,
-    resize,
 )
 from ._common import (
     StreamSink,
@@ -415,7 +415,7 @@ class VLMBackend:
         though the preset's ``use_prune=False`` flagged it as full.
         """
         size = variant.image_size
-        rgb = resize(bgr_to_rgb(img_bgr), size)
+        rgb = letterbox_resize(bgr_to_rgb(img_bgr), size)
         in_attr = variant.rknn.get_inputs_tensor_attr()[0]
 
         if in_attr.n_dims == 4:

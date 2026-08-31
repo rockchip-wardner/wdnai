@@ -875,7 +875,230 @@ def test_preprocess_to_variant_dispatches_by_n_dims():
         assert calls["prune"] == 1, "768 path must call qwen3vl_prune_single exactly once"
     finally:
         vlm_mod.qwen3vl_prune_single = orig_prune
-    print("[preprocess] dispatches by in_attr.n_dims (384=NHWC, 768=pruned)")
+    print("[preprocess] dispatches by in_dims (384=NHWC, 768=pruned)")
+
+
+def test_letterbox_resize_preserves_aspect_ratio():
+    """``letterbox_resize`` must NEVER stretch — non-square inputs get
+    centred in a square canvas with grey padding, and the scaled
+    content keeps its original aspect ratio exactly.
+    """
+    from wdnai.utils import letterbox_resize
+
+    # ---- 1. Wide plate-strip: 100 (h) × 400 (w), target 384 ----
+    img_wide = np.zeros((100, 400, 3), dtype=np.uint8)
+    img_wide[..., 0] = 200  # blue strip, easy to spot
+    out = letterbox_resize(img_wide, 384)
+    assert out.shape == (384, 384, 3), f"wide: expected (384,384,3), got {out.shape}"
+
+    # Scaled content width: 400/4 * 384 = 384 (already fills the long side)
+    # Scaled content height: 100/4 * 384 = 96
+    # Letterbox padding: (384-96)//2 = 144 rows on top & bottom; 0 cols L/R
+    expected_nh = round(100 * 384 / 400)
+    expected_pad_top = (384 - expected_nh) // 2
+    pad_left = (384 - expected_nh) // 2  # the loop sets x0 from nw, not nh; recompute correctly
+    # The strip is wider than tall (nw == 384, nh < 384), so pad is
+    # vertical only (top/bottom) and L/R are zero.
+    pad_h_each = expected_pad_top
+    # Top pad rows should be fill grey (114,114,114).
+    assert np.all(out[:pad_h_each, :, :] == 114), \
+        "wide: top pad rows must be grey fill (114)"
+    assert np.all(out[pad_h_each + expected_nh:, :, :] == 114), \
+        "wide: bottom pad rows must be grey fill (114)"
+    # Left & right columns within the content band are NOT pad (full width).
+    # Content band's aspect ratio: 384/expected_nh ≈ 400/100.
+    content = out[pad_h_each:pad_h_each + expected_nh]
+    blue_rows = np.where(content[..., 0] == 200)[0]
+    assert blue_rows.size > 0, "wide: original blue content must survive inside the letterbox"
+    # Aspect ratio preserved: width / height of the surviving content ≈ 4:1.
+    bw = float(content.shape[1])
+    bh = float(content.shape[0])
+    assert abs(bw / bh - 4.0) < 0.05, \
+        f"wide: aspect ratio must be preserved (~4:1), got {bw/bh:.2f}"
+
+    # ---- 2. Tall portrait: 400 (h) × 100 (w), target 384 ----
+    img_tall = np.zeros((400, 100, 3), dtype=np.uint8)
+    img_tall[..., 1] = 150  # green
+    out = letterbox_resize(img_tall, 384)
+    assert out.shape == (384, 384, 3)
+    expected_nw = round(100 * 384 / 400)
+    pad_w_each = (384 - expected_nw) // 2
+    assert np.all(out[:, :pad_w_each, :] == 114), "tall: left pad must be grey fill"
+    assert np.all(out[:, pad_w_each + expected_nw:, :] == 114), "tall: right pad must be grey fill"
+    content = out[:, pad_w_each:pad_w_each + expected_nw]
+    bw, bh = float(content.shape[1]), float(content.shape[0])
+    assert abs(bw / bh - 0.25) < 0.05, \
+        f"tall: aspect ratio must be preserved (~1:4), got {bw/bh:.2f}"
+
+    # ---- 3. Already square at target size: idempotent + writable copy ----
+    img_sq = np.full((384, 384, 3), 200, dtype=np.uint8)
+    out = letterbox_resize(img_sq, 384)
+    assert out.shape == (384, 384, 3)
+    assert np.all(out == 200), "square: must pass-through (no padding needed)"
+    out[0, 0] = 0  # mutating the result must NOT mutate the input
+    assert int(img_sq[0, 0, 0]) == 200, "square: result must be a copy, not a view"
+
+    # ---- 4. Upscale: 50x50 → 768 (longest side = 50 < 768) ----
+    small = np.full((50, 50, 3), 50, dtype=np.uint8)
+    out = letterbox_resize(small, 768)
+    assert out.shape == (768, 768, 3)
+    pad_each = (768 - 50) // 2  # scale = 768/50, content should be 768×768? No — 50x50 is square → no pad.
+    # A square input never gets padding, regardless of size.
+    assert np.all(out == 50), "square small → 768: must fill the whole canvas"
+
+    print("[letterbox] preserves aspect ratio, fills with grey (114)")
+
+
+def test_letterbox_resize_embeds_into_preprocess():
+    """Verify ``VLMBackend._preprocess_to_variant`` now letterboxes
+    instead of stretching — i.e. feeding a wide plate-strip yields a
+    square that still contains the original colours in a centred band.
+    """
+    from types import SimpleNamespace
+    from wdnai.backends.vlm import _VisionVariant, VLMBackend
+
+    class _StubRknn:
+        def get_inputs_tensor_attr(self):
+            return [SimpleNamespace(n_dims=4, shape=(1, 384, 384, 3))]
+        def inference(self, inputs=None):
+            return [np.zeros((1, 384, 384, 16), dtype=np.float16)]
+
+    v = _VisionVariant(
+        image_size=384, rknn=_StubRknn(),
+        rknn_path="/f/384.rknn", weight_path="/f/384.weight",
+    )
+    backend = object.__new__(VLMBackend)
+    backend.spec = SimpleNamespace(use_prune=False)
+    backend.variant = VLMBackend.VARIANT_3VL
+    backend._vision_variants = [v]
+
+    # Wide plate strip: 60 (h) × 240 (w), all red.
+    # Pass as BGR (name ``img_bgr`` in the SDK signature); the SDK
+    # converts internally to RGB before letterboxing.
+    strip_bgr = np.zeros((60, 240, 3), dtype=np.uint8)
+    strip_bgr[..., 2] = 200  # red channel in BGR (index 2)
+    out = backend._preprocess_to_variant(strip_bgr, v)
+    assert out.shape == (1, 384, 384, 3)
+    out_sq = out[0]
+    # After BGR->RGB the red channel is now at index 0.
+    # The strip's aspect ratio is 4:1, so the letterbox content band
+    # is the full 384 wide and 96 tall, centred vertically.
+    expected_nh = round(60 * 384 / 240)  # 96
+    pad_each = (384 - expected_nh) // 2
+    # Above the content: grey fill (114,114,114).
+    assert np.all(out_sq[:pad_each, :, :] == 114), \
+        "preprocess: top letterbox pad must be grey (114)"
+    assert np.all(out_sq[pad_each + expected_nh:, :, :] == 114), \
+        "preprocess: bottom letterbox pad must be grey (114)"
+    # Inside the content band the original colour (red) must be present.
+    content = out_sq[pad_each:pad_each + expected_nh]
+    red_rows = np.where(content[..., 0] == 200)[0]
+    assert red_rows.size > 0, \
+        "preprocess: original red content must survive inside the letterbox"
+    print("[letterbox] _preprocess_to_variant letterboxes wide strips")
+
+
+def test_unletterbox_bbox_round_trip():
+    """``unletterbox_bbox`` must map a 0-1000 bbox in the letterboxed
+    canvas back to original-image pixels, accounting for the scale and
+    the centred padding.
+
+    The canonical pattern is: caller pre-letterboxes with
+    ``letterbox_resize_with_meta``, sends the canvas to the VLM, gets
+    back a bbox in 0-1000 of **the canvas** (with grey padding), then
+    maps that bbox to original-frame pixels so the ROI crop has the
+    original aspect ratio and no grey border.
+    """
+    from wdnai.utils import letterbox_resize_with_meta, unletterbox_bbox
+
+    # ---- 1. 16:9 source (1920x1080) → 384x384 canvas, wide case ----
+    img = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    canvas, meta = letterbox_resize_with_meta(img, 384)
+    assert canvas.shape == (384, 384, 3)
+    assert meta.size == 384
+    assert meta.orig_h == 1080 and meta.orig_w == 1920
+    # 1920 > 1080 → scale = 384/1920 = 0.2, content_w = 384, content_h = 216
+    assert abs(meta.scale - 0.2) < 1e-6, f"16:9 scale: expected 0.2, got {meta.scale}"
+    assert meta.content_w == 384
+    assert meta.content_h == 216
+    assert meta.pad_top == (384 - 216) // 2  # 84
+    assert meta.pad_left == 0
+
+    # Bbox covers the entire content area in 0-1000 of the canvas:
+    #   - canvas pixels: (0, 84) → (384, 300)  (full width, content height)
+    #   - 0-1000 of canvas: x=[0, 1000], y=[84*1000/384, 300*1000/384]
+    canvas_y_top = 84 / 384 * 1000  # ~218.75
+    canvas_y_bot = 300 / 384 * 1000  # ~781.25
+    bbox_canvas = [0, canvas_y_top, 1000, canvas_y_bot]
+    bbox_orig = unletterbox_bbox(bbox_canvas, meta)
+    # Expected: full width, full height
+    assert abs(bbox_orig[0] - 0) < 1.0, f"x1 expected ~0, got {bbox_orig[0]}"
+    assert abs(bbox_orig[1] - 0) < 1.0, f"y1 expected ~0, got {bbox_orig[1]}"
+    assert abs(bbox_orig[2] - 1920) < 1.0, f"x2 expected ~1920, got {bbox_orig[2]}"
+    assert abs(bbox_orig[3] - 1080) < 1.0, f"y2 expected ~1080, got {bbox_orig[3]}"
+
+    # Bbox straddles the top grey padding (y=50..100 of 1000 lands at
+    # canvas rows 19..38, which is inside the 84-row top padding). The
+    # ``y`` coords must clamp to ``0``; the ``x`` coords stay valid
+    # (they're in the content band because pad_left == 0).
+    bbox_in_pad = [400, 50, 600, 100]
+    clamped = unletterbox_bbox(bbox_in_pad, meta)
+    assert clamped[1] == 0.0 and clamped[3] == 0.0, \
+        f"bbox y must clamp to 0 (in pad), got {clamped}"
+    # x1=400/1000*384/0.2 = 768, x2=600/1000*384/0.2 = 1152
+    assert abs(clamped[0] - 768.0) < 1.0, f"x1 expected ~768, got {clamped[0]}"
+    assert abs(clamped[2] - 1152.0) < 1.0, f"x2 expected ~1152, got {clamped[2]}"
+
+    # ---- 2. 9:16 source (1080x1920) → 384x384 canvas, tall case ----
+    img_tall = np.zeros((1920, 1080, 3), dtype=np.uint8)
+    canvas, meta = letterbox_resize_with_meta(img_tall, 384)
+    assert abs(meta.scale - 0.2) < 1e-6
+    assert meta.content_w == 216 and meta.content_h == 384
+    assert meta.pad_top == 0
+    assert meta.pad_left == (384 - 216) // 2  # 84
+
+    # Bbox covering the entire content area in 0-1000 of canvas
+    bbox_canvas = [84/384*1000, 0, (84+216)/384*1000, 1000]
+    bbox_orig = unletterbox_bbox(bbox_canvas, meta)
+    assert abs(bbox_orig[0]) < 1.0
+    assert abs(bbox_orig[1]) < 1.0
+    assert abs(bbox_orig[2] - 1080) < 1.0
+    assert abs(bbox_orig[3] - 1920) < 1.0
+
+    # ---- 3. Square source 800x800 → 384x384 canvas (downsampled) ----
+    # 800 > 384 → downsample, scale = 384/800 = 0.48, no padding.
+    img_sq = np.zeros((800, 800, 3), dtype=np.uint8)
+    canvas, meta = letterbox_resize_with_meta(img_sq, 384)
+    assert meta.content_w == 384 and meta.content_h == 384
+    assert meta.pad_top == 0 and meta.pad_left == 0
+    assert abs(meta.scale - 0.48) < 1e-6, f"800→384 scale: expected 0.48, got {meta.scale}"
+    # 0-1000 bbox (200, 300, 700, 900) in the canvas maps back to the
+    # 800x800 frame at (200/1000*384 / 0.48, ...) = (160, ...).
+    bbox_canvas = [200, 300, 700, 900]
+    bbox_orig = unletterbox_bbox(bbox_canvas, meta)
+    inv = 1.0 / meta.scale
+    assert abs(bbox_orig[0] - 200/1000*384*inv) < 1.0
+    assert abs(bbox_orig[1] - 300/1000*384*inv) < 1.0
+    assert abs(bbox_orig[2] - 700/1000*384*inv) < 1.0
+    assert abs(bbox_orig[3] - 900/1000*384*inv) < 1.0
+
+    # ---- 3b. Square source at exact canvas size: identity scale ----
+    img_eq = np.zeros((384, 384, 3), dtype=np.uint8)
+    canvas, meta = letterbox_resize_with_meta(img_eq, 384)
+    assert meta.scale == 1.0
+    bbox_canvas = [200, 300, 700, 900]
+    bbox_orig = unletterbox_bbox(bbox_canvas, meta)
+    assert abs(bbox_orig[0] - 200/1000*384) < 1.0
+    assert abs(bbox_orig[2] - 700/1000*384) < 1.0
+
+    # ---- 4. clamp=False keeps negative / oversize coords ----
+    bbox_neg = [10, 10, 20, 20]   # inside top-left padding of a 16:9 letterbox
+    unclamped = unletterbox_bbox(bbox_neg, meta, clamp=False)
+    # meta here is the 800x800→384 case (no padding), so the result is
+    # just the canvas-pixel scaled. Just confirm it didn't clamp.
+    assert unclamped == [10/1000*384, 10/1000*384, 20/1000*384, 20/1000*384]
+
+    print("[unletterbox_bbox] round-trip preserves canvas↔original mapping")
 
 
 def test_pick_variant_image_size_override_nearest_fallback():

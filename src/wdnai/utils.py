@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Union
 
 import numpy as np
 
@@ -24,42 +24,227 @@ def bgr_to_rgb(img_bgr: np.ndarray) -> np.ndarray:
     return img_bgr
 
 
-def resize(img: np.ndarray, size: int) -> np.ndarray:
-    """Resize an image to ``(size, size)``.
+def letterbox_resize(img: np.ndarray, size: int) -> np.ndarray:
+    """Resize ``img`` to a ``(size, size)`` square **without** stretching.
 
-    Picks the interpolation by direction:
-      * **downsample** (``size < max(h, w)``) → ``cv2.INTER_AREA``. This
-        averages every source pixel covered by the destination cell,
-        which is what OpenCV documents as the recommended mode for
-        decimation and what preserves anti-aliased mean intensity for
-        small high-frequency content (e.g. license-plate strokes when
-        scaling 960x540 → 384x384). Plain bilinear
-        (``cv2.INTER_LINEAR``) only sees the 2x2 corner pixels of each
-        destination cell and silently drops the rest, which mangles
-        text-like patterns.
-      * **upsample** (``size > max(h, w)``) → ``cv2.INTER_CUBIC``. Cubic
-        spline over a 4x4 neighbourhood is markedly sharper than the
-        bilinear default at the cost of a few extra multiplies — well
-        worth it for small-target detection on a 384 → 768 upscale.
-      * **isometric** (equal) → ``cv2.INTER_LINEAR``. No resampling
-        needed, but INTER_LINEAR keeps the function symmetric.
+    Behaviour:
 
-    Equivalence: ``cv2.resize(img, (s, s), interpolation=...)`` is the
-    same code path OpenCV itself uses internally; we just pick the
-    flag ahead of the call.
+    * The longer side of ``img`` is scaled so it equals ``size``.
+    * The shorter side is scaled by the same factor and the result is
+      centred inside a ``(size, size)`` canvas; the remaining border is
+      filled with grey ``(114, 114, 114)`` (BGR; the ImageNet mean that
+      Qwen-VL's official ``smart_resize`` and most letterbox pipelines
+      use as the "empty patch" colour).
+    * The original aspect ratio is preserved exactly — never stretched.
+
+    This is the only image-resize entry point the SDK exposes. Calling
+    code MUST NOT bypass it via plain ``cv2.resize`` because:
+
+    1. VLM crop ROIs (e.g. license-plate bbox → ~250×60 strip) would
+       otherwise get squashed into a square and the characters would
+       distort badly enough to break OCR.
+    2. The vision RKNNs (Qwen3-VL / Qwen3.5-VL / Embedding-2B) are all
+       exported with square inputs but were trained against letterboxed
+       data, so grey-padded squares are the canonical input shape.
+
+    Interpolation follows the same direction-aware rule the legacy
+    ``resize`` used:
+
+    * downsample (``size < max(h, w)``) → ``cv2.INTER_AREA`` (averages
+      every source pixel covered by each destination cell, preserves
+      anti-aliased mean intensity for small high-frequency content
+      like license-plate strokes).
+    * upsample (``size > max(h, w)``) → ``cv2.INTER_CUBIC`` (sharper
+      than bilinear for 4×-class upscales).
+    * isometric (equal) → ``cv2.INTER_LINEAR``.
+
+    Edge cases:
+
+    * Square input at exact target size: returns a copy of the input
+      padded to the canvas (the paste into a fresh canvas already
+      forces a copy, so callers may mutate the returned array freely).
+    * 1-channel or 4-channel input: the canvas is filled with the
+      matching fill value broadcast along the channel axis
+      (``(114, 114, 114)`` becomes ``114`` for grayscale, ``(114,114,114,114)``
+      for BGRA).
+
+    If you need to map the model's bbox output (which is in the
+    letterboxed canvas's coordinate space) back to the **original**
+    image's coordinate space, use :func:`letterbox_resize_with_meta` and
+    :func:`unletterbox_bbox` instead.
+    """
+    canvas, _meta = letterbox_resize_with_meta(img, size)
+    return canvas
+
+
+class LetterboxMeta(NamedTuple):
+    """Geometry produced by :func:`letterbox_resize_with_meta`.
+
+    Feed this to :func:`unletterbox_bbox` / :func:`unletterbox_point`
+    to map coordinates that the model returned in the **letterboxed
+    canvas's** space back to the **original image's** space.
+
+    Attributes
+    ----------
+    size : int
+        Canvas edge length (e.g. 384).
+    orig_h, orig_w : int
+        Original image height / width.
+    scale : float
+        ``size / max(orig_h, orig_w)`` — uniform scale applied to both
+        axes. Inverse of the scaling done inside ``letterbox_resize``.
+    content_h, content_w : int
+        Pixel size of the centred content area inside the canvas
+        (``round(orig_h * scale)`` / ``round(orig_w * scale)``).
+    pad_top, pad_left : int
+        Grey-padding offset of the content area's top-left corner
+        inside the canvas. Always ``(size - content_*) // 2``; the
+        opposite-side padding is ``size - content_* - pad_*`` and may
+        differ by 1 pixel for odd ``size - content_*`` differences.
+    """
+
+    size: int
+    orig_h: int
+    orig_w: int
+    scale: float
+    content_h: int
+    content_w: int
+    pad_top: int
+    pad_left: int
+
+
+def letterbox_resize_with_meta(
+    img: np.ndarray, size: int,
+) -> tuple:
+    """Same as :func:`letterbox_resize` but also returns the geometry.
+
+    The returned :class:`LetterboxMeta` lets callers invert the
+    letterbox — i.e. map coordinates that the VLM emitted in the
+    letterboxed canvas's space back to the original image's space.
+
+    Typical usage (the canonical "send to VLM → crop original frame"
+    pattern)::
+
+        canvas, meta = letterbox_resize_with_meta(img, 384)
+        # ask VLM what to crop
+        result = await session.respond(attachment=Attachment(canvas), ...)
+        # bbox is in 0-1000 coords of `canvas`
+        x1, y1, x2, y2 = unletterbox_bbox(result.bbox, meta)
+        roi = img[int(y1):int(y2), int(x1):int(x2)]
     """
     try:
         import cv2  # noqa: WPS433
     except ImportError as e:
-        raise ImportError("Image resize requires opencv-python; please `pip install opencv-python`") from e
+        raise ImportError(
+            "Image letterbox requires opencv-python; please `pip install opencv-python`"
+        ) from e
+
     h, w = img.shape[:2]
-    if size < max(h, w):
+    s = max(h, w)
+    if s == size and h == w:
+        canvas = np.full((size, size) + img.shape[2:], 114, dtype=img.dtype)
+        canvas[...] = img
+        meta = LetterboxMeta(
+            size=size, orig_h=h, orig_w=w, scale=1.0,
+            content_h=size, content_w=size, pad_top=0, pad_left=0,
+        )
+        return canvas, meta
+
+    scale = size / s
+    nh, nw = int(round(h * scale)), int(round(w * scale))
+    nh = max(1, nh)
+    nw = max(1, nw)
+    if size < s:
         interp = cv2.INTER_AREA
-    elif size > max(h, w):
+    elif size > s:
         interp = cv2.INTER_CUBIC
     else:
         interp = cv2.INTER_LINEAR
-    return cv2.resize(img, (size, size), interpolation=interp)
+    resized = cv2.resize(img, (nw, nh), interpolation=interp)
+
+    fill = 114
+    if img.ndim == 3:
+        if img.shape[2] == 1:
+            canvas = np.full((size, size, 1), fill, dtype=img.dtype)
+        else:
+            canvas = np.full((size, size, img.shape[2]), fill, dtype=img.dtype)
+    else:
+        canvas = np.full((size, size), fill, dtype=img.dtype)
+    pad_top = (size - nh) // 2
+    pad_left = (size - nw) // 2
+    canvas[pad_top:pad_top + nh, pad_left:pad_left + nw] = resized
+    meta = LetterboxMeta(
+        size=size, orig_h=h, orig_w=w, scale=scale,
+        content_h=nh, content_w=nw, pad_top=pad_top, pad_left=pad_left,
+    )
+    return canvas, meta
+
+
+def unletterbox_bbox(
+    bbox_1000: Union[List[float], tuple],
+    meta: LetterboxMeta,
+    *,
+    clamp: bool = True,
+) -> List[float]:
+    """Map a 0-1000 bbox in the letterboxed canvas back to the original image.
+
+    The VLM sees the letterboxed canvas and emits bbox coords in 0-1000
+    of **that canvas** (which contains grey padding around the original
+    content). Calling code that wants to crop the **original** image
+    (no grey padding, original aspect ratio) must run the bbox through
+    this function.
+
+    ``bbox_1000`` is ``[x1, y1, x2, y2]`` (any order is fine — the
+    function inverts top-left and bottom-right independently and
+    returns them in input order). Values outside ``[0, 1000]`` are
+    accepted; if ``clamp=True`` (default), the result is clipped to
+    ``[0, orig_w]`` / ``[0, orig_h]`` so the cropped ROI never reads
+    out-of-bounds pixels.
+
+    Returns ``[x1_orig, y1_orig, x2_orig, y2_orig]`` in **pixels** of
+    the original image (floats; cast to ``int`` when slicing).
+    """
+    if len(bbox_1000) != 4:
+        raise ValueError(
+            f"bbox must have 4 elements, got {len(bbox_1000)}: {bbox_1000!r}"
+        )
+    raw = [float(v) for v in bbox_1000]
+    # 0-1000 -> canvas pixels
+    canvas_xs = [v / 1000.0 * meta.size for v in (raw[0], raw[2])]
+    canvas_ys = [v / 1000.0 * meta.size for v in (raw[1], raw[3])]
+    # subtract padding -> content pixels (may be negative if bbox
+    # strayed into the grey border; ``clamp`` handles that below)
+    content_xs = [cx - meta.pad_left for cx in canvas_xs]
+    content_ys = [cy - meta.pad_top for cy in canvas_ys]
+    # content pixels -> original pixels
+    orig_xs = [cx / meta.scale for cx in content_xs]
+    orig_ys = [cy / meta.scale for cy in content_ys]
+    if clamp:
+        orig_xs = [max(0.0, min(float(meta.orig_w), x)) for x in orig_xs]
+        orig_ys = [max(0.0, min(float(meta.orig_h), y)) for y in orig_ys]
+    return [orig_xs[0], orig_ys[0], orig_xs[1], orig_ys[1]]
+
+
+def unletterbox_point(
+    xy_1000: Union[List[float], tuple],
+    meta: LetterboxMeta,
+    *,
+    clamp: bool = True,
+) -> List[float]:
+    """Map a single 0-1000 point ``(x, y)`` from letterboxed canvas
+    back to original image coordinates (pixels).
+
+    Same arithmetic as :func:`unletterbox_bbox` but for a single point.
+    Returns ``[x_orig, y_orig]``.
+    """
+    if len(xy_1000) != 2:
+        raise ValueError(
+            f"point must have 2 elements, got {len(xy_1000)}: {xy_1000!r}"
+        )
+    bbox = unletterbox_bbox(
+        [xy_1000[0], xy_1000[1], xy_1000[0], xy_1000[1]], meta, clamp=clamp,
+    )
+    return [bbox[0], bbox[1]]
 
 
 # --------------------------------------------------------------------------- #

@@ -104,12 +104,17 @@ class EmbeddingBackend:
 
     def _vision_inference(self, frame_bgr: np.ndarray):
         import cv2
-        img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        from ..utils import letterbox_resize
         input_attr = self.rknn_vision.get_inputs_tensor_attr()[0]
         batch = int(input_attr.shape[0])
         h, w = int(input_attr.shape[1]), int(input_attr.shape[2])
-        if (img.shape[0], img.shape[1]) != (h, w):
-            img = cv2.resize(img, (w, h))
+        img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        # Letterbox instead of plain resize: the source frame may be any
+        # aspect ratio (PyAV decode / user upload), and the Qwen3-VL
+        # vision RKNN was trained on square inputs. Plain resize would
+        # stretch a 16:9 frame into a square and distort embeddings.
+        if (img.shape[0], img.shape[1]) != (h, w) or img.shape[0] != img.shape[1]:
+            img = letterbox_resize(img, h)
         feature = img.reshape(1, h, w, 3)
         if batch == 2:
             feature = np.concatenate([feature, feature], axis=0)

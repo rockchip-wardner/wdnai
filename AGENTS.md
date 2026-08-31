@@ -80,12 +80,20 @@ name `wdnai`.
   `bool(attachments_out)` vs raw-JSON parse), history bookkeeping,
   `reset()` (clears history + `rknn_llm.clear_kvcache()`),
   `majority_vote(k)` (k sequential calls + `Counter.most_common`).
-- `src/wdnai/utils.py` — image preprocessing (`bgr_to_rgb`, `resize`
-  picks `INTER_AREA`/`INTER_CUBIC`/`INTER_LINEAR` by direction),
+- `src/wdnai/utils.py` — image preprocessing (`bgr_to_rgb`,
+  `letterbox_resize` — **the only image-resize entry point**; always
+  preserves aspect ratio by scaling longest side and centring the
+  shorter side with grey `(114,114,114)` padding; NEVER stretches.
+  Interpolation direction-aware: downsample→`INTER_AREA`,
+  upsample→`INTER_CUBIC`, equal→`INTER_LINEAR`),
   `qwen25vl_prune` / `qwen3vl_prune_single` (patch-tokeniser for
   pruned vision RKNNs — matches the example scripts' preprocessing
   exactly), `extract_json` (tolerates ```json``` fences and bare
   braces).
+  **Removed**: the old plain `resize()` (stretch-to-square) — VLM crop
+  ROIs (e.g. a 250×60 license-plate strip) would get squashed into a
+  square and break OCR. Use `letterbox_resize`; if you really need the
+  legacy stretch, call `cv2.resize(img, (size, size), ...)` yourself.
 - `src/wdnai/gguf_tokenizer.py` — `load_tokenizer_from_gguf(path)`:
   reads `tokenizer.ggml.{tokens,merges,model,pre,eos_token_id,…}` via
   `gguf.GGUFReader`, writes vocab+merges to a temp dir, builds a
@@ -102,7 +110,9 @@ name `wdnai`.
 - `src/wdnai/backends/embedding.py` — `EmbeddingBackend` (kind=
   "embedding"): loads llm/vision `.1828.rknn` + `.weight` + embed.bin
   + tokenizer under `WDNAI_MODELS_DIR/Qwen3-VL-Embedding-2B`, feeds
-  vision at 576x576, exposes `embed_text(text)` and
+  vision at 576x576 via `letterbox_resize` (so PyAV-decoded frames
+  with arbitrary aspect ratios get grey-padded squares, never
+  stretched), exposes `embed_text(text)` and
   `embed_video_chunk(frames, text="")` returning L2-normalized
   2048-dim vectors (the LLM runs through the plain RKNN3Lite path,
   no token generation).
@@ -145,8 +155,14 @@ name `wdnai`.
   (the LLM consumes a single `RKNN3Image` with concatenated tokens +
   a single `image_width` / `image_height`); images that would prefer a
   different variant are force-fit to the chosen one with a warning.
-  Outputs the vision feature → `RKNN3Image` (vision tags set to
-  `<|vision_start|>` / `<|vision_end|>` / `<|image_pad|>`). Qwen3-VL
+  **Image-to-variant resize** (`_preprocess_to_variant`) uses
+  `letterbox_resize(img, variant.image_size)` — never plain `cv2.resize`
+  — so the source aspect ratio is preserved and the shorter side is
+  filled with grey `(114,114,114)`. Crop ROIs (typically very wide
+  strips like a license-plate bbox) keep their character aspect ratio
+  through the second-stage OCR call. Outputs the vision feature →
+  `RKNN3Image` (vision tags set to `<|vision_start|>` / `<|vision_end|>`
+  / `<|image_pad|>`). Qwen3-VL
   additionally concatenates 3 deepstack aux tensors (output indices
   1..3) into `RKNN3AuxTensorWrapper`s with the chosen variant's
   vision output's `aligned_size`.
@@ -190,12 +206,16 @@ name `wdnai`.
 
 ### 设计原则
 
-- **VLM 兼容 cv2 但不依赖 cv2**：`bgr_to_rgb` / `resize` 是惰性 import cv2，
-  SDK 在非 RK 开发板上依然能 import；但调用方一旦走图像路径就必须装
-  `opencv-python`。`wdnav` 的 `VideoCapture.read()` 已经把 BGR ndarray 出来了，
-  调用方直接 `Attachment(frame)` 即可。
+- **VLM 兼容 cv2 但不依赖 cv2**：`bgr_to_rgb` / `letterbox_resize` 是惰性
+  import cv2，SDK 在非 RK 开发板上依然能 import；但调用方一旦走图像路径
+  就必须装 `opencv-python`。`wdnav` 的 `VideoCapture.read()` 已经把 BGR
+  ndarray 出来了，调用方直接 `Attachment(frame)` 即可。**图像送入 VLM
+  之前不需要调用方自己 resize** —— SDK 后端会自动按 vision 变体
+  `image_size` 做 letterbox（最长边等比缩放 + 短边居中填灰
+  `(114,114,114)`），永远不拉伸。Crop ROI、用户上传图、视频任意比例帧
+  都走同一条路径。
 - **不做软解 / 不做软件兜底**：解码（视频帧）/ 视觉预处理（图像）/ TTS
-  codec 解码全部走 NPU / 加速库。cv2 只用来 BGR↔RGB、resize、frame
+  codec 解码全部走 NPU / 加速库。cv2 只用来 BGR↔RGB、letterbox、frame
   sampling（视频 attachment 抽样 5 帧）、`cv2.VideoCapture` 给 `Attachment`
   用作兜底启发式；不要拿 cv2 做 JPEG/H.264 软编解码。
 - **RKNN 导入必须懒加载**：`from rknn3lite.api import RKNN3Lite` 仅出现在
