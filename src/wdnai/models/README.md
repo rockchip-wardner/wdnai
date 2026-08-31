@@ -18,6 +18,23 @@ No network access is performed at any point; place the model files manually.
 │   ├── Qwen3-VL-4B.embed.bin                     # Token embedding table (742 MB, vocab 151936 × 2560-dim float16)
 │   └── Qwen3-VL-4B.tokenizer.gguf                # GGUF-format tokenizer (5.7 MB; loaded via wdnai.gguf_tokenizer)
 │
+├── Qwen3.5-4B/                                   # vision-language (also powers pure-text chat via the VL RKNN)
+│   ├── Qwen3.5-4B-llm.1828.rknn                  # LLM RKNN (38 MB, MRoPE baked in) — for qwen3_5_vl_4b()
+│   ├── Qwen3.5-4B-llm.weight                     # LLM weights (2.5 GB)
+│   ├── Qwen3.5-4B-llm.embed.bin                  # Token embedding table (1.27 GB, vocab 248320 × 2560-dim fp16)
+│   ├── Qwen3.5-4B-llm.tokenizer.gguf             # GGUF-format tokenizer (10.9 MB; vocab 248320, EOS 248046)
+│   ├── Qwen3.5-4B-vision.384x384.1828.rknn       # Vision encoder RKNN @ 384x384 (5 MB) — REQUIRED
+│   ├── Qwen3.5-4B-vision.384x384.weight          # Vision weights @ 384x384 (188 MB)   — REQUIRED
+│   ├── Qwen3.5-4B-vision.768x768.1828.rknn       # Vision encoder RKNN @ 768x768 (11 MB) — OPTIONAL
+│   └── Qwen3.5-4B-vision.768x768.weight          # Vision weights @ 768x768 (195 MB)   — OPTIONAL
+│
+│   # The VLM-mode LLM RKNN has MRoPE (``mrope_type='Qwen3.5'``,
+│   # ``mrope_section=[11, 11, 10]``) baked into the graph for image
+│   # position encoding; with no vision tokens attached MRoPE reduces
+│   # to standard positional encoding, so a single RKNN powers both
+│   # ``swcap_text_chat`` and ``swcap_video_describe`` capabilities
+│   # in ``MODEL_PRESETS["qwen3-5-vl-4b"]``.
+│
 ├── Qwen3-TTS/                         # pyrkaiweb's text-to-speech back end
 │   ├── text_projection.1828.rknn       # ① 文本侧 projector — 普通 RKNN 图，core_mask=0x01（1 核）
 │   ├── text_projection.weight          #   （16 MB，与上面配对）
@@ -74,6 +91,35 @@ of variants resident on the NPU — bump `memory_estimate_mb` in
 [wdnwebui](../)'s `MODEL_PRESETS` if you ship both 384x384 and 768x768
 together. To add a new resolution tier, drop a new pair into the
 directory; no preset change is needed.
+
+### Qwen3.5-VL-4B (vision-language, also powers text chat)
+
+Vision-language model (image-in, text-out) that **also handles
+pure-text inference** — the VLM-mode LLM is a regular LLM with
+`mrope_type='Qwen3.5'` / `mrope_section=[11, 11, 10]` baked into the
+graph for image position encoding; with no vision tokens attached
+MRoPE reduces to standard positional encoding, so a single RKNN
+powers both the `swcap_text_chat` and `swcap_video_describe`
+capabilities declared by `MODEL_PRESETS["qwen3-5-vl-4b"]`.
+`SystemLanguageModel.qwen3_5_vl_4b` points to
+`/userdata/models/Qwen3.5-4B/` by default (override via
+`WDNAI_MODELS_DIR` or pin a custom path with
+`WDNAI_QWEN3_5_4B_VL_DIR`) and raises `FileNotFoundError` listing
+the missing files if the directory is incomplete.
+
+| File (`<root>/Qwen3.5-4B/…`)        | Purpose                                  | Required          |
+| ----------------------------------- | ---------------------------------------- | ----------------- |
+| `Qwen3.5-4B-llm.1828.rknn` + `.weight`            | LLM RKNN (MRoPE baked in)        | yes               |
+| `Qwen3.5-4B-vision.384x384.1828.rknn` + `.weight` | Vision encoder @ 384×384         | yes (fallback)    |
+| `Qwen3.5-4B-vision.768x768.1828.rknn` + `.weight` | Vision encoder @ 768×768         | optional          |
+| `Qwen3.5-4B-llm.embed.bin`          | Token embedding table (248320 × 2560 fp16, 1.27 GB) | yes   |
+| `Qwen3.5-4B-llm.tokenizer.gguf`     | GGUF tokenizer (248320 vocab, EOS 248046) | yes             |
+
+`VLMBackend` auto-discovers every `Qwen3.5-4B-vision.*x*.1828.rknn`
+sibling in the directory at load time (same multi-resolution
+discovery as Qwen3-VL-4B). Note the Qwen3.5 vocabulary (248,320
+tokens / EOS 248,046) is distinct from Qwen3's (151,936 / 151,645)
+— mixing them would crash the embed-table reshape.
 
 ### Qwen3-TTS (text-to-speech)
 

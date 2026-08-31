@@ -2,18 +2,18 @@
 
 模型文件位于固定的本地路径 ``/userdata/models/Qwen3.5-4B/``：
 
-    llm_Qwen3.5-4B-VL.1828.rknn / .weight           (VLM-mode LLM，MRoPE 烙印)
-    vision_Qwen3.5-4B-VL.384x384.1828.rknn / .weight (必需 384x384 vision)
-    vision_Qwen3.5-4B-VL.768x768.1828.rknn / .weight (可选 768x768 vision)
-    llm_Qwen3.5-4B-VL.embed.bin
-    llm_Qwen3.5-4B-VL.tokenizer.gguf
+    Qwen3.5-4B-llm.1828.rknn / .weight                (VLM-mode LLM，MRoPE 烙印)
+    Qwen3.5-4B-vision.384x384.1828.rknn / .weight    (必需 384x384 vision)
+    Qwen3.5-4B-vision.768x768.1828.rknn / .weight    (可选 768x768 vision)
+    Qwen3.5-4B-llm.embed.bin
+    Qwen3.5-4B-llm.tokenizer.gguf
 
 可通过环境变量更改根目录：
 
     WDNAI_QWEN3_5_4B_VL_DIR=/path/to/Qwen3.5-4B
 
 与 ``qwen3_5_text.py`` 的区别：本示例加载的是 VLM-mode LLM
-（``llm_Qwen3.5-4B-VL.1828.rknn``），可以消费 vision tokens。视觉
+（``Qwen3.5-4B-llm.1828.rknn``），可以消费 vision tokens。视觉
 预处理路径与 Qwen3-VL 修剪版一致（``qwen3vl_prune_single``）。
 
 When the ``Qwen3.5-4B/`` directory carries both the 384x384 and the

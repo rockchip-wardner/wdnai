@@ -49,25 +49,27 @@ name `wdnai`.
   preset catalog: `qwen2_5_0_5b()`, `qwen3_1_7b()`, `qwen3_8b()`
   (pure-text, binds to `/userdata/models/Qwen3-8B/`, overridable via
   `WDNAI_QWEN3_8B_DIR`; raises `FileNotFoundError` listing missing
-  files), `qwen3_5_4b()` (Qwen3.5-4B pure-text; **vocab_size=248320**,
-  **special_eos_id=248046** — different from Qwen3), `qwen2_5_vl_3b()` /
-  `_7b()`, `qwen3_vl_2b()`, `qwen3_vl_4b_template()`, `qwen3_vl_4b()`,
-  `qwen3_5_vl_4b()` (Qwen3.5-VL-4B; same vocab as text-only variant;
-  384×384 + 768×768 vision variants auto-discovered in the model
-  directory), `qwen3_tts()`, `qwen3_vl_embedding()` (retrieval
+  files), `qwen2_5_vl_3b()` / `_7b()`, `qwen3_vl_2b()`,
+  `qwen3_vl_4b_template()`, `qwen3_vl_4b()`,
+  `qwen3_5_vl_4b()` (Qwen3.5-VL-4B; **vocab_size=248320**,
+  **special_eos_id=248046** — different from Qwen3; the VLM-mode LLM
+  is a regular LLM with MRoPE baked into the graph for image position
+  encoding, so it also handles pure-text inference from a single
+  RKNN; 384×384 + 768×768 vision variants auto-discovered in the
+  model directory), `qwen3_tts()`, `qwen3_vl_embedding()` (retrieval
   embedding, no token generation, binds to
   `/userdata/models/Qwen3-VL-Embedding-2B/` and raises
   `FileNotFoundError` listing missing files).
   The `qwen3_vl_4b()` preset binds to
   `/userdata/models/Qwen3-VL-4B/` (overridable via
   `WDNAI_QWEN3_VL_4B_DIR`) and raises `FileNotFoundError` listing
-  missing files if the directory is incomplete. The `qwen3_5_4b()`
-  and `qwen3_5_vl_4b()` presets both live under
-  `/userdata/models/Qwen3.5-4B/` (override via `WDNAI_QWEN3_5_4B_DIR`
-  / `WDNAI_QWEN3_5_4B_VL_DIR`); the text-only and VLM RKNN files
-  differ (`Qwen3.5-4B.1828.rknn` vs `llm_Qwen3.5-4B-VL.1828.rknn`)
-  because the VLM-mode LLM has MRoPE baked into the graph for image
-  position encoding.
+  missing files if the directory is incomplete. The
+  `qwen3_5_vl_4b()` preset lives under
+  `/userdata/models/Qwen3.5-4B/` (override via
+  `WDNAI_QWEN3_5_4B_VL_DIR`); MRoPE baked into
+  `Qwen3.5-4B-llm.1828.rknn` is what distinguishes it from a pure
+  text LLM — no separate text-only Qwen3.5-4B RKNN is shipped (one
+  RKNN powers both text-chat and video-describe capabilities).
 - `src/wdnai/session.py` — `LLMSession`: `async def respond(prompt,
   attachment, generating, tools, debug, perf, **overrides)`. Owns
   one backend (chosen by `ModelSpec.kind`). Responsibilities:

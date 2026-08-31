@@ -134,42 +134,6 @@ def _qwen3_8b_spec(**overrides) -> ModelSpec:
     return _qwen3_spec(**base)
 
 
-def _qwen3_5_spec(**overrides) -> ModelSpec:
-    """Qwen3.5-4B text-only LLM spec.
-
-    Distinct from :func:`_qwen3_5_vl_spec` because the VLM variant uses
-    a *different* RKNN file (with MRoPE baked in for image position
-    embedding). The text-only RKNN has no MRoPE; it cannot consume
-    vision tokens and is therefore smaller (~35 MB vs ~40 MB) and
-    faster at prefill.
-
-    Note: Qwen3.5 ships with a *much* larger vocabulary than Qwen3
-    (248,320 tokens vs 151,936). The ``eos_token_id`` is also
-    different (248,046 vs 151,645). These come straight out of the
-    GGUF tokenizer header — see :mod:`wdnai.gguf_tokenizer`.
-    """
-    base = dict(
-        name="qwen3.5-4b",
-        kind="llm",
-        variant="qwen3.5",
-        vocab_size=248320,
-        special_eos_id=248046,
-        max_context_len=4096,        # export kvcache_buffer_len = 8K, demo uses 3K
-        options={
-            "max_new_tokens": 1024,
-            "top_k": 1,
-            "top_p": 0.9,
-            "temperature": 1.0,      # example scripts default
-            "repeat_penalty": 1.0,
-            "frequency_penalty": 0.0,
-            "presence_penalty": 0.0,
-            "enable_thinking": False,
-        },
-    )
-    base.update(overrides)
-    return ModelSpec(**base)
-
-
 def _qwen2_5vl_spec(**overrides) -> ModelSpec:
     base = dict(
         name="qwen2.5-vl-3b",
@@ -270,20 +234,21 @@ def _qwen3vl_4b_spec(**overrides) -> ModelSpec:
 def _qwen3_5_vl_spec(**overrides) -> ModelSpec:
     """Qwen3.5-VL-4B multimodal spec (image-in, text-out).
 
+    Also handles pure-text inference (no image attachment) — the
+    VLM-mode LLM is a regular LLM with MRoPE (``mrope_type='Qwen3.5'``,
+    ``mrope_section=[11, 11, 10]``) baked into the graph for image
+    position encoding; with no vision tokens attached MRoPE reduces
+    to standard positional encoding, so this single RKNN powers both
+    the video-description and text-chat capabilities in
+    ``MODEL_PRESETS["qwen3-5-vl-4b"]``.
+
     File layout::
 
-        llm_Qwen3.5-4B-VL.1828.rknn + .weight                (VLM-mode LLM, MRoPE baked in)
-        vision_Qwen3.5-4B-VL.384x384.1828.rknn + .weight      (required, prune-mode vision)
-        vision_Qwen3.5-4B-VL.768x768.1828.rknn + .weight      (optional, prune-mode vision)
-        llm_Qwen3.5-4B-VL.embed.bin                          fp16 (vocab_size × dim)
-        llm_Qwen3.5-4B-VL.tokenizer.gguf                     GPT-2 BPE + ByteLevel
-
-    Distinct from :func:`_qwen3_5_spec` (text-only): the VLM-mode LLM
-    is a separate RKNN with MRoPE (``mrope_type='Qwen3.5'``,
-    ``mrope_section=[11, 11, 10]``) baked into the model graph at
-    export time so the prompt template can carry image position
-    embeddings. The text-only RKNN lacks MRoPE and cannot consume
-    vision tokens.
+        Qwen3.5-4B-llm.1828.rknn + .weight                   (VLM-mode LLM, MRoPE baked in)
+        Qwen3.5-4B-vision.384x384.1828.rknn + .weight        (required, prune-mode vision)
+        Qwen3.5-4B-vision.768x768.1828.rknn + .weight        (optional, prune-mode vision)
+        Qwen3.5-4B-llm.embed.bin                             fp16 (vocab_size × dim)
+        Qwen3.5-4B-llm.tokenizer.gguf                        GPT-2 BPE + ByteLevel
 
     Sampling parameters mostly follow ``examples/Qwen3_5_VL/cpp/main.cc``
     defaults: ``top_k=1``, ``top_p=0.9``, ``repeat_penalty=1.0``,
@@ -511,78 +476,29 @@ def _verify_qwen3_8b_files() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Qwen3.5-4B: text-only LLM. File layout::
+# Qwen3.5-VL-4B: vision-language model (image-in, text-out). The same RKNN
+# also powers pure-text inference (the VLM-mode LLM is a regular LLM with
+# MRoPE baked into the graph; without vision tokens MRoPE reduces to
+# standard positional encoding). File layout::
 #
-#     Qwen3.5-4B.1828.rknn           (text-only LLM, no MRoPE)
-#     Qwen3.5-4B.weight
-#     Qwen3.5-4B.embed.bin           fp16 (vocab_size × dim)
-#     Qwen3.5-4B.tokenizer.gguf      GPT-2 BPE + ByteLevel
-#
-# Same convention as Qwen3-8B (model directory carries 4 files).
-# --------------------------------------------------------------------------- #
-_QWEN3_5_4B_REQUIRED = (
-    "Qwen3.5-4B.1828.rknn",
-    "Qwen3.5-4B.weight",
-    "Qwen3.5-4B.embed.bin",
-    "Qwen3.5-4B.tokenizer.gguf",
-)
-
-
-def _qwen3_5_4b_dir() -> Path:
-    """Resolve the Qwen3.5-4B (text-only) model directory.
-
-    Override via ``WDNAI_QWEN3_5_4B_DIR`` (full path);
-    fallback ``$WDNAI_MODELS_DIR/Qwen3.5-4B`` (which itself defaults
-    to ``/userdata/models/Qwen3.5-4B`` when ``WDNAI_MODELS_DIR`` is
-    unset).
-    """
-    override = _os.environ.get("WDNAI_QWEN3_5_4B_DIR")
-    return Path(override) if override else _models_root() / "Qwen3.5-4B"
-
-
-def _default_qwen3_5_4b_paths() -> dict:
-    d = _qwen3_5_4b_dir()
-    return {
-        "rknn_path":      str(d / "Qwen3.5-4B.1828.rknn"),
-        "weight_path":    str(d / "Qwen3.5-4B.weight"),
-        "tokenizer_path": str(d / "Qwen3.5-4B.tokenizer.gguf"),
-        "embed_path":     str(d / "Qwen3.5-4B.embed.bin"),
-    }
-
-
-def _verify_qwen3_5_4b_files() -> None:
-    d = _qwen3_5_4b_dir()
-    missing = [f for f in _QWEN3_5_4B_REQUIRED if not (d / f).is_file()]
-    if missing:
-        raise FileNotFoundError(
-            f"Qwen3.5-4B files missing under {d}: {missing}. "
-            f"Place the files there or set WDNAI_QWEN3_5_4B_DIR to point at a custom path."
-        )
-
-
-# --------------------------------------------------------------------------- #
-# Qwen3.5-VL-4B: vision-language model (image-in, text-out). Distinct from
-# the text-only Qwen3.5-4B above because the VLM-mode LLM is a separate
-# RKNN file with MRoPE baked in. File layout::
-#
-#     llm_Qwen3.5-4B-VL.1828.rknn                            (VLM-mode LLM, MRoPE)
-#     llm_Qwen3.5-4B-VL.weight
-#     vision_Qwen3.5-4B-VL.384x384.1828.rknn + .weight      (required, 384×384 prune-mode)
-#     vision_Qwen3.5-4B-VL.768x768.1828.rknn + .weight      (optional, 768×768 prune-mode)
-#     llm_Qwen3.5-4B-VL.embed.bin                            fp16 (vocab_size × dim)
-#     llm_Qwen3.5-4B-VL.tokenizer.gguf                       GPT-2 BPE + ByteLevel
+#     Qwen3.5-4B-llm.1828.rknn                              (VLM-mode LLM, MRoPE)
+#     Qwen3.5-4B-llm.weight
+#     Qwen3.5-4B-vision.384x384.1828.rknn + .weight        (required, 384×384 prune-mode)
+#     Qwen3.5-4B-vision.768x768.1828.rknn + .weight        (optional, 768×768 prune-mode)
+#     Qwen3.5-4B-llm.embed.bin                              fp16 (vocab_size × dim)
+#     Qwen3.5-4B-llm.tokenizer.gguf                         GPT-2 BPE + ByteLevel
 #
 # The 384×384 vision pair is the always-required base resolution;
 # ``VLMBackend._discover_vision_paths`` discovers both 384×384 and
 # 768×768 sibling ``.<WxH>.1828.rknn`` files in the directory.
 # --------------------------------------------------------------------------- #
 _QWEN3_5_4B_VL_REQUIRED = (
-    "llm_Qwen3.5-4B-VL.1828.rknn",
-    "llm_Qwen3.5-4B-VL.weight",
-    "vision_Qwen3.5-4B-VL.384x384.1828.rknn",
-    "vision_Qwen3.5-4B-VL.384x384.weight",
-    "llm_Qwen3.5-4B-VL.embed.bin",
-    "llm_Qwen3.5-4B-VL.tokenizer.gguf",
+    "Qwen3.5-4B-llm.1828.rknn",
+    "Qwen3.5-4B-llm.weight",
+    "Qwen3.5-4B-vision.384x384.1828.rknn",
+    "Qwen3.5-4B-vision.384x384.weight",
+    "Qwen3.5-4B-llm.embed.bin",
+    "Qwen3.5-4B-llm.tokenizer.gguf",
 )
 
 
@@ -603,10 +519,10 @@ def _qwen3_5_4b_vl_dir() -> Path:
 def _default_qwen3_5_4b_vl_paths() -> dict:
     d = _qwen3_5_4b_vl_dir()
     return {
-        "rknn_llm_path":    str(d / "llm_Qwen3.5-4B-VL.1828.rknn"),
-        "rknn_vision_path": str(d / "vision_Qwen3.5-4B-VL.384x384.1828.rknn"),
-        "tokenizer_path":   str(d / "llm_Qwen3.5-4B-VL.tokenizer.gguf"),
-        "embed_path":       str(d / "llm_Qwen3.5-4B-VL.embed.bin"),
+        "rknn_llm_path":    str(d / "Qwen3.5-4B-llm.1828.rknn"),
+        "rknn_vision_path": str(d / "Qwen3.5-4B-vision.384x384.1828.rknn"),
+        "tokenizer_path":   str(d / "Qwen3.5-4B-llm.tokenizer.gguf"),
+        "embed_path":       str(d / "Qwen3.5-4B-llm.embed.bin"),
     }
 
 
@@ -732,8 +648,6 @@ class SystemLanguageModel:
     - ``qwen3_1_7b()``           — Qwen3-1.7B
     - ``qwen3_8b()``             — Qwen3-8B (pure text) bound to
                                     ``/userdata/models/Qwen3-8B``
-    - ``qwen3_5_4b()``           — Qwen3.5-4B (pure text) bound to
-                                    ``$WDNAI_MODELS_DIR/Qwen3.5-4B``
     - ``qwen2_5_vl_3b()``        — Qwen2.5-VL-3B (image)
     - ``qwen2_5_vl_7b()``        — Qwen2.5-VL-7B (image)
     - ``qwen3_vl_2b()``          — Qwen3-VL-2B (image)
@@ -742,10 +656,15 @@ class SystemLanguageModel:
                                     (default ``/userdata/models/Qwen3-VL-4B``; override
                                      the root via ``WDNAI_MODELS_DIR`` or pin a custom
                                      path via ``WDNAI_QWEN3_VL_4B_DIR``)
-    - ``qwen3_5_vl_4b()``        — Qwen3.5-VL-4B (image) bound to
-                                    ``$WDNAI_MODELS_DIR/Qwen3.5-4B`` (shares
-                                     directory with text-only variant; vision
-                                     files carry the ``-VL`` suffix).
+    - ``qwen3_5_vl_4b()``        — Qwen3.5-VL-4B (image + text) bound to
+                                    ``$WDNAI_MODELS_DIR/Qwen3.5-4B``
+                                    (default ``/userdata/models/Qwen3.5-4B``;
+                                    override the root via ``WDNAI_MODELS_DIR``
+                                    or pin a custom path via
+                                    ``WDNAI_QWEN3_5_4B_VL_DIR``). Powers both
+                                    ``swcap_text_chat`` and
+                                    ``swcap_video_describe`` capabilities from
+                                    a single RKNN.
     - ``qwen3_tts()``            — Qwen3-TTS bound to ``/userdata/models/Qwen3-TTS``;
                                     the 4 ``.1828.rknn`` files are looked up inside
                                     that directory.
@@ -784,30 +703,17 @@ class SystemLanguageModel:
         return _qwen3_8b_spec().with_paths(**_default_qwen3_8b_paths())
 
     @classmethod
-    def qwen3_5_4b(cls) -> ModelSpec:
-        """Return a :class:`ModelSpec` pre-bound to the Qwen3.5-4B files.
-
-        Text-only LLM (no vision); the files are expected at
-        ``$WDNAI_MODELS_DIR/Qwen3.5-4B/`` (default
-        ``/userdata/models/Qwen3.5-4B/``; override the root with
-        ``WDNAI_MODELS_DIR`` or pin a custom path with
-        ``WDNAI_QWEN3_5_4B_DIR``). Missing files raise
-        :class:`FileNotFoundError` listing them. Distinct from
-        :meth:`qwen3_5_vl_4b` — the VLM-mode LLM is a *separate* RKNN
-        file with MRoPE baked in.
-        """
-        _verify_qwen3_5_4b_files()
-        return _qwen3_5_spec().with_paths(**_default_qwen3_5_4b_paths())
-
-    @classmethod
     def qwen3_5_vl_4b(cls) -> ModelSpec:
         """Return a :class:`ModelSpec` pre-bound to the Qwen3.5-VL-4B files.
 
-        Vision-language model (image-in, text-out). Files are expected
-        at ``$WDNAI_MODELS_DIR/Qwen3.5-4B/`` (same directory as the
-        text-only variant; the LLM/vision filenames carry the ``-VL``
-        suffix and ``vision_*`` prefix respectively). Override the
-        root with ``WDNAI_MODELS_DIR`` or pin a custom path with
+        Vision-language model (image-in, text-out) that also handles
+        pure-text inference — the VLM-mode LLM is a regular LLM with
+        MRoPE baked into the graph for image position encoding; without
+        vision tokens MRoPE reduces to standard positional encoding,
+        so this single RKNN powers both text-chat and video-describe
+        capabilities. Files are expected at
+        ``$WDNAI_MODELS_DIR/Qwen3.5-4B/``. Override the root with
+        ``WDNAI_MODELS_DIR`` or pin a custom path with
         ``WDNAI_QWEN3_5_4B_VL_DIR``. Missing files raise
         :class:`FileNotFoundError` listing them. Auto-discovers the
         optional 768×768 vision pair at construction time; the
@@ -815,7 +721,7 @@ class SystemLanguageModel:
 
         Sampling defaults follow
         ``examples/Qwen3_5_VL/cpp/main.cc``: ``top_k=1``, ``top_p=0.9``,
-        ``temperature=1.0``, ``repeat_penalty=1.0``,
+        ``temperature=1e-6``, ``repeat_penalty=1.0``,
         ``frequency_penalty=0.0``, ``presence_penalty=1.5``.
         """
         _verify_qwen3_5_4b_vl_files()
