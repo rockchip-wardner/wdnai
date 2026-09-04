@@ -1,20 +1,20 @@
-"""Qwen3-8B 推理示例 —— 纯文本总结。
+"""Qwen3-4B 推理示例 —— 纯文本总结。
 
-模型文件位于固定的本地路径 ``/userdata/models/Qwen3-8B/``：
+模型文件位于固定的本地路径 ``/userdata/models/Qwen3-4B/``：
 
-    Qwen3-8B.1828.rknn / .weight
-    Qwen3-8B.embed.bin
-    Qwen3-8B.tokenizer.gguf
+    Qwen3-4B.1828.rknn / .weight
+    Qwen3-4B.embed.bin
+    Qwen3-4B.tokenizer.gguf
 
 可通过环境变量更改根目录：
 
-    WDNAI_QWEN3_8B_DIR=/path/to/Qwen3-8B
+    WDNAI_QWEN3_4B_DIR=/path/to/Qwen3-4B
 
 Usage::
 
     .venv/bin/python examples/summarize_text.py
     .venv/bin/python examples/summarize_text.py --iter 3 --perf
-    .venv/bin/python examples/summarize_text.py --model-dir /opt/Qwen3-8B
+    .venv/bin/python examples/summarize_text.py --model-dir /opt/Qwen3-4B
 """
 from __future__ import annotations
 
@@ -76,7 +76,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--max-new-tokens", type=int, default=None,
                    help="覆盖 spec.options['max_new_tokens']（不传则用 preset 默认）")
     p.add_argument("--model-dir", type=Path, default=None,
-                   help="覆盖模型根目录；等价于 WDNAI_QWEN3_8B_DIR")
+                   help="覆盖模型根目录；等价于 WDNAI_QWEN3_4B_DIR")
     p.add_argument("--npu", type=int, default=None,
                    help="多卡场景下选第 K 张卡（0-based index）")
     p.add_argument("--perf", action="store_true",
@@ -96,8 +96,8 @@ async def main() -> None:
     )
 
     if args.model_dir:
-        os.environ["WDNAI_QWEN3_8B_DIR"] = str(args.model_dir)
-    model = SystemLanguageModel.qwen3_8b()
+        os.environ["WDNAI_QWEN3_4B_DIR"] = str(args.model_dir)
+    model = SystemLanguageModel.qwen3_4b()
     if args.max_new_tokens is not None:
         model = model.with_options(max_new_tokens=args.max_new_tokens)
 

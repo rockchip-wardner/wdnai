@@ -128,8 +128,8 @@ def _qwen3_spec(**overrides) -> ModelSpec:
     return ModelSpec(**base)
 
 
-def _qwen3_8b_spec(**overrides) -> ModelSpec:
-    base = dict(name="qwen3-8b", max_context_len=4096)
+def _qwen3_4b_spec(**overrides) -> ModelSpec:
+    base = dict(name="qwen3-4b", max_context_len=4096)
     base.update(overrides)
     return _qwen3_spec(**base)
 
@@ -361,7 +361,7 @@ def _qwen3_vl_4b_dir() -> Path:
     Override via the ``WDNAI_QWEN3_VL_4B_DIR`` env var (full path);
     fallback ``$WDNAI_MODELS_DIR/Qwen3-VL-4B`` (which itself defaults
     to ``/userdata/models/Qwen3-VL-4B`` when ``WDNAI_MODELS_DIR`` is
-    unset). Mirrors ``_qwen3_8b_dir`` so every model dir honors the
+    unset). Mirrors ``_qwen3_4b_dir`` so every model dir honors the
     same ``WDNAI_MODELS_DIR`` root — the wdnwebui 基础配置 page writes
     ``base.model_path`` into ``WDNAI_MODELS_DIR`` at boot, and the
     SDK must follow it for all presets, not just two of them.
@@ -442,36 +442,36 @@ def _verify_qwen3_vl_4b_files() -> None:
             )
 
 
-_QWEN3_8B_REQUIRED = (
-    "Qwen3-8B.1828.rknn",
-    "Qwen3-8B.weight",
-    "Qwen3-8B.embed.bin",
-    "Qwen3-8B.tokenizer.gguf",
+_QWEN3_4B_REQUIRED = (
+    "Qwen3-4B.1828.rknn",
+    "Qwen3-4B.weight",
+    "Qwen3-4B.embed.bin",
+    "Qwen3-4B.tokenizer.gguf",
 )
 
 
-def _qwen3_8b_dir() -> Path:
-    override = _os.environ.get("WDNAI_QWEN3_8B_DIR")
-    return Path(override) if override else _models_root() / "Qwen3-8B"
+def _qwen3_4b_dir() -> Path:
+    override = _os.environ.get("WDNAI_QWEN3_4B_DIR")
+    return Path(override) if override else _models_root() / "Qwen3-4B"
 
 
-def _default_qwen3_8b_paths() -> dict:
-    d = _qwen3_8b_dir()
+def _default_qwen3_4b_paths() -> dict:
+    d = _qwen3_4b_dir()
     return {
-        "rknn_path":      str(d / "Qwen3-8B.1828.rknn"),
-        "weight_path":    str(d / "Qwen3-8B.weight"),
-        "tokenizer_path": str(d / "Qwen3-8B.tokenizer.gguf"),
-        "embed_path":     str(d / "Qwen3-8B.embed.bin"),
+        "rknn_path":      str(d / "Qwen3-4B.1828.rknn"),
+        "weight_path":    str(d / "Qwen3-4B.weight"),
+        "tokenizer_path": str(d / "Qwen3-4B.tokenizer.gguf"),
+        "embed_path":     str(d / "Qwen3-4B.embed.bin"),
     }
 
 
-def _verify_qwen3_8b_files() -> None:
-    d = _qwen3_8b_dir()
-    missing = [f for f in _QWEN3_8B_REQUIRED if not (d / f).is_file()]
+def _verify_qwen3_4b_files() -> None:
+    d = _qwen3_4b_dir()
+    missing = [f for f in _QWEN3_4B_REQUIRED if not (d / f).is_file()]
     if missing:
         raise FileNotFoundError(
-            f"Qwen3-8B files missing under {d}: {missing}. "
-            f"Place the files there or set WDNAI_QWEN3_8B_DIR to point at a custom path."
+            f"Qwen3-4B files missing under {d}: {missing}. "
+            f"Place the files there or set WDNAI_QWEN3_4B_DIR to point at a custom path."
         )
 
 
@@ -606,7 +606,7 @@ def _qwen_2_5_omni_3b_dir() -> Path:
     Override via the ``WDNAI_QWEN_2_5_OMNI_3B_DIR`` env var (full path);
     fallback ``$WDNAI_MODELS_DIR/Qwen2.5-Omni-3B`` (which itself defaults
     to ``/userdata/models/Qwen2.5-Omni-3B`` when ``WDNAI_MODELS_DIR`` is
-    unset). Mirrors ``_qwen3_8b_dir`` so every model dir honors the same
+    unset). Mirrors ``_qwen3_4b_dir`` so every model dir honors the same
     ``WDNAI_MODELS_DIR`` root.
     """
     override = _os.environ.get("WDNAI_QWEN_2_5_OMNI_3B_DIR")
@@ -646,8 +646,8 @@ class SystemLanguageModel:
     - ``default``                — placeholder ``ModelSpec`` (no paths; for demos).
     - ``qwen2_5_0_5b()``         — Qwen2.5-0.5B-Instruct
     - ``qwen3_1_7b()``           — Qwen3-1.7B
-    - ``qwen3_8b()``             — Qwen3-8B (pure text) bound to
-                                    ``/userdata/models/Qwen3-8B``
+    - ``qwen3_4b()``             — Qwen3-4B (pure text) bound to
+                                    ``/userdata/models/Qwen3-4B``
     - ``qwen2_5_vl_3b()``        — Qwen2.5-VL-3B (image)
     - ``qwen2_5_vl_7b()``        — Qwen2.5-VL-7B (image)
     - ``qwen3_vl_2b()``          — Qwen3-VL-2B (image)
@@ -694,13 +694,13 @@ class SystemLanguageModel:
         return _qwen3_spec()
 
     @classmethod
-    def qwen3_8b(cls) -> ModelSpec:
-        """Return a :class:`ModelSpec` pre-bound to the Qwen3-8B files at
-        ``/userdata/models/Qwen3-8B/`` (override via ``WDNAI_QWEN3_8B_DIR``);
+    def qwen3_4b(cls) -> ModelSpec:
+        """Return a :class:`ModelSpec` pre-bound to the Qwen3-4B files at
+        ``/userdata/models/Qwen3-4B/`` (override via ``WDNAI_QWEN3_4B_DIR``);
         raises :class:`FileNotFoundError` listing any missing files.
         """
-        _verify_qwen3_8b_files()
-        return _qwen3_8b_spec().with_paths(**_default_qwen3_8b_paths())
+        _verify_qwen3_4b_files()
+        return _qwen3_4b_spec().with_paths(**_default_qwen3_4b_paths())
 
     @classmethod
     def qwen3_5_vl_4b(cls) -> ModelSpec:

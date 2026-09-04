@@ -46,9 +46,9 @@ name `wdnai`.
   (TTS audio bytes, decoded multimodal images, …).
 - `src/wdnai/model.py` — `ModelSpec` dataclass (paths + sampling +
   vocab + image_size + target/core_mask) + `SystemLanguageModel`
-  preset catalog: `qwen2_5_0_5b()`, `qwen3_1_7b()`, `qwen3_8b()`
-  (pure-text, binds to `/userdata/models/Qwen3-8B/`, overridable via
-  `WDNAI_QWEN3_8B_DIR`; raises `FileNotFoundError` listing missing
+  preset catalog: `qwen2_5_0_5b()`, `qwen3_1_7b()`, `qwen3_4b()`
+  (pure-text, binds to `/userdata/models/Qwen3-4B/`, overridable via
+  `WDNAI_QWEN3_4B_DIR`; raises `FileNotFoundError` listing missing
   files), `qwen2_5_vl_3b()` / `_7b()`, `qwen3_vl_2b()`,
   `qwen3_vl_4b_template()`, `qwen3_vl_4b()`,
   `qwen3_5_vl_4b()` (Qwen3.5-VL-4B; **vocab_size=248320**,
