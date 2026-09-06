@@ -8,7 +8,7 @@ SDK 在 backend 里解析成结构化的 :class:`~wdnai.grounding.BoundingBox`
 
 模型布局（与 ``examples/LocateAnything/cpp/main.cc`` 对齐）：
 
-    /userdata/models/LocateAnything/
+    /userdata/models/LocateAnything-3B/
         llm_LocateAnything.1828.rknn + .weight
         vision_LocateAnything.448x448.1828.rknn + .weight
         LocateAnything.embed.bin
@@ -17,11 +17,13 @@ SDK 在 backend 里解析成结构化的 :class:`~wdnai.grounding.BoundingBox`
 可用环境变量 ``WDNAI_MODELS_DIR`` 覆盖根目录，或
 ``WDNAI_LOCATE_ANYTHING_DIR`` 直接指向具体目录。
 
-执行：
+执行（默认读取本目录的 bus.jpg —— 与 detect_image.py 的 demo.jpg 同款套路；
+    按需 ``--image other.jpg`` 覆盖即可）：
 
+    .venv/bin/python .venv/src/wdnai/examples/locate_image.py
     .venv/bin/python .venv/src/wdnai/examples/locate_image.py \\
-        --image demo.jpg \\
-        --prompt "图里的红色汽车"
+        --image bus.jpg \\
+        --prompt "定位图里的公共汽车"
 """
 from __future__ import annotations
 
@@ -39,10 +41,11 @@ from wdnai.grounding import GroundingResult
 # --------------------------------------------------------------------------- #
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--image", required=True,
-                   help="输入图片路径（BGR 顺序，cv2.imread 解码）")
+    p.add_argument("--image", default="bus.jpg",
+                   help="输入图片路径（BGR 顺序，cv2.imread 解码；默认本目录下的 bus.jpg —— "
+                        "rknn3-model-zoo 的 LocateAnything 演示样张，作为本脚本的 canonical test image）")
     p.add_argument("--prompt", default="",
-                   help="grounding 查询，例如「图里的红色汽车」（默认空字符串；SDK 会按空 prompt 处理）")
+                   help="grounding 查询，例如「定位图里的公共汽车」（默认空字符串；SDK 会按空 prompt 处理）")
     p.add_argument("--max-new-tokens", type=int, default=1024,
                    help="LLM 最大生成 token 数（默认 1024）")
     p.add_argument("--npu", type=int, default=0,
@@ -63,7 +66,7 @@ async def main() -> None:
     except FileNotFoundError as e:
         sys.stderr.write(
             "[locate_image] LocateAnything 模型文件未就绪。"
-            "请把模型放到 $WDNAI_LOCATE_ANYTHING_DIR 或 $WDNAI_MODELS_DIR/LocateAnything 下，"
+            "请把模型放到 $WDNAI_LOCATE_ANYTHING_DIR 或 $WDNAI_MODELS_DIR/LocateAnything-3B 下，"
             "并确认 .1828.rknn / .weight / .embed.bin / .tokenizer.gguf 齐全。"
             f"\n  原始错误：{e}\n"
         )
