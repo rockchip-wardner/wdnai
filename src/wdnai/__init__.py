@@ -29,6 +29,7 @@ from .attachment import Attachment
 from .lm_output import LMOutput
 from .model import ModelSpec, SystemLanguageModel
 from .session import LLMSession
+from .backends.locate_anything import LocateAnythingBackend
 
 __all__ = [
     "BaseModel",
@@ -40,6 +41,7 @@ __all__ = [
     "ModelSpec",
     "SystemLanguageModel",
     "LLMSession",
+    "LocateAnythingBackend",
 ]
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
