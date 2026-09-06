@@ -322,7 +322,7 @@ def _locate_anything_spec(**overrides) -> ModelSpec:
         name="locate-anything",
         kind="grounding",
         variant="locate-anything",
-        vocab_size=151936,
+        vocab_size=152681,
         special_eos_id=151645,
         max_context_len=1024,
         image_size=448,
