@@ -308,6 +308,37 @@ def _qwen3_5_vl_spec(**overrides) -> ModelSpec:
     return ModelSpec(**base)
 
 
+def _locate_anything_spec(**overrides) -> ModelSpec:
+    """LocateAnything: grounding model (image-in, text-out with bbox coords).
+
+    Sampling parameters mirror ``examples/LocateAnything/cpp/main.cc``
+    ``SAMPLE_PARAMS`` defaults: ``max_new_tokens=1024``, ``top_k=1``,
+    ``top_p=0.9``, ``temperature=1e-6``, ``repeat_penalty=1.05``,
+    ``enable_thinking=False``. Near-greedy (1e-6) is required because
+    the model emits structured bounding-box tokens where temperature=1.0
+    would degrade to garbage; same reasoning as ``_qwen3vl_4b_spec``.
+    """
+    base = dict(
+        name="locate-anything",
+        kind="grounding",
+        variant="locate-anything",
+        vocab_size=151936,
+        special_eos_id=151645,
+        max_context_len=1024,
+        image_size=448,
+        options={
+            "max_new_tokens": 1024,
+            "top_k": 1,
+            "top_p": 0.9,
+            "temperature": 1e-6,
+            "repeat_penalty": 1.05,
+            "enable_thinking": False,
+        },
+    )
+    base.update(overrides)
+    return ModelSpec(**base)
+
+
 # --------------------------------------------------------------------------- #
 # Predefined paths: Qwen3-VL-4B lives at a fixed on-device location
 # (``/userdata/models/Qwen3-VL-4B/``). No network access is performed at any
@@ -636,6 +667,79 @@ def _verify_qwen_2_5_omni_3b_files() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# LocateAnything: grounding model (image-in, text-out with bbox coords).
+# File layout::
+#
+#     llm_LocateAnything.1828.rknn + .weight          (text LLM, RK1828 quant)
+#     vision_LocateAnything.448x448.1828.rknn + .weight  (448×448 vision encoder)
+#     LocateAnything.embed.bin                        fp16 (vocab_size × dim)
+#     LocateAnything.tokenizer.gguf                   GPT-2 BPE + ByteLevel
+#
+# The 448×448 vision pair is the only resolution shipped; ``image_size=448``
+# on the preset forces single-variant dispatch (no auto-discovery of
+# siblings in the backend — kept simple to mirror the C++ demo's
+# ``main.cc`` defaults).
+# --------------------------------------------------------------------------- #
+_LOCATE_ANYTHING_REQUIRED = (
+    "llm_LocateAnything.1828.rknn",
+    "llm_LocateAnything.weight",
+    "vision_LocateAnything.448x448.1828.rknn",
+    "vision_LocateAnything.448x448.weight",
+    "LocateAnything.embed.bin",
+    "LocateAnything.tokenizer.gguf",
+)
+
+
+def _locate_anything_dir() -> Path:
+    """Resolve the LocateAnything model directory.
+
+    Override via the ``WDNAI_LOCATE_ANYTHING_DIR`` env var (full path);
+    fallback ``$WDNAI_MODELS_DIR/LocateAnything`` (which itself defaults
+    to ``/userdata/models/LocateAnything`` when ``WDNAI_MODELS_DIR`` is
+    unset). Mirrors ``_qwen3_vl_4b_dir`` so every model dir honors the
+    same ``WDNAI_MODELS_DIR`` root.
+    """
+    override = _os.environ.get("WDNAI_LOCATE_ANYTHING_DIR")
+    return Path(override) if override else _models_root() / "LocateAnything"
+
+
+def _default_locate_anything_paths() -> dict:
+    """Return absolute paths to the LocateAnything files under the resolved directory."""
+    d = _locate_anything_dir()
+    return {
+        "rknn_path":          str(d / "llm_LocateAnything.1828.rknn"),
+        "weight_path":        str(d / "llm_LocateAnything.weight"),
+        "rknn_vision_path":   str(d / "vision_LocateAnything.448x448.1828.rknn"),
+        "weight_vision_path": str(d / "vision_LocateAnything.448x448.weight"),
+        "tokenizer_path":     str(d / "LocateAnything.tokenizer.gguf"),
+        "embed_path":         str(d / "LocateAnything.embed.bin"),
+    }
+
+
+def _verify_locate_anything_files() -> None:
+    """Raise :class:`FileNotFoundError` listing any missing LocateAnything files.
+
+    Required files (must be present): see ``_LOCATE_ANYTHING_REQUIRED``.
+    Path resolution is wrapped in ``try/except OSError`` so a malformed
+    ``WDNAI_LOCATE_ANYTHING_DIR`` (e.g. with embedded NUL or a path the
+    OS rejects) surfaces as a single descriptive ``FileNotFoundError``
+    rather than an obscure ``OSError`` from ``pathlib``.
+    """
+    try:
+        d = _locate_anything_dir()
+    except OSError as e:
+        raise FileNotFoundError(
+            f"LocateAnything directory resolution failed: {e}"
+        )
+    missing = [f for f in _LOCATE_ANYTHING_REQUIRED if not (d / f).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"LocateAnything files missing under {d}: {missing}. "
+            f"Place the files there or set WDNAI_LOCATE_ANYTHING_DIR to point at a custom path."
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Public catalog
 # --------------------------------------------------------------------------- #
 class SystemLanguageModel:
@@ -674,6 +778,11 @@ class SystemLanguageModel:
                                     root via ``WDNAI_MODELS_DIR`` or pin a custom path
                                     via ``WDNAI_QWEN_2_5_OMNI_3B_DIR``). The SDK
                                     auto-prepends ``<audio>`` to the user prompt.
+    - ``locate_anything()``     — LocateAnything (grounding, image→bbox) bound to
+                                    ``$WDNAI_MODELS_DIR/LocateAnything`` (default
+                                    ``/userdata/models/LocateAnything``; override the
+                                    root via ``WDNAI_MODELS_DIR`` or pin a custom path
+                                    via ``WDNAI_LOCATE_ANYTHING_DIR``).
     """
 
     #: Default placeholder (no paths; for the ``model=default`` syntax in demo_vlm)
@@ -886,3 +995,26 @@ class SystemLanguageModel:
             max_context_len=2048,
             **{**_default_qwen3_vl_embedding_2b_paths()},
         )
+
+    # ---- Grounding (bbox) ----------------------------------------------
+    @classmethod
+    def locate_anything(cls) -> ModelSpec:
+        """Return a :class:`ModelSpec` pre-bound to the LocateAnything files.
+
+        Grounding model (image-in, text-out with normalized bounding-box
+        coords). Files are expected at
+        ``$WDNAI_MODELS_DIR/LocateAnything/`` (default
+        ``/userdata/models/LocateAnything/`` when ``WDNAI_MODELS_DIR`` is
+        unset; override the root with ``WDNAI_MODELS_DIR`` or pin a custom
+        path with ``WDNAI_LOCATE_ANYTHING_DIR``). If any expected file is
+        missing a :class:`FileNotFoundError` is raised listing them.
+
+        Sampling defaults follow ``examples/LocateAnything/cpp/main.cc``
+        ``SAMPLE_PARAMS``: ``top_k=1``, ``top_p=0.9``, ``temperature=1e-6``,
+        ``repeat_penalty=1.05``, ``enable_thinking=False``. The
+        near-greedy temperature mirrors the rationale in
+        ``_qwen3vl_4b_spec``: structured bbox token output degrades at
+        higher values.
+        """
+        _verify_locate_anything_files()
+        return _locate_anything_spec().with_paths(**_default_locate_anything_paths())
