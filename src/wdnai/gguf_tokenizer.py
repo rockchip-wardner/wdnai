@@ -86,8 +86,18 @@ def load_tokenizer_from_gguf(gguf_path: str):
         "<img>", "</img>", "<IMG_CONTEXT>", "<image>",
         "</c>", "<switch>",
     ]
-    # Defensive: drop any token that isn't in the GGUF vocabulary
-    extra = [t for t in multimodal_tokens if t in vocab]
+    # Tokens already in the vocab register as ``additional_special_tokens``
+    # (the ByteLevel pre-tokenizer leaves them unsplit). Tokens not yet in
+    # the vocab — only ``<image>`` here — get added via ``add_tokens``,
+    # which extends the vocab and assigns a fresh ID. Both paths end up
+    # with the token registered in ``added_tokens_encoder`` so the Python
+    # tokenizer treats it as one ID instead of splitting it into ``<``,
+    # the inner word, ``>``.
+    in_vocab = [t for t in multimodal_tokens if t in vocab]
+    missing = [t for t in multimodal_tokens if t not in vocab]
+    extra = in_vocab
+    if missing:
+        tok_obj.add_tokens(missing)
 
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=tok_obj,
