@@ -84,6 +84,7 @@ def load_tokenizer_from_gguf(gguf_path: str):
         "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>",
         "<|image_pad|>", "<|video_pad|>",
         "<img>", "</img>", "<IMG_CONTEXT>", "<image>",
+        "</c>", "<switch>",
     ]
     # Defensive: drop any token that isn't in the GGUF vocabulary
     extra = [t for t in multimodal_tokens if t in vocab]
