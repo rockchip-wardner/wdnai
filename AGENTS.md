@@ -56,10 +56,23 @@ name `wdnai`.
   is a regular LLM with MRoPE baked into the graph for image position
   encoding, so it also handles pure-text inference from a single
   RKNN; 384×384 + 768×768 vision variants auto-discovered in the
-  model directory), `qwen3_tts()`, `qwen3_vl_embedding()` (retrieval
+  model directory),   `qwen3_tts()`, `qwen3_vl_embedding()` (retrieval
   embedding, no token generation, binds to
   `/userdata/models/Qwen3-VL-Embedding-2B/` and raises
-  `FileNotFoundError` listing missing files).
+  `FileNotFoundError` listing missing files),
+  `locate_anything()` (LocateAnything grounding model — image-in,
+  text-out with 0–1000 normalised bbox coords; binds to
+  `/userdata/models/LocateAnything/`, override via
+  `WDNAI_LOCATE_ANYTHING_DIR`; raises `FileNotFoundError` listing
+  missing files; capability key `swcap_grounding`).
+- `src/wdnai/grounding.py` — `@Generable` schemas for the
+  LocateAnything backend: `BoundingBox` (single `<box>` region with
+  `label` + 0–1000 normalised `x1`/`y1`/`x2`/`y2`) and
+  `GroundingResult(LMOutput)` (the top-level payload, adds
+  `boxes: List[BoundingBox]` + `text` (raw echoed grounding text)
+  + `level: Literal["Normal", "Warning"]`). Parses the
+  ``<ref>label</ref><box>(x1, y1, x2, y2)</box>`` spans the model
+  emits into structured fields.
   The `qwen3_vl_4b()` preset binds to
   `/userdata/models/Qwen3-VL-4B/` (overridable via
   `WDNAI_QWEN3_VL_4B_DIR`) and raises `FileNotFoundError` listing
@@ -106,7 +119,8 @@ name `wdnai`.
   expected IDs.
 - `src/wdnai/backends/__init__.py` — `build_backend(spec)` factory:
   `{"llm": TextBackend, "vlm": VLMBackend, "tts": TTSBackend,
-  "embedding": EmbeddingBackend}` registry (asr is loaded on demand).
+  "embedding": EmbeddingBackend, "grounding": LocateAnythingBackend}`
+  registry (asr is loaded on demand).
 - `src/wdnai/backends/embedding.py` — `EmbeddingBackend` (kind=
   "embedding"): loads llm/vision `.1828.rknn` + `.weight` + embed.bin
   + tokenizer under `WDNAI_MODELS_DIR/Qwen3-VL-Embedding-2B`, feeds
@@ -116,6 +130,21 @@ name `wdnai`.
   `embed_video_chunk(frames, text="")` returning L2-normalized
   2048-dim vectors (the LLM runs through the plain RKNN3Lite path,
   no token generation).
+- `src/wdnai/backends/locate_anything.py` — `LocateAnythingBackend`
+  (kind="grounding"): LocateAnything grounding model — pairs a
+  448×448 vision RKNN encoder with a text LLM RKNN running in
+  `llm_mode` (mirrors `examples/LocateAnything/cpp/main.cc`).
+  Pipeline: BGR→RGB→letterbox→NHWC uint8 → vision RKNN → fp16 patch
+  tokens packed into a single `RKNN3Image` → LLM `session_run` with
+  `enable_thinking=False` (grounding is non-thinking) → raw text
+  passed through `wdnai.utils._parse_locate_output` to split
+  ``<ref>label</ref><box>(x1,y1,x2,y2)</box>`` /
+  ``<ref>label</ref><box>(x,y)</box>`` spans into structured
+  `boxes` / `points` lists. Exposes `run_image(prompt, image,
+  *, max_new_tokens=1024)` returning `{"text", "boxes", "points"}`.
+  Required paths: `rknn_path` + `weight_path` + `rknn_vision_path`
+  + `weight_vision_path` + `tokenizer_path` + `embed_path`; vision
+  `image_size` must be a multiple of 14.
 - `src/wdnai/backends/_common.py` — shared RKNN plumbing:
   `StreamSink` (collects tokens / text / perf from streaming
   callback), `make_result_callback` / `make_tokenizer_callback` /
@@ -360,6 +389,75 @@ async with LLMSession(model=model) as sess:
         ...
 ```
 
+### 视觉定位 (LocateAnything)
+
+LocateAnything 是一个 grounding 模型（视觉定位）：单张图输入 → 模型回
+答带 ``<ref>label</ref><box>(x1, y1, x2, y2)</box>`` 标记的文本 + 0–1000
+归一化坐标的 ROI 列表。模型同时支持点定位（``<box>(x, y)</box>``）和
+框定位；SDK 解析后 `GroundingResult.boxes` 只收纳 4 坐标框，点定位落
+进 `points` 字段（在 `LocateAnythingBackend.run_image` 返回值中可见；
+通过 `LLMSession.respond(generating=GroundingResult)` 走标准
+`@Generable` 协议时只有 `boxes` 进入 schema，因为 `GroundingResult`
+刻意只声明了 `boxes` / `text` / `level` 三个字段，不污染坐标语义）。
+
+```python
+import cv2
+from wdnai import Attachment, LLMSession, SystemLanguageModel
+from wdnai.grounding import GroundingResult
+
+img = cv2.imread("demo.jpg")                    # BGR ndarray
+model = SystemLanguageModel.locate_anything()   # 默认绑 /userdata/models/LocateAnything/
+async with LLMSession(model=model, npu=0) as sess:
+    result = await sess.respond(
+        prompt="Locate the person in the image",
+        attachment=[Attachment(img)],            # 单图输入
+        generating=GroundingResult,             # 解析为 @Generable schema
+    )
+    print(result.boxes, result.text, result.level)
+    # result.boxes[0]  -> BoundingBox(label="person", x1=120, y1=80, x2=480, y2=720)
+    # result.text      -> 模型回显的原始文本（带 <ref>/<box> 标签）
+    # result.level     -> "Normal" | "Warning"
+    sess.reset()
+```
+
+### 输出 schema 形态
+
+grounding 链路定义在 `src/wdnai/grounding.py`（独立模块，**不**耦合
+`@Callable` 工具链路），由三个角色构成：
+
+- **`BoundingBox`** —— 单个 ``<box>`` 区域，5 个字段：
+  - `label: str` —— 目标类别名，对应模型输出的 ``<ref>label</ref>`` 标签文本；
+  - `x1` / `y1` / `x2` / `y2: float` —— ROI 左上 / 右下坐标，**0–1000
+    归一化**（pydantic `Field(ge=0, le=1000)` 硬约束，模型输出超界会被
+    schema 校验直接拒收）。
+
+- **`GroundingResult(LMOutput)`** —— grounding 顶层 payload。除了继承自
+  `LMOutput` 的 `attachment: List[Attachment]` slot 外，自身声明 3 个
+  字段：
+  - `boxes: List[BoundingBox]` —— 从模型输出中解析出的所有 ``<box>`` 区域；
+  - `text: str` —— 模型回显的原始 grounding 文本（含 ``<ref>`` /
+    ``<box>`` 标记，方便前端调试或回放原始输出）；
+  - `level: Literal["Normal", "Warning"]` —— 事件等级标签，常规观察为
+    `"Normal"`，异常 / 风险提示为 `"Warning"`（默认 `"Normal"`）。
+
+- **`LMOutput(BaseModel)`** —— 来自 `src/wdnai/lm_output.py` 的结构化
+  输出基类，自带 `attachment: List[Attachment]` slot（SDK 自动填充
+  二进制 payload，例如 TTS 音频字节、解码后的多模态图等）。
+
+**为什么 `GroundingResult` 继承 `LMOutput` 而不直接 `BaseModel`**：
+继承 `LMOutput` 是为了白嫖 `attachment` slot —— 这样 grounding 链路
+可以像 TTS 一样附加二进制标注（比如画好 bbox 的 JPEG overlay）而不
+需要新发明一个 carrier 类型。这跟 `TTSResult` / `Event` 的设计同构。
+如果改继承 `BaseModel`，就需要在 `GroundingResult` 里手抄一份
+`attachment` 字段并维护和 `LMOutput` 的双向赋值逻辑。
+
+**0–1000 归一化是协议层格式**：模型在训练阶段就是这么输出
+（与输入分辨率无关），调用方拿到后用
+`pixel = coord * (W or H) / 1000` 自乘到实际像素。**永远不要把
+归一化坐标当像素坐标存盘** —— 同一张 ROI 在 1920×1080 和 640×360
+下的像素位置完全不同，但归一化坐标是稳定的；落盘再乘回去几乎一定
+错（缩略图、crop、resize 都会偏）。
+
 ## 重要提示
 
 - **用中文回答**。
@@ -394,3 +492,19 @@ async with LLMSession(model=model) as sess:
 - **`npu` 与 `device_id` 互斥**：同时传 `LLMSession(..., npu=K, device_id=b"...")`
   直接抛 `ValueError`；`npu` 越界（>= `len(get_devices_id())`）抛
   `IndexError` 并把可用设备列表写进消息里（方便排查板上卡数变化）。
+
+## Known limits
+
+- **LocateAnything 多实例之间不共享 NPU 内部显存**：当前每个
+  `LocateAnythingBackend` 实例（每个 `LLMSession(model=locate_anything(),
+  npu=K)`）都各自 `load_rknn` + `init_runtime` 走完一遍流程，独立持
+  有一份 LLM + vision RKNN context（约几百 MB RKNN 内部 + 几 MB
+  `StreamSink` / tokenizer cache / embed table mmap）。同一 NPU 上
+  起两个 LocateAnything 实例会各占一份 NPU 内存预算，板上 8 GB 统一
+  内存吃紧；RKNN3 提供的"多进程共享同一份已加载模型"能力
+  （`/proc/<pid>/maps` 命中同一份 `.weight` mmap）尚未在本 SDK
+  落地，所以短期内多实例同卡复用需要外部调度（不同 NPU / 不同
+  process）来避免双份加载。后续如要支持，需要在 backend `__init__`
+  加一个 `share_with: Optional[LocateAnythingBackend] = None` 入参
+  把 `rknn_llm` / `rknn_vision` 句柄与目标实例合并持有，调用前再
+  做一次 mutex 串行化（与 `_llm_session_call_lock` 同源）。
