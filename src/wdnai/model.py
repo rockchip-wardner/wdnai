@@ -319,9 +319,9 @@ def _locate_anything_spec(**overrides) -> ModelSpec:
     would degrade to garbage; same reasoning as ``_qwen3vl_4b_spec``.
     """
     base = dict(
-        name="locate-anything",
+        name="LocateAnything-3b",
         kind="grounding",
-        variant="locate-anything",
+        variant="LocateAnything-3b",
         vocab_size=152681,
         special_eos_id=151645,
         max_context_len=1024,
