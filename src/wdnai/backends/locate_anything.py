@@ -102,12 +102,22 @@ class LocateAnythingBackend:
         self.rknn_vision = RKNN3Lite(verbose=spec.verbose)
         if self.rknn_vision.load_rknn(spec.rknn_vision_path, spec.weight_vision_path) != 0:
             raise RuntimeError(f"load_rknn (vision) failed: {spec.rknn_vision_path}")
+        # init_runtime for the vision graph — no llm_args / llm_callback
+        # needed because this isn't an LLM session. Same device as the
+        # LLM (per C++ LocateAnything demo: vision and LLM init on the
+        # same NPU device, shared via internal memory).
+        if self.rknn_vision.init_runtime(
+            target=spec.target,
+            core_mask=spec.core_mask,
+            device_id=resolved_device_id,
+        ) != 0:
+            raise RuntimeError("init_runtime (vision) failed")
 
         # Buffer reused across calls; populated in run_images.
         self._embeds_buf: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------ #
-    def run_images(self, prompt: str, images: List[np.ndarray], *, max_new_tokens: int = 1024) -> "GroundingResult":
+    def run_images(self, prompt: str, images: List[np.ndarray], **overrides: Any) -> "GroundingResult":
         """Run a single grounding inference and return a ``GroundingResult``.
 
         ``LLMSession._dispatch`` (session.py:302) always passes a list of
@@ -119,6 +129,8 @@ class LocateAnythingBackend:
         from rknn3lite.api import Float16, RKNN3Image  # type: ignore  # noqa: WPS433
         from ..grounding import BoundingBox, GroundingResult  # noqa: WPS433
         from ..utils import _parse_locate_output  # noqa: WPS433
+
+        max_new_tokens = overrides.get("max_new_tokens", 1024)
 
         if not images:
             raise ValueError("locate_anything: images must not be empty")
@@ -150,8 +162,13 @@ class LocateAnythingBackend:
 
         # 4. Reset sink, build full prompt, run LLM session.
         self.sink.reset()
+        # Use ``<image>`` (the C++ demo's placeholder). It is NOT in the
+        # GGUF vocabulary, so the Python tokenizer would split it into
+        # three BPE tokens; we registered it as an additional_special_token
+        # in gguf_tokenizer.py so it stays a single ID. The on-device LLM
+        # recognizes the same marker the C++ demo uses.
         full_prompt = "<image> " + prompt
-        ret, _stats = self.rknn_llm.session_run(
+        ret, stats = self.rknn_llm.session_run(
             inputs=[llm_img],
             prompt=full_prompt,
             enable_thinking=False,
