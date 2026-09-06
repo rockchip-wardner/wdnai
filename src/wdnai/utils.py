@@ -421,3 +421,90 @@ def extract_json(text: str) -> Optional[Union[Dict[str, Any], List[Any]]]:
         except (ValueError, SyntaxError):
             pass
     return None
+
+
+# --------------------------------------------------------------------------- #
+# LocateAnything token detokenizer + output parser (port of cpp/main.cc:67-244)
+# --------------------------------------------------------------------------- #
+def _locate_anything_token_to_piece(token: int) -> str:
+    """Map a LocateAnything special / coord token id to its rendered piece."""
+    pieces = {
+        151668: "<box>",
+        151669: "</box>",
+        151670: "<quad>",
+        151671: "</quad>",
+        151672: "<ref>",
+        151673: "</ref>",
+        151674: "<interval>",
+        151675: "</interval>",
+    }
+    piece = pieces.get(token)
+    if piece is not None:
+        return piece
+    if 151677 <= token <= 152677:
+        return f"<{token - 151677}>"
+    return ""
+
+
+def _parse_locate_output(answer: str) -> tuple[list[dict], list[dict]]:
+    """Parse ``<ref>label</ref><box><coords></box>`` spans; return ``(boxes, points)``."""
+    boxes: List[Dict[str, Any]] = []
+    points: List[Dict[str, Any]] = []
+
+    def parse_coord_token(text: str, pos: int):
+        if pos >= len(text) or text[pos] != "<":
+            return None
+        num_begin = pos + 1
+        num_end = num_begin
+        while num_end < len(text) and text[num_end].isdigit():
+            num_end += 1
+        if num_end == num_begin or num_end >= len(text) or text[num_end] != ">":
+            return None
+        return int(text[num_begin:num_end]), num_end + 1
+
+    def extract_label(text: str, box_pos: int) -> str:
+        ref_end = text.rfind("</ref>", 0, box_pos)
+        if ref_end < 0:
+            return ""
+        ref_begin = text.rfind("<ref>", 0, ref_end)
+        if ref_begin < 0:
+            return ""
+        label_start = ref_begin + len("<ref>")
+        if label_start > ref_end:
+            return ""
+        return text[label_start:ref_end]
+
+    pos = 0
+    while True:
+        pos = answer.find("<box>", pos)
+        if pos < 0:
+            break
+        coord_pos = pos + len("<box>")
+        coords: List[int] = []
+        while len(coords) < 4:
+            parsed = parse_coord_token(answer, coord_pos)
+            if parsed is None:
+                break
+            value, coord_pos = parsed
+            coords.append(value)
+        if answer.startswith("</box>", coord_pos):
+            label = extract_label(answer, pos)
+            if len(coords) == 4:
+                boxes.append({
+                    "label": label,
+                    "x1": coords[0],
+                    "y1": coords[1],
+                    "x2": coords[2],
+                    "y2": coords[3],
+                })
+            elif len(coords) == 2:
+                points.append({
+                    "label": label,
+                    "x": coords[0],
+                    "y": coords[1],
+                })
+            pos = coord_pos + len("</box>")
+        else:
+            pos += len("<box>")
+
+    return boxes, points
