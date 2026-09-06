@@ -1826,14 +1826,9 @@ def _set_locate_anything_output(backend, text: str):
     backend.rknn_llm.session_run = fake_session_run
 
 
-def _build_grounding_result(run_image_out):
-    """Wrap :py:meth:`LocateAnythingBackend.run_image` output as a ``GroundingResult``."""
-    from wdnai.grounding import BoundingBox, GroundingResult
-    return GroundingResult(
-        boxes=[BoundingBox(**b) for b in run_image_out["boxes"]],
-        text=run_image_out["text"],
-        level="Normal",
-    )
+def _build_grounding_result(run_images_out):
+    """Identity helper — :py:meth:`LocateAnythingBackend.run_images` already returns a ``GroundingResult``."""
+    return run_images_out
 
 
 def test_locate_anything_grounding_result_round_trip():
@@ -1848,7 +1843,7 @@ def test_locate_anything_grounding_result_round_trip():
     _set_locate_anything_output(backend, synthetic)
 
     img = np.zeros((480, 640, 3), dtype=np.uint8)
-    raw = backend.run_image("detect person", img)
+    raw = backend.run_images("detect person", [img])
     result = _build_grounding_result(raw)
 
     assert result.text == synthetic, f"text round-trip mismatch: {result.text!r}"
@@ -1863,7 +1858,6 @@ def test_locate_anything_grounding_result_round_trip():
 
     assert result.level == "Normal", f"level: {result.level!r}"
 
-    assert raw["points"] == []
     print("[locate_anything] grounding result round-trip OK")
 
 
@@ -1876,20 +1870,19 @@ def test_locate_anything_no_boxes_returns_empty_list():
     _set_locate_anything_output(backend, plain)
 
     img = np.zeros((480, 640, 3), dtype=np.uint8)
-    raw = backend.run_image("describe", img)
+    raw = backend.run_images("describe", [img])
     result = _build_grounding_result(raw)
 
     assert result.text == plain, f"text passthrough: {result.text!r}"
     assert result.boxes == [], f"want [] boxes, got {result.boxes!r}"
     assert result.level == "Normal"
-    assert raw["points"] == []
     print("[locate_anything] no-boxes → empty list OK")
 
 
 def test_locate_anything_session_reset_clears_state():
-    """Two consecutive ``run_image()`` calls. The second call must NOT
+    """Two consecutive ``run_images()`` calls. The second call must NOT
     carry any leftover text or tokens from the first call (or from manual
-    sink pollution) — ``run_image()``'s internal ``self.sink.reset()``
+    sink pollution) — ``run_images()``'s internal ``self.sink.reset()``
     is what guarantees the fresh state.
     """
     backend = _build_locate_anything_backend_for_test()
@@ -1897,8 +1890,8 @@ def test_locate_anything_session_reset_clears_state():
 
     first_text = "<ref>a</ref><box><10><20><30><40></box>"
     _set_locate_anything_output(backend, first_text)
-    r1 = backend.run_image("first", img)
-    assert r1["text"] == first_text, f"first call: {r1['text']!r}"
+    r1 = backend.run_images("first", [img])
+    assert r1.text == first_text, f"first call: {r1.text!r}"
     assert backend.sink.text == first_text
 
     backend.sink.tokens.extend([100, 101, 102, 103])
@@ -1908,16 +1901,16 @@ def test_locate_anything_session_reset_clears_state():
 
     second_text = "<ref>b</ref><box><50><60><70><80></box>"
     _set_locate_anything_output(backend, second_text)
-    r2 = backend.run_image("second", img)
+    r2 = backend.run_images("second", [img])
 
-    assert r2["text"] == second_text, (
-        f"reset failed — got {r2['text']!r}"
+    assert r2.text == second_text, (
+        f"reset failed — got {r2.text!r}"
     )
-    assert "STALE" not in r2["text"], (
-        f"stale state leaked into second result: {r2['text']!r}"
+    assert "STALE" not in r2.text, (
+        f"stale state leaked into second result: {r2.text!r}"
     )
-    assert "<ref>a</ref>" not in r2["text"], (
-        f"first-call text leaked into second result: {r2['text']!r}"
+    assert "<ref>a</ref>" not in r2.text, (
+        f"first-call text leaked into second result: {r2.text!r}"
     )
     assert 100 not in backend.sink.tokens, (
         "manual pollution tokens survived the reset"

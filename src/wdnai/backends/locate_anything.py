@@ -14,7 +14,7 @@ Mirrors ``examples/LocateAnything/cpp/main.cc``:
 from __future__ import annotations
 
 import ctypes
-from typing import Any, Dict, Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
 
@@ -33,7 +33,7 @@ class LocateAnythingBackend:
 
     On construction, runs ``load_rknn`` + ``init_runtime`` for both the
     LLM and the vision encoder, sets the ChatML template, and exposes
-    :py:meth:`run_image` for a single grounding inference.
+    :py:meth:`run_images` for a single grounding inference.
     """
 
     def __init__(
@@ -103,14 +103,26 @@ class LocateAnythingBackend:
         if self.rknn_vision.load_rknn(spec.rknn_vision_path, spec.weight_vision_path) != 0:
             raise RuntimeError(f"load_rknn (vision) failed: {spec.rknn_vision_path}")
 
-        # Buffer reused across calls; populated in run_image.
+        # Buffer reused across calls; populated in run_images.
         self._embeds_buf: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------ #
-    def run_image(self, prompt: str, image: np.ndarray, *, max_new_tokens: int = 1024) -> Dict[str, Any]:
-        """Run a single grounding inference and return ``{text, boxes, points}``."""
+    def run_images(self, prompt: str, images: List[np.ndarray], *, max_new_tokens: int = 1024) -> "GroundingResult":
+        """Run a single grounding inference and return a ``GroundingResult``.
+
+        ``LLMSession._dispatch`` (session.py:302) always passes a list of
+        images; we accept the list shape and consume ``images[0]`` to match
+        the C++ demo at ``examples/LocateAnything/cpp/main.cc`` (one image
+        per call). Raises ``ValueError`` on an empty list — LocateAnything
+        is single-image; multi-image callers should loop.
+        """
         from rknn3lite.api import Float16, RKNN3Image  # type: ignore  # noqa: WPS433
+        from ..grounding import BoundingBox, GroundingResult  # noqa: WPS433
         from ..utils import _parse_locate_output  # noqa: WPS433
+
+        if not images:
+            raise ValueError("locate_anything: images must not be empty")
+        image = images[0]
 
         # 1. Preprocess: BGR -> RGB -> letterbox -> NHWC uint8.
         from ..utils import bgr_to_rgb, letterbox_resize  # noqa: WPS433
@@ -132,7 +144,7 @@ class LocateAnythingBackend:
         llm_img.n_image = self._embeds_buf.shape[0]
         llm_img.image_width = self.spec.image_size
         llm_img.image_height = self.spec.image_size
-        llm_img.image_start = b""
+        llm_img.image_start = b"<img>"
         llm_img.image_end = b"</img>"
         llm_img.image_content = b"<IMG_CONTEXT>"
 
@@ -149,8 +161,21 @@ class LocateAnythingBackend:
             raise RuntimeError(f"session_run failed: ret={ret}")
 
         text = self.sink.text
-        boxes, points = _parse_locate_output(text)
-        return {"text": text, "boxes": boxes, "points": points}
+        boxes, _points = _parse_locate_output(text)
+        bb_list: List[BoundingBox] = [
+            BoundingBox(
+                label=b["label"],
+                x1=float(b["x1"]),
+                y1=float(b["y1"]),
+                x2=float(b["x2"]),
+                y2=float(b["y2"]),
+            )
+            for b in boxes
+        ]
+        # points are dropped — GroundingResult has no field for them.
+        # (The C++ parser still detects 2-coord "<box>" spans, but the
+        # LocateAnything model in practice only emits 4-coord boxes.)
+        return GroundingResult(boxes=bb_list, text=text, level="Normal")
 
     # ------------------------------------------------------------------ #
     def close(self) -> None:
