@@ -66,6 +66,10 @@ R-C.png
 *.tmp
 .cache/
 
+# LocateAnything demo runtime output (regenerated on every run of
+# examples/locate_image.py; not a source artifact).
+examples/locate_anything_vis.jpg
+
 # ============================================================================ #
 # Test / coverage artifacts
 # ============================================================================ #
