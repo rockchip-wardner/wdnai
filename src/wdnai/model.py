@@ -694,13 +694,13 @@ def _locate_anything_dir() -> Path:
     """Resolve the LocateAnything model directory.
 
     Override via the ``WDNAI_LOCATE_ANYTHING_DIR`` env var (full path);
-    fallback ``$WDNAI_MODELS_DIR/LocateAnything`` (which itself defaults
-    to ``/userdata/models/LocateAnything`` when ``WDNAI_MODELS_DIR`` is
+    fallback ``$WDNAI_MODELS_DIR/LocateAnything-3B`` (which itself defaults
+    to ``/userdata/models/LocateAnything-3B`` when ``WDNAI_MODELS_DIR`` is
     unset). Mirrors ``_qwen3_vl_4b_dir`` so every model dir honors the
     same ``WDNAI_MODELS_DIR`` root.
     """
     override = _os.environ.get("WDNAI_LOCATE_ANYTHING_DIR")
-    return Path(override) if override else _models_root() / "LocateAnything"
+    return Path(override) if override else _models_root() / "LocateAnything-3B"
 
 
 def _default_locate_anything_paths() -> dict:
@@ -779,8 +779,8 @@ class SystemLanguageModel:
                                     via ``WDNAI_QWEN_2_5_OMNI_3B_DIR``). The SDK
                                     auto-prepends ``<audio>`` to the user prompt.
     - ``locate_anything()``     — LocateAnything (grounding, image→bbox) bound to
-                                    ``$WDNAI_MODELS_DIR/LocateAnything`` (default
-                                    ``/userdata/models/LocateAnything``; override the
+                                    ``$WDNAI_MODELS_DIR/LocateAnything-3B`` (default
+                                    ``/userdata/models/LocateAnything-3B``; override the
                                     root via ``WDNAI_MODELS_DIR`` or pin a custom path
                                     via ``WDNAI_LOCATE_ANYTHING_DIR``).
     """
@@ -1003,8 +1003,8 @@ class SystemLanguageModel:
 
         Grounding model (image-in, text-out with normalized bounding-box
         coords). Files are expected at
-        ``$WDNAI_MODELS_DIR/LocateAnything/`` (default
-        ``/userdata/models/LocateAnything/`` when ``WDNAI_MODELS_DIR`` is
+        ``$WDNAI_MODELS_DIR/LocateAnything-3B/`` (default
+        ``/userdata/models/LocateAnything-3B/`` when ``WDNAI_MODELS_DIR`` is
         unset; override the root with ``WDNAI_MODELS_DIR`` or pin a custom
         path with ``WDNAI_LOCATE_ANYTHING_DIR``). If any expected file is
         missing a :class:`FileNotFoundError` is raised listing them.
