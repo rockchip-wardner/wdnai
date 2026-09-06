@@ -1765,6 +1765,170 @@ def test_qwen3_5_vl_with_new_prompt_calls_crop_correctly():
 
 
 # --------------------------------------------------------------------------- #
+# LocateAnything grounding backend — mock-based end-to-end tests
+# --------------------------------------------------------------------------- #
+def _build_locate_anything_backend_for_test(num_tokens: int = 4, embed_dim: int = 64):
+    """Build a LocateAnythingBackend backed by mocked RKNN3Lite handles.
+
+    ``_install_mocks()`` only patches ``TextBackend.__init__`` /
+    ``VLMBackend.__init__`` — it never tracks the
+    ``LocateAnythingBackend`` LLM handle, so we register the sink to
+    ``rknn_llm._sinks`` by hand. ``rknn_vision.inference`` is also
+    overridden to return a synthetic ``(1, num_tokens, embed_dim)``
+    fp16 feature so the backend's NHWC→fp16 cast path runs without
+    complaining.
+    """
+    embed, tok_dir = _make_workspace()
+    _install_mocks(deepstack_n=0, vocab_size=64)
+
+    import wdnai.backends._common as common
+    import wdnai.backends.locate_anything as la_mod
+    la_mod.load_tokenizer = common.load_tokenizer
+    la_mod.load_embed_table = common.load_embed_table
+    la_mod.build_llm_callback = common.build_llm_callback
+
+    from wdnai.model import _locate_anything_spec
+    spec = _locate_anything_spec().with_paths(
+        rknn_path="/fake_llm.rknn3",
+        weight_path="/fake_llm.weight",
+        rknn_vision_path="/fake_v.rknn3",
+        weight_vision_path="/fake_v.weight",
+        tokenizer_path=tok_dir,
+        embed_path=embed,
+    )
+
+    from wdnai.backends.locate_anything import LocateAnythingBackend
+    backend = LocateAnythingBackend(spec)
+    backend.rknn_llm._sinks.append(backend.sink)
+
+    def fake_vision_inference(inputs=None, **kw):
+        return [np.zeros((1, num_tokens, embed_dim), dtype=np.float16)]
+    backend.rknn_vision.inference = fake_vision_inference
+
+    return backend
+
+
+def _set_locate_anything_output(backend, text: str):
+    """Replace ``rknn_llm.session_run`` so it injects ``text`` into the sink.
+
+    Mirrors what the C-side ``make_result_callback`` would do at the end
+    of a real run: extend the sink's token list with ASCII ord-of-char
+    ids (filtering out non-ASCII), then write the desired text verbatim
+    into ``sink.text``. Returns the ``(0, [stats])`` tuple the caller
+    expects from ``session_run``.
+    """
+    def fake_session_run(inputs=None, prompt=None, embeds=None, **kw):
+        tok = backend.tokenizer
+        ids = [ord(c) % tok._vocab for c in text if ord(c) < 128]
+        backend.sink.tokens.extend(ids)
+        backend.sink.text = text
+        return 0, [10, 5, 0.0, 0.001]
+    backend.rknn_llm.session_run = fake_session_run
+
+
+def _build_grounding_result(run_image_out):
+    """Wrap :py:meth:`LocateAnythingBackend.run_image` output as a ``GroundingResult``."""
+    from wdnai.grounding import BoundingBox, GroundingResult
+    return GroundingResult(
+        boxes=[BoundingBox(**b) for b in run_image_out["boxes"]],
+        text=run_image_out["text"],
+        level="Normal",
+    )
+
+
+def test_locate_anything_grounding_result_round_trip():
+    """Full pipeline: vision RKNN → LLM RKNN → text → ``_parse_locate_output``.
+
+    The synthetic model output ``<ref>person</ref><box><43><475><137><865></box>``
+    must parse to one ``BoundingBox`` with ``label="person"`` and the
+    four coords exactly as written.
+    """
+    backend = _build_locate_anything_backend_for_test()
+    synthetic = "<ref>person</ref><box><43><475><137><865></box>"
+    _set_locate_anything_output(backend, synthetic)
+
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+    raw = backend.run_image("detect person", img)
+    result = _build_grounding_result(raw)
+
+    assert result.text == synthetic, f"text round-trip mismatch: {result.text!r}"
+
+    assert len(result.boxes) == 1, f"want 1 box, got {len(result.boxes)}"
+    box = result.boxes[0]
+    assert box.label == "person", f"label: {box.label!r}"
+    assert box.x1 == 43, f"x1: {box.x1}"
+    assert box.y1 == 475, f"y1: {box.y1}"
+    assert box.x2 == 137, f"x2: {box.x2}"
+    assert box.y2 == 865, f"y2: {box.y2}"
+
+    assert result.level == "Normal", f"level: {result.level!r}"
+
+    assert raw["points"] == []
+    print("[locate_anything] grounding result round-trip OK")
+
+
+def test_locate_anything_no_boxes_returns_empty_list():
+    """A grounding call whose model response contains no ``<box>`` tags
+    must produce ``boxes=[]`` and pass the original text through verbatim.
+    """
+    backend = _build_locate_anything_backend_for_test()
+    plain = "no person detected in this image"
+    _set_locate_anything_output(backend, plain)
+
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+    raw = backend.run_image("describe", img)
+    result = _build_grounding_result(raw)
+
+    assert result.text == plain, f"text passthrough: {result.text!r}"
+    assert result.boxes == [], f"want [] boxes, got {result.boxes!r}"
+    assert result.level == "Normal"
+    assert raw["points"] == []
+    print("[locate_anything] no-boxes → empty list OK")
+
+
+def test_locate_anything_session_reset_clears_state():
+    """Two consecutive ``run_image()`` calls. The second call must NOT
+    carry any leftover text or tokens from the first call (or from manual
+    sink pollution) — ``run_image()``'s internal ``self.sink.reset()``
+    is what guarantees the fresh state.
+    """
+    backend = _build_locate_anything_backend_for_test()
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    first_text = "<ref>a</ref><box><10><20><30><40></box>"
+    _set_locate_anything_output(backend, first_text)
+    r1 = backend.run_image("first", img)
+    assert r1["text"] == first_text, f"first call: {r1['text']!r}"
+    assert backend.sink.text == first_text
+
+    backend.sink.tokens.extend([100, 101, 102, 103])
+    backend.sink.text = "STALE_LEFTOVER"
+    assert "STALE" in backend.sink.text
+    assert len(backend.sink.tokens) >= 4
+
+    second_text = "<ref>b</ref><box><50><60><70><80></box>"
+    _set_locate_anything_output(backend, second_text)
+    r2 = backend.run_image("second", img)
+
+    assert r2["text"] == second_text, (
+        f"reset failed — got {r2['text']!r}"
+    )
+    assert "STALE" not in r2["text"], (
+        f"stale state leaked into second result: {r2['text']!r}"
+    )
+    assert "<ref>a</ref>" not in r2["text"], (
+        f"first-call text leaked into second result: {r2['text']!r}"
+    )
+    assert 100 not in backend.sink.tokens, (
+        "manual pollution tokens survived the reset"
+    )
+    result = _build_grounding_result(r2)
+    assert result.boxes[0].label == "b"
+    assert result.boxes[0].x1 == 50
+    print("[locate_anything] session reset clears state OK")
+
+
+# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     test_text_qwen3()
     test_text_qwen25()
