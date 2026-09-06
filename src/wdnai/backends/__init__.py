@@ -6,6 +6,7 @@ from typing import Dict, Optional, Type, Union
 from ..model import ModelSpec
 from ._common import resolve_device_id
 from .embedding import EmbeddingBackend
+from .locate_anything import LocateAnythingBackend
 from .text import TextBackend
 from .tts import TTSBackend
 from .vlm import VLMBackend
@@ -15,6 +16,7 @@ _REGISTRY: Dict[str, Type] = {
     "vlm": VLMBackend,
     "tts": TTSBackend,
     "embedding": EmbeddingBackend,
+    "grounding": LocateAnythingBackend,
 }
 
 
@@ -53,6 +55,7 @@ def build_backend(
 
 __all__ = [
     "TextBackend", "VLMBackend", "TTSBackend", "EmbeddingBackend",
+    "LocateAnythingBackend",
     "OmniBackend", "ASRBackend",
     "build_backend", "resolve_device_id",
 ]
