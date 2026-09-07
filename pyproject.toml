@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wdnai"
-version = "0.3.1"
-description = "RK 芯片上的 LLM / VLM 访问 SDK（基于 rknn3-toolkit-lite）"
+version = "0.4.0"
+description = "RK 芯片上的 LLM / VLM 访问 SDK（基于 librknn3 的 ctypes 直连）"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }

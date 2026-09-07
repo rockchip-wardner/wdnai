@@ -1,27 +1,35 @@
 # AGENTS.md
 
 Quick reference for OpenCode sessions working on the `wdnai` SDK. The
-project is a Python wrapper around rknn3lite for **LLM / VLM / TTS**
-inference on Rockchip NPUs (RK1828); import name `wdnai`, distribution
-name `wdnai`.
+project is a Python wrapper around librknn3 (`/usr/lib/librknn3_api.so`)
+for **LLM / VLM / TTS** inference on Rockchip NPUs (RK1828); import
+name `wdnai`, distribution name `wdnai`.
 
 > Vendored in-tree as `.venv/src/wdnai/` (editable install from
 > `git@10.10.10.10/wardner/wdnai.git`). It is *not* on PyPI. See
 > `wdnwebui/AGENTS.md` "One-time setup" for the install command.
 
+> **As of v0.4.x**, wdnai no longer depends on the `rknn3lite` Python
+> wheel. The vendored `wdnai/_librknn.py` is a ctypes shim that
+> mirrors the subset of `rknn3lite.api` the SDK actually exercises,
+> driven directly against librknn3. See
+> [`wdnai/_librknn.py`](#wdnaishim-library-binding) below.
+
 
 ## Repo map (one-line each)
 
-- `pyproject.toml` — package metadata (name=wdnai, version=0.1.1);
+- `pyproject.toml` — package metadata (name=wdnai, version=0.4.0);
   deps: `numpy>=1.23`, `transformers>=4.40`, `pydantic>=1.10`,
   `opencv-python>=4.5`, `gguf>=0.6`. Optional: `[lite]`
-  `opencv-python-headless`, `[dev]` `pytest`+`build`.
+  `opencv-python-headless`, `[dev]` `pytest`+`build`. **No runtime
+  dependency on `rknn3lite` / `rknn3-toolkit-lite`**: the SDK
+  talks to librknn3 directly via `wdnai._librknn`.
 - `src/wdnai/__init__.py` — public API: re-exports `Generable`,
   `Callable`, `Attachment`, `LMOutput`, `ModelSpec`,
   `SystemLanguageModel`, `LLMSession`, plus pydantic's `BaseModel`
-  / `Field`. Holds `__version__`. **Does not import `rknn3lite`** at
-  module top — that import only happens inside the backend modules
-  (see "Gotchas").
+  / `Field`. Holds `__version__`. **Does not import `rknn3lite`** —
+  the only RKNN3 access point is :mod:`wdnai._librknn`, which is
+  lazy-imported inside each backend's `__init__` (see "Gotchas").
 - `src/wdnai/attachment.py` — `Attachment(content, kind=…)`: unified
   carrier for `image` / `video` / `text` / `audio(bytes)`. BGR ndarray
   or list-of-BGR → image; string + `.mp4|.mov|.mkv|.avi|.webm|.flv`
@@ -147,20 +155,78 @@ name `wdnai`.
   `image_size` must be a multiple of 14.
 - `src/wdnai/backends/_common.py` — shared RKNN plumbing:
   `StreamSink` (collects tokens / text / perf from streaming
-  callback), `make_result_callback` / `make_tokenizer_callback` /
-  `make_embed_callback` (the three C callbacks `RKLLMCallback`
-  expects), `build_llm_callback`, `load_tokenizer` (`.gguf` →
-  `gguf_tokenizer.py`; otherwise `AutoTokenizer.from_pretrained`),
+  callback), `build_llm_callback` (wraps the shim's
+  `wdnai._librknn.build_llm_callback`), `load_tokenizer` (`.gguf`
+  → `gguf_tokenizer.py`; otherwise `AutoTokenizer.from_pretrained`),
   `load_embed_table` (mmap fp16 → reshape `(vocab_size, dim)`),
   ChatML template (`system\nYou are a helpful assistant.\n` /
   `user\n` / `\nassistant\n`), `build_llm_args` (merges
   `spec.options` into the `llm_args[0]` dict), `printf_perf`
   (Prefill / Generate / vision / total latency table).
+- `src/wdnai/_librknn.py` — **vendored ctypes shim for librknn3**.
+  Public surface: `RKNN3Lite` (mirrors the slice of
+  `rknn3lite.api.RKNN3Lite` wdnai uses), `RKNN3Image` /
+  `RKNN3Audio` / `RKNN3AuxTensorWrapper` (multimodal input structs
+  backends construct and pass to `session_run(inputs=...)`),
+  `Float16` (ctype alias for `uint16` storage used in
+  `ctypes.POINTER(Float16)` typing), `RKNN3TensorType` (IntEnum
+  used by the embedding backend), and `build_llm_callback` (the
+  builder that hides the C `RKLLMCallback` struct + CFUNCTYPE
+  trampolines — backends pass plain Python callables, the shim
+  pins the bound ``self`` via `ctypes.py_object` and rebuilds the
+  ctypes pointer dance internally). All other ctypes Structures
+  (`RKNN3TensorAttr`, `RKNN3CoreMemSize`, `RKNN3QueryCmd`,
+  `RKNN3LLMParam`, `RKNN3LLMInput`, …) and the C function
+  prototypes for `rknn3_init` / `rknn3_load_model_from_path` /
+  `rknn3_session_init` / `rknn3_session_run` / `rknn3_run` /
+  `rknn3_set_internal_mem` / … live in the same module but stay
+  private (names start with `_`). Library is loaded lazily
+  (`CDLL` only runs on the first `RKNN3Lite()` instantiation) so
+  `import wdnai` doesn't open the SO and init the NPU driver.
+  Style follows `rknn3_model_zoo/examples/Qwen3_5_VL/cpp/main.cc`
+  + `qwen3_5_vl.cc` (one librknn3 context per RKNN model, plain
+  `rknn3_run` for vision / embedding, `rknn3_session_init` +
+  `rknn3_session_run` for LLM mode).
 - `src/wdnai/backends/text.py` — `TextBackend`: loads `rknn` +
   `weight`, init_runtime with the LLMM-mode callback, `apply_chat_template`,
   exposes `run(prompt, **overrides)`. Overrides `max_new_tokens` /
   `enable_thinking` / `keep_history` are passed straight to
-  `rknn.session_run`.
+  `rknn.session_run` (the shim's session_run takes the same kwarg
+  names as rknn3lite did).
+- `src/wdnai/backends/vlm.py` — `VLMBackend`: one `RKNN3Lite` LLM
+  handle + **N** vision handles (one per discovered native resolution
+  variant). At init, `_load_vision_variants` calls
+  `_discover_vision_paths` to scan `spec.rknn_vision_path`'s directory
+  for every `<prefix>.<WxH>.1828.rknn` sibling. Qwen3-VL-4B ships
+  with both 384x384 (required) and 768x768 (optional) pairs; legacy
+  installations with a single `vision_<name>.1828.rknn` (no `<WxH>`
+  suffix) fall through to the single-file path. Each variant gets its
+  own `RKNN3Lite` context sharing the LLM's `device_id`. Variant-
+  dispatched preprocessing (`VARIANT_25VL="qwen2.5-vl"` vs
+  `VARIANT_3VL="qwen3-vl"`):
+  - `use_prune=True` → `qwen25vl_prune(...)` /
+    `qwen3vl_prune_single(...)` (2D feature, matches the example
+    scripts).
+  - `use_prune=False` → NHWC `(1, H, W, 3)`; Qwen3-VL full vision
+    model expects a 2-image stack (the "two-frame input" video mode),
+    so a single image is duplicated along axis 0.
+  **Per-call variant selection** (`_pick_variant`): the variant whose
+  `image_size` is closest to the first image's longest side wins; ties
+  broken by smaller size. All images in one call share one variant
+  (the LLM consumes a single `RKNN3Image` with concatenated tokens +
+  a single `image_width` / `image_height`); images that would prefer a
+  different variant are force-fit to the chosen one with a warning.
+  **Image-to-variant resize** (`_preprocess_to_variant`) uses
+  `letterbox_resize(img, variant.image_size)` — never plain `cv2.resize`
+  — so the source aspect ratio is preserved and the shorter side is
+  filled with grey `(114,114,114)`. Crop ROIs (typically very wide
+  strips like a license-plate bbox) keep their character aspect ratio
+  through the second-stage OCR call. Outputs the vision feature →
+  `RKNN3Image` (vision tags set to `<|vision_start|>` / `<|vision_end|>`
+  / `<|image_pad|>`). Qwen3-VL
+  additionally concatenates 3 deepstack aux tensors (output indices
+  1..3) into `RKNN3AuxTensorWrapper`s with the chosen variant's
+  vision output's `aligned_size`.
 - `src/wdnai/backends/vlm.py` — `VLMBackend`: one `RKNN3Lite` LLM
   handle + **N** vision handles (one per discovered native resolution
   variant). At init, `_load_vision_variants` calls
@@ -208,7 +274,17 @@ name `wdnai`.
   in `_BUNDLED_SPEAKER_EMBEDDINGS_B64` so no external
   `qwen3tts_speaker_embed.h` is required. `run_text()` returns
   `(prompt_str, [Attachment])`; the SDK unpacks the tuple and
-  assigns the audio bytes to `LMOutput.attachment`.
+  assigns the audio bytes to `LMOutput.attachment`. The four RKNN
+  contexts each go through `rknn3_init` + `load_rknn` +
+  `model_init`; only `talker` and `code_predictor` get
+  `rknn3_session_init` (the LLM-mode pair). The four callbacks
+  (`_talker_result_callback`, `_talker_output_callback`,
+  `_talker_embed_callback`, `_cp_*` variants) are plain Python
+  callables built via `wdnai._librknn.build_llm_callback`; the
+  shim pins the bound `self` as userdata and dispatches the C-side
+  trampolines. `_LLM_RUN_NORMAL` / `_LLM_RUN_FINISH` etc. are
+  inlined as integer constants — we don't expose the shim's
+  IntEnum to keep this module independent.
 - `src/wdnai/models/README.md` — model file layout
   (`/userdata/models/<name>/`), `.1828.rknn` naming convention, the
   Qwen3-VL-4B / Qwen3-TTS file tables. The directory itself ships
@@ -295,6 +371,15 @@ name `wdnai`.
   调用（`LLMSession.__init__` 自身不触发 `get_devices_id()`，保持 RKNN3
   native driver 懒加载——与 `wdnwebui` 里 `WdnaiDetector._load_wdnai` 同源
   约束）。
+- **不要在 backend 里再手写 `ctypes`/`py_object`/CFUNCTYPE 那套**——
+  用 `wdnai._librknn.build_llm_callback(result_cb=…, tokenizer=…,
+  embeds_data=…, output_cb=…, embed_callback=…)` 即可。shim 会自动
+  把绑定方法的 `__self__` 用 `ctypes.py_object` 钉住，并 trampoline
+  C 侧的 `RKLLMResult` / `RKLLMCallback` 指针 ↔ Python list /
+  numpy view。如果非要直接接 ctypes 指针（例如要写 embed buffer），
+  让 callback 接受 `(userdata, tokens, embed_ptr: int, length: int)`
+  形态并用 `np.ctypeslib.as_array(cast(embed_ptr, POINTER(c_uint16)),
+  shape=(length//2,)).view(np.float16)` 自己包 view。
 
 ### 文本推理（LLM）
 
@@ -462,8 +547,9 @@ grounding 链路定义在 `src/wdnai/grounding.py`（独立模块，**不**耦�
 
 - **用中文回答**。
 - **除非我要求，否则不要自动 git commit**。
-- **不要把 `from rknn3lite.api import RKNN3Lite` 提到 `src/wdnai/__init__.py`
-  或 `backends/__init__.py` 顶部**。RKNN3 native libs 在 import 时会 init
+- **不要把 `from wdnai._librknn import RKNN3Lite` 提到 `src/wdnai/__init__.py`
+  或 `backends/__init__.py` 顶部**。`wdnai._librknn.load_library()`
+  在首次 `RKNN3Lite()` 实例化时会 `CDLL` 打开 librknn3 并 init
   NPU driver；在 `wdnwebui` 这种多模块共存的进程里和 `wdnav` 的 mpp init
   抢资源会 segfault。保持当前"只在具体 backend `__init__` / 私有方法内
   懒导入"的形态。

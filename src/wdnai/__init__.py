@@ -1,4 +1,9 @@
-"""wdnai — LLM / VLM / TTS access SDK for Rockchip NPUs (rknn3-toolkit-lite).
+"""wdnai — LLM / VLM / TTS access SDK for Rockchip NPUs (librknn3 ctypes).
+
+The SDK talks to librknn3 (`/usr/lib/librknn3_api.so`) directly via the
+vendored ctypes shim in :mod:`wdnai._librknn`; it does not depend on
+the ``rknn3lite`` / ``rknn3-toolkit-lite`` Python wheel. See AGENTS.md
+for the design notes.
 
 Quick start (Qwen3-VL image):
 
