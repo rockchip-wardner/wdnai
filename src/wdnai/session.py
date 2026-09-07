@@ -614,6 +614,7 @@ def _safe_schema(generating: Optional[Type[T]]) -> str:
     """
     if generating is None:
         return ""
+    schema = None
     try:
         schema = (
             generating.model_json_schema()
@@ -625,7 +626,31 @@ def _safe_schema(generating: Optional[Type[T]]) -> str:
             )
         )
     except Exception:
-        return ""
+        # ``LMOutput`` carries an ``attachment: List[Attachment]`` slot
+        # whose inner type is non-JSON-serializable. Drop that field
+        # and retry — emitting an empty ```json fence causes the
+        # NPU C library to choke on the bad input and throw
+        # ``std::bad_alloc`` during session_run. Filtering produces a
+        # usable schema for the structured-output fields only.
+        try:
+            field_names = list(
+                getattr(generating, "model_fields", {}).keys()
+            )
+            ann_clean = [
+                f for f in field_names
+                if f != "attachment"
+                and f in getattr(generating, "__annotations__", {})
+            ]
+            if ann_clean and len(ann_clean) < len(field_names):
+                ann = getattr(generating, "__annotations__", {})
+                from pydantic import create_model
+                generating_clean = create_model(
+                    generating.__name__ + "_SchemaOnly",
+                    **{k: (ann[k], ...) for k in ann_clean},
+                )
+                schema = generating_clean.model_json_schema()
+        except Exception:
+            return ""
     if not schema:
         return ""
     try:
