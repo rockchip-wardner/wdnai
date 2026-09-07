@@ -50,7 +50,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -199,7 +199,7 @@ class VLMBackend:
         npu: Optional[int] = None,
         device_id: Optional[Union[bytes, str]] = None,
     ):
-        from rknn3lite.api import RKNN3Lite  # type: ignore  # noqa: WPS433
+        from .._librknn import RKNN3Lite
 
         if not spec.rknn_llm_path or not spec.rknn_vision_path:
             raise ValueError(
@@ -257,6 +257,13 @@ class VLMBackend:
             raise RuntimeError("llm init_runtime failed")
         apply_chat_template(self.rknn_llm)
 
+        # Pin the vision feature tensor that backs ``RKNN3Image.image_embed``
+        # across ``_build_image_inputs`` calls. The ctypes pointer inside
+        # the struct is just an integer — without an extra reference the
+        # numpy buffer is freed the moment the helper returns and the
+        # driver reads garbage.
+        self._vision_embed_pin: List[np.ndarray] = []
+
     @staticmethod
     def _load_vision_variants(
         rknn_vision_path: str,
@@ -266,7 +273,7 @@ class VLMBackend:
         device_id,
         fallback_image_size: int,
     ) -> List[_VisionVariant]:
-        from rknn3lite.api import RKNN3Lite  # type: ignore  # noqa: WPS433
+        from .._librknn import RKNN3Lite
 
         discovered = _discover_vision_paths(rknn_vision_path)
         if not discovered:
@@ -425,7 +432,17 @@ class VLMBackend:
             nhwc = rgb.reshape(1, size, size, 3)
             if in_attr.shape[0] == 2:
                 nhwc = np.concatenate([nhwc, nhwc], axis=0)
-            return np.float16(nhwc)
+            # The model may expect uint8 (raw pixels, patch embedding
+            # happens inside the graph) or float16 (preprocessed
+            # embeddings). Match the queried input dtype so the model
+            # sees the bytes it was exported against.
+            from .._librknn import RKNN3TensorType
+            model_dtype = RKNN3TensorType(int(in_attr.dtype))
+            if model_dtype == RKNN3TensorType.RKNN3_TENSOR_UINT8:
+                nhwc = nhwc.astype(np.uint8)
+            else:
+                nhwc = nhwc.astype(np.float16)
+            return nhwc
 
         # Pruned / patchified path: 2-D input (num_patches, embed_dim).
         # ``qwen3vl_prune_single`` / ``qwen25vl_prune`` produce the
@@ -485,8 +502,10 @@ class VLMBackend:
         video frames at fixed source resolution — only touch one
         variant per call.
         """
-        from rknn3lite.api import (  # type: ignore  # noqa: WPS433
-            Float16, RKNN3Image, RKNN3AuxTensorWrapper,
+        from .._librknn import (
+            Float16,
+            RKNN3Image,
+            RKNN3AuxTensorWrapper,
         )
 
         if not image_bgr_list:
@@ -512,6 +531,7 @@ class VLMBackend:
             vision_latency_total += lat
 
             out0 = outs[0]
+            LOG.info("vlm: vision output[%d] shape=%s dtype=%s", idx, out0.shape, out0.dtype)
             # Most models emit a 2D (n_tokens, dim) tensor; add a batch dim if so
             if out0.ndim == 2:
                 out0 = np.expand_dims(out0, 0)
@@ -528,8 +548,15 @@ class VLMBackend:
 
         llm_img = RKNN3Image()
         llm_img.image_embed = features.ctypes.data_as(ctypes.POINTER(Float16))
-        llm_img.n_image_tokens = features.shape[1]
-        llm_img.n_image = features.shape[0]
+        # ``features`` is always packed as ``(batch, n_tokens, embed_dim)``
+        # (single image ⇒ ``(1, n_patches, dim)`` for Qwen3.5-VL's
+        # 2-D vision output; the original 1-D token-only path also goes
+        # through the ``expand_dims`` branch). The C-side
+        # ``n_image_tokens`` is the per-image token count; ``n_image`` is
+        # the batch count. Reading ``features.shape[0] / features.shape[1]``
+        # gives the right values for both layouts.
+        llm_img.n_image_tokens = features.shape[1] if features.ndim >= 2 else features.shape[0]
+        llm_img.n_image = features.shape[0] if features.ndim >= 3 else 1
         llm_img.image_width = chosen_variant.image_size
         llm_img.image_height = chosen_variant.image_size
         llm_img.image_start = "<|vision_start|>".encode("utf-8")
@@ -547,6 +574,13 @@ class VLMBackend:
                 aux.aux_data = np.concatenate(deepstack[i], axis=0)
                 aux.align_size = aligned
                 inputs.append(aux)
+
+        # ``llm_img.image_embed`` is a raw pointer into ``features``;
+        # without an extra reference the numpy array is garbage-collected
+        # the moment this method returns, and the driver reads freed
+        # memory. Pin until the next ``_build_image_inputs`` call (or
+        # session reset) clears the list.
+        self._vision_embed_pin = [features]
 
         prefix = "<image>" * len(image_bgr_list)
         return prefix, inputs, vision_latency_total
@@ -593,7 +627,7 @@ class VLMBackend:
         self, prompt: str, inputs, vision_latency: Optional[float], **overrides: Any,
     ):
         self.sink.reset()
-        kwargs = {"prompt": prompt}
+        kwargs: Dict[str, Any] = {"prompt": prompt}
         if inputs is not None:
             kwargs["inputs"] = inputs
         # Per-call overrides (max_new_tokens / enable_thinking / keep_history)
@@ -601,6 +635,13 @@ class VLMBackend:
             if k in overrides and overrides[k] is not None:
                 kwargs[k] = overrides[k]
         ret, stats = self.rknn_llm.session_run(**kwargs)
+        # Drop the vision feature pin once the LLM has consumed the
+        # embeddings; the pin exists so the numpy array survives until
+        # ``session_run`` reads the pointer, not for the lifetime of the
+        # process. Resetting here also frees the previous call's buffer
+        # in long-running video loops.
+        if inputs is not None:
+            self._vision_embed_pin.clear()
         if ret != 0:
             raise RuntimeError(f"llm session_run failed: ret={ret}")
         n_decode, n_prefill, llm_start, llm_end = stats

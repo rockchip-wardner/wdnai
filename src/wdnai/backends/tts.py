@@ -63,22 +63,18 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 
-try:
-    from rknn3lite.api import RKNN3Lite, RKLLMCallback  # noqa: WPS433
-    from rknn3lite.api.rknn3_types import (
-        LLMResultCallback,
-        LLMGetEmbedCallback,
-        LLMOutputCallback,
-        LLMCallState,
-    )
-except Exception as exc:  # pragma: no cover - import error path
-    raise SystemExit(
-        "rknn3lite package not installed. Please install the wheel under "
-        "rknn3-toolkit-lite/packages and rerun."
-    ) from exc
-
+from .._librknn import RKNN3Lite, build_llm_callback
 from ..attachment import Attachment
 from ._common import resolve_device_id
+
+# LLMCallState integer values used by the TTS callbacks below. Kept
+# inline so this module doesn't reach into the shim's internal
+# IntEnum; the values mirror rknn3_api.h.
+_LLM_RUN_NORMAL = 0
+_LLM_RUN_FINISH = 2
+_LLM_RUN_STOP = 3
+_LLM_RUN_MAX_NEW_TOKEN_REACHED = 4
+_LLM_RUN_ERROR = 5
 
 LOG = logging.getLogger("wdnai.backends.tts")
 
@@ -157,35 +153,19 @@ CODE_PREDICTOR_SAMPLING = {
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def _userdata_to_obj(ptr):
-    """Recover a Python object from a void* userdata pointer."""
-    return ctypes.cast(ptr, ctypes.POINTER(ctypes.py_object)).contents.value
-
-
-def _obj_to_userdata(obj):
-    """Return ``(void_ptr, anchor)``.
-
-    The returned ``py_object`` instance must stay alive as long as the
-    callback may be invoked; callers usually pin it as a class attribute.
-    """
-    holder = ctypes.py_object(obj)
-    return ctypes.cast(ctypes.pointer(holder), ctypes.c_void_p), holder
-
-
+# Helpers
+# --------------------------------------------------------------------------- #
 def _fp16_view(ptr, n_elems):
-    """Create a fp16 ``numpy`` view of a raw memory pointer."""
+    """Create a fp16 ``numpy`` view of a raw memory pointer.
+
+    Used by the embed callbacks below: the shim passes the C-side
+    ``embed_ptr`` as a Python int (the raw address) and ``length`` in
+    bytes; we wrap the address as a writable fp16 ndarray.
+    """
     return np.ctypeslib.as_array(
         ctypes.cast(ptr, ctypes.POINTER(ctypes.c_uint16)),
         shape=(n_elems,),
     ).view(np.float16)
-
-
-def _wrap_userdata(self, attr_name):
-    """Build a void* userdata that recovers ``self`` from the callback."""
-    ptr, holder = _obj_to_userdata(self)
-    if attr_name is not None:
-        setattr(self, attr_name, holder)
-    return ptr
 
 
 # --------------------------------------------------------------------------- #
@@ -797,11 +777,10 @@ class Qwen3TTSDriver:
         ret = self.code_predictor.load_rknn(str(rknn_path), str(weight_path))
         assert ret == 0, f"load code_predictor failed ({rknn_path}): {ret}"
 
-        cb = RKLLMCallback()
-        cb.result_callback = LLMResultCallback(self._cp_result_callback)
-        cb.result_userdata = _wrap_userdata(self, "_cp_userdata")
-        cb.embed_callback = LLMGetEmbedCallback(self._cp_embed_callback)
-        cb.embed_userdata = _wrap_userdata(self, "_cp_embed_userdata")
+        cb = build_llm_callback(
+            result_cb=self._cp_result_callback,
+            embed_callback=self._cp_embed_callback,
+        )
 
         args = [{
             "max_context_len": CODEC_MAX_CONTEXT_LEN,
@@ -862,15 +841,11 @@ class Qwen3TTSDriver:
         assert n_outputs == 2, f"talker: expected 2 outputs, got {n_outputs}"
         self._talker_output_tensors = output_tensors
 
-        cb = RKLLMCallback()
-        cb.result_callback = LLMResultCallback(self._talker_result_callback)
-        cb.result_userdata = _wrap_userdata(self, "_talker_result_userdata")
-        cb.embed_callback = LLMGetEmbedCallback(self._talker_embed_callback)
-        cb.embed_userdata = _wrap_userdata(self, "_talker_embed_userdata")
-        cb.output_callback = LLMOutputCallback(self._talker_output_callback)
-        cb.output_userdata = _wrap_userdata(self, "_talker_output_userdata")
-        cb.output_tensors = output_tensors
-        cb.n_output_tensors = n_outputs
+        cb = build_llm_callback(
+            result_cb=self._talker_result_callback,
+            embed_callback=self._talker_embed_callback,
+            output_cb=self._talker_output_callback,
+        )
 
         args = [{
             "max_context_len": QWEN3_TTS_MAX_CONTEXT_LEN,
@@ -887,69 +862,68 @@ class Qwen3TTSDriver:
     # ------------------------------------------------------------------ #
     # Callbacks
     # ------------------------------------------------------------------ #
-    def _talker_result_callback(self, userdata, result_ptr, state):
-        self = _userdata_to_obj(userdata)
+    # The shim's trampolines hand these callables Python objects:
+    # * result_cb(self, token_ids: List[int], state: int) -> int
+    # * embed_callback(self, token_ids: List[int], embed_ptr: int,
+    #                   length: int) -> int
+    # * output_cb(self, outputs: List[_TensorView], state: int) -> int
+    # ``self`` here is the bound backend instance (the shim pins it as
+    # the C-side userdata).
+    def _talker_result_callback(self, _self, tokens, state):
         state_val = int(state)
-        with self.lock:
-            self.talker_last_state = state_val
-            if state_val == int(LLMCallState.RKLLM_RUN_NORMAL):
-                self.talker_steps += 1
-            step = self.talker_steps
+        with _self.lock:
+            _self.talker_last_state = state_val
+            if state_val == _LLM_RUN_NORMAL:
+                _self.talker_steps += 1
+            step = _self.talker_steps
             if state_val in (
-                int(LLMCallState.RKLLM_RUN_FINISH),
-                int(LLMCallState.RKLLM_RUN_STOP),
-                int(LLMCallState.RKLLM_RUN_MAX_NEW_TOKEN_REACHED),
-                int(LLMCallState.RKLLM_RUN_ERROR),
+                _LLM_RUN_FINISH,
+                _LLM_RUN_STOP,
+                _LLM_RUN_MAX_NEW_TOKEN_REACHED,
+                _LLM_RUN_ERROR,
             ):
-                if state_val == int(LLMCallState.RKLLM_RUN_ERROR):
-                    self.talker_failed = True
-                if self._talker_done_event is not None:
-                    self._talker_done_event.set()
-        if state_val == int(LLMCallState.RKLLM_RUN_NORMAL):
-            n = result_ptr.contents.num_tokens
-            tokens = [int(result_ptr.contents.token_ids[i]) for i in range(n)]
-        elif state_val == int(LLMCallState.RKLLM_RUN_FINISH):
+                if state_val == _LLM_RUN_ERROR:
+                    _self.talker_failed = True
+                if _self._talker_done_event is not None:
+                    _self._talker_done_event.set()
+        if state_val == _LLM_RUN_NORMAL:
+            pass  # tokens ignored by the talker; we only track step count
+        elif state_val == _LLM_RUN_FINISH:
             print(f"[talker] FINISH, total steps={step}")
-        elif state_val == int(LLMCallState.RKLLM_RUN_STOP):
+        elif state_val == _LLM_RUN_STOP:
             print(f"[talker] STOP")
-        elif state_val == int(LLMCallState.RKLLM_RUN_MAX_NEW_TOKEN_REACHED):
+        elif state_val == _LLM_RUN_MAX_NEW_TOKEN_REACHED:
             print(f"[talker] MAX_NEW_TOKEN_REACHED, total steps={step}")
-        elif state_val == int(LLMCallState.RKLLM_RUN_ERROR):
+        elif state_val == _LLM_RUN_ERROR:
             print(f"[talker] ERROR")
         return 0
 
-    def _talker_output_callback(self, userdata, tensors, n_tensors, state):
+    def _talker_output_callback(self, _self, outputs, state):
         """Copy the talker's ``past_hidden`` (output index 1) back to host."""
-        self = _userdata_to_obj(userdata)
-        for i in range(n_tensors):
-            tensor_ptr = tensors[i]
-            if tensor_ptr.attr is None or tensor_ptr.mem is None:
+        for tv in outputs:
+            if tv.index != 1 or tv.data is None:
                 continue
-            attr = tensor_ptr.attr.contents
-            if attr.index != 1:
-                continue
-            view = _fp16_view(tensor_ptr.mem.contents.virt_addr, attr.n_elems)
-            with self.lock:
-                self.past_hidden = view.reshape(-1).copy()
+            with _self.lock:
+                _self.past_hidden = tv.data.reshape(-1).copy()
         return 0
 
-    def _talker_embed_callback(self, userdata, tokens_ptr, num_tokens, embed_ptr, length):
+    def _talker_embed_callback(self, _self, tokens, embed_ptr, length):
         """Build the next talker input embedding for ``num_tokens`` positions."""
-        self = _userdata_to_obj(userdata)
         dim = QWEN3_TTS_EMBED_DIM
 
+        num_tokens = len(tokens)
         expected_len = num_tokens * dim * np.dtype(np.float16).itemsize
         if length != expected_len:
             print(f"[talker embed] invalid buffer: got {length}, want {expected_len}")
             return -1
 
-        token_id = int(tokens_ptr[0])
+        token_id = int(tokens[0])
         if token_id < 0 or token_id >= TALKER_VOCAB_SIZE:
             token_id = 0
-        last_id_hidden = self.input_embed[token_id].astype(np.float32).copy()
+        last_id_hidden = _self.input_embed[token_id].astype(np.float32).copy()
 
-        with self.lock:
-            past_hidden = self.past_hidden
+        with _self.lock:
+            past_hidden = _self.past_hidden
         if past_hidden is None:
             print("[talker embed] past_hidden not yet available")
             return -1
@@ -958,25 +932,25 @@ class Qwen3TTSDriver:
             [past_hidden.astype(np.float32), last_id_hidden]
         ).astype(np.float16)
         code_input = code_input.reshape(1, 2, dim)
-        code_ids = self.run_code_predictor(code_input)
+        code_ids = _self.run_code_predictor(code_input)
 
         frame = [token_id] + [int(t) for t in code_ids]
-        with self.lock:
-            self.collected_codes.append(frame)
-            step = self.talker_steps
-        if self.frame_queue is not None:
-            self.frame_queue.put(frame)
+        with _self.lock:
+            _self.collected_codes.append(frame)
+            step = _self.talker_steps
+        if _self.frame_queue is not None:
+            _self.frame_queue.put(frame)
 
         next_embed = last_id_hidden.copy()
         for i, tid in enumerate(code_ids):
             tid = int(tid)
             if tid < 0 or tid >= CODEC_VOCAB_SIZE:
                 tid = 0
-            next_embed += self.codec_embed[i, tid].astype(np.float32)
+            next_embed += _self.codec_embed[i, tid].astype(np.float32)
 
-        with self.lock:
-            trailing = self.trailing_text_hiddens
-            pad = self.tts_pad_embed
+        with _self.lock:
+            trailing = _self.trailing_text_hiddens
+            pad = _self.tts_pad_embed
         idx = step - 1
         if trailing is not None and 0 <= idx < trailing.shape[0]:
             next_embed += trailing[idx].astype(np.float32)
@@ -987,39 +961,36 @@ class Qwen3TTSDriver:
         dst[:] = next_embed.astype(np.float16)
         return 0
 
-    def _cp_result_callback(self, userdata, result_ptr, state):
-        self = _userdata_to_obj(userdata)
-        if int(state) != int(LLMCallState.RKLLM_RUN_NORMAL):
+    def _cp_result_callback(self, _self, tokens, state):
+        if int(state) != _LLM_RUN_NORMAL:
             return 0
-        n = result_ptr.contents.num_tokens
-        tokens = [int(result_ptr.contents.token_ids[i]) for i in range(n)]
-        with self.lock:
-            self.code_predictor_out_ids.extend(tokens)
-            self.code_predictor_step += 1
+        with _self.lock:
+            _self.code_predictor_out_ids.extend(tokens)
+            _self.code_predictor_step += 1
         return 0
 
-    def _cp_embed_callback(self, userdata, tokens_ptr, num_tokens, embed_ptr, length):
+    def _cp_embed_callback(self, _self, tokens, embed_ptr, length):
         """Fill the code_predictor embed buffer from the codec embedding table."""
-        self = _userdata_to_obj(userdata)
         dim = QWEN3_TTS_EMBED_DIM
 
+        num_tokens = len(tokens)
         expected_len = num_tokens * dim * np.dtype(np.float16).itemsize
         if length != expected_len:
             return -1
 
-        with self.lock:
-            step = self.code_predictor_step
+        with _self.lock:
+            step = _self.code_predictor_step
 
         row = step - 1 if step > 0 else 0
-        if row >= self.codec_embed.shape[0]:
-            row = self.codec_embed.shape[0] - 1
+        if row >= _self.codec_embed.shape[0]:
+            row = _self.codec_embed.shape[0] - 1
 
         dst = _fp16_view(embed_ptr, num_tokens * dim)
-        for n in range(int(num_tokens)):
-            tid = int(tokens_ptr[n])
+        for i in range(num_tokens):
+            tid = int(tokens[i])
             if tid < 0 or tid >= CODEC_VOCAB_SIZE:
                 tid = 0
-            dst[n * dim:(n + 1) * dim] = self.codec_embed[row, tid]
+            dst[i * dim:(i + 1) * dim] = _self.codec_embed[row, tid]
         return 0
 
     # ------------------------------------------------------------------ #

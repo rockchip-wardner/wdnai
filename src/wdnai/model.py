@@ -121,7 +121,7 @@ def _qwen3_spec(**overrides) -> ModelSpec:
             "top_p": 0.9,
             "temperature": 0.7,
             "repeat_penalty": 1.0,
-            "enable_thinking": False,   # Qwen3 thinking-mode toggle (supported by rknn3lite.session_run)
+            "enable_thinking": False,   # Qwen3 thinking-mode toggle (passed to RKNN3Lite.session_run)
         },
     )
     base.update(overrides)

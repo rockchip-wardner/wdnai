@@ -46,7 +46,7 @@ class EmbeddingBackend:
         npu: Optional[int] = None,
         device_id: Optional[Union[bytes, str]] = None,
     ):
-        from rknn3lite.api import RKNN3Lite  # type: ignore
+        from .._librknn import RKNN3Lite
 
         if not spec.rknn_llm_path or not spec.rknn_vision_path:
             raise ValueError(
@@ -105,7 +105,11 @@ class EmbeddingBackend:
     def _vision_inference(self, frame_bgr: np.ndarray):
         import cv2
         from ..utils import letterbox_resize
-        input_attr = self.rknn_vision.get_inputs_tensor_attr()[0]
+        from .._librknn import RKNN3TensorType
+        rt = self.rknn_vision
+        if rt is None:
+            raise RuntimeError("vision runtime not initialised")
+        input_attr = rt.get_inputs_tensor_attr()[0]
         batch = int(input_attr.shape[0])
         h, w = int(input_attr.shape[1]), int(input_attr.shape[2])
         img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -118,10 +122,11 @@ class EmbeddingBackend:
         feature = img.reshape(1, h, w, 3)
         if batch == 2:
             feature = np.concatenate([feature, feature], axis=0)
-        from rknn3lite.api import RKNN3TensorType  # type: ignore
-        if input_attr.dtype != RKNN3TensorType.RKNN3_TENSOR_UINT8:
+        if input_attr.dtype != int(RKNN3TensorType.RKNN3_TENSOR_UINT8):
             feature = feature.astype(np.float16)
-        outputs = self.rknn_vision.inference(inputs=[feature])
+        outputs = rt.inference(inputs=[feature])
+        if outputs is None or len(outputs) == 0:
+            raise RuntimeError("vision inference returned no outputs")
         image_feature = np.float16(np.expand_dims(outputs[0], 0))
         deepstacks = [np.float16(outputs[i]) for i in (1, 2, 3)]
         return image_feature, deepstacks
@@ -167,7 +172,12 @@ class EmbeddingBackend:
                            deepstacks=None, image_mask=None) -> np.ndarray:
         inputs, fmt, _n_tokens = self._build_llm_inputs(
             prompt, video_feature, deepstacks, image_mask)
-        outs = self.rknn_llm.inference(inputs, data_format=fmt)
+        rt = self.rknn_llm
+        if rt is None:
+            raise RuntimeError("llm runtime not initialised")
+        outs = rt.inference(inputs, data_format=fmt)
+        if outs is None or len(outs) == 0:
+            raise RuntimeError("embedding llm inference returned no outputs")
         o = np.asarray(outs[0]).reshape(DIM).astype(np.float32)
         return _normalize_embedding(o)
 

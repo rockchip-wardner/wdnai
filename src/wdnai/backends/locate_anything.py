@@ -14,7 +14,7 @@ Mirrors ``examples/LocateAnything/cpp/main.cc``:
 from __future__ import annotations
 
 import ctypes
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import numpy as np
 
@@ -43,7 +43,7 @@ class LocateAnythingBackend:
         npu: Optional[int] = None,
         device_id: Optional[Union[bytes, str]] = None,
     ):
-        from rknn3lite.api import RKNN3Lite  # type: ignore
+        from .._librknn import RKNN3Lite  # vendored ctypes shim
 
         required = (
             ("rknn_path", spec.rknn_path),
@@ -113,7 +113,11 @@ class LocateAnythingBackend:
         ) != 0:
             raise RuntimeError("init_runtime (vision) failed")
 
-        # Buffer reused across calls; populated in run_images.
+        # Buffer reused across calls; pinned here so the ctypes pointer
+        # in ``RKNN3Image.image_embed`` survives until ``session_run``
+        # consumes it. Same lifetime concern as ``VLMBackend``: the
+        # pointer is just an integer and numpy GC would otherwise free
+        # the underlying buffer mid-call.
         self._embeds_buf: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------ #
@@ -126,7 +130,7 @@ class LocateAnythingBackend:
         per call). Raises ``ValueError`` on an empty list — LocateAnything
         is single-image; multi-image callers should loop.
         """
-        from rknn3lite.api import Float16, RKNN3Image  # type: ignore  # noqa: WPS433
+        from .._librknn import Float16, RKNN3Image  # vendored ctypes shim
         from ..grounding import BoundingBox, GroundingResult  # noqa: WPS433
         from ..utils import _parse_locate_output  # noqa: WPS433
 
@@ -176,6 +180,10 @@ class LocateAnythingBackend:
         )
         if ret != 0:
             raise RuntimeError(f"session_run failed: ret={ret}")
+        # Once ``session_run`` has consumed the embeddings, the buffer
+        # is no longer needed; drop the reference so a long video loop
+        # doesn't accumulate pin copies.
+        self._embeds_buf = None
 
         text = self.sink.text
         boxes, _points = _parse_locate_output(text)

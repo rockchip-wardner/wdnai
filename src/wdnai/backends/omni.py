@@ -141,7 +141,7 @@ class OmniBackend:
         npu: Optional[int] = None,
         device_id: Optional[Union[bytes, str]] = None,
     ):
-        from rknn3lite.api import RKNN3Lite  # type: ignore
+        from .._librknn import RKNN3Lite
 
         if not spec.omni_model_dir:
             raise ValueError(
@@ -256,8 +256,9 @@ class OmniBackend:
         the model's free-form text response. ``overrides`` are forwarded
         to ``rknn_llm.session_run`` (``max_new_tokens`` etc.).
         """
-        from rknn3lite.api.rknn3_types import (  # type: ignore
-            Float16, RKNN3Audio,
+        from .._librknn import (
+            Float16,
+            RKNN3Audio,
         )
 
         self.sink.reset()

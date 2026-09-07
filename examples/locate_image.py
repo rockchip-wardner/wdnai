@@ -260,18 +260,18 @@ def _query_attr(rknn_handle, cmd_input_num, cmd_output_attr, cmd_tensor_input, c
 def _resolve_device_id(npu: int):
     """Look up the PCI BDF / SoC id of the device the backend was bound to.
 
-    Falls back to ``"default"`` if no devices can be enumerated (e.g. on a
-    dev box where RKNN3 isn't available)."""
-    try:
-        from rknn3lite.api import RKNN3Lite  # noqa: WPS433
-        devices = RKNN3Lite().get_devices_id()
-        if 0 <= npu < len(devices):
-            dev = devices[npu]
-            if isinstance(dev, bytes):
-                dev = dev.decode("utf-8", errors="replace")
-            return dev
-    except Exception:
-        pass
+    Returns ``"default"`` when ``npu`` is out of range; the
+    ``RKNN3Lite().get_devices_id()`` call itself surfaces any real
+    driver / NPU initialisation failure (no silent fallback — running
+    this on a board without librknn3 available is a programmer error,
+    not a graceful-degradation case)."""
+    from wdnai._librknn import RKNN3Lite  # noqa: WPS433
+    devices = RKNN3Lite().get_devices_id()
+    if 0 <= npu < len(devices):
+        dev = devices[npu]
+        if isinstance(dev, bytes):
+            dev = dev.decode("utf-8", errors="replace")
+        return dev
     return "default"
 
 
@@ -291,7 +291,7 @@ def main() -> None:
     import cv2
     import numpy as np
 
-    from rknn3lite.api import (  # noqa: WPS433
+    from wdnai._librknn import (  # noqa: WPS433
         Float16,
         RKNN3Image,
         RKNN3QueryCmd,
@@ -325,10 +325,10 @@ def main() -> None:
     try:
         attrs = _query_attr(
             backend.rknn_vision,
-            RKNN3QueryCmd.RKNN3_QUERY_IN_OUT_NUM,
-            RKNN3QueryCmd.RKNN3_QUERY_OUTPUT_ATTR,
-            RKNN3QueryCmd.RKNN3_QUERY_INPUT_ATTR,
-            RKNN3QueryCmd.RKNN3_QUERY_OUTPUT_ATTR,
+            RKNN3QueryCmd.IN_OUT_NUM,
+            RKNN3QueryCmd.OUTPUT_ATTR,
+            RKNN3QueryCmd.INPUT_ATTR,
+            RKNN3QueryCmd.OUTPUT_ATTR,
         )
     except Exception:
         attrs = None

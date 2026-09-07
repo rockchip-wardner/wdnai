@@ -37,14 +37,21 @@ class _MockTokenizer:
 
 
 class _FakeTensorAttr:
-    def __init__(self, n_dims=4, shape=(1, 384, 384, 3), aligned_size=4096):
-        self.n_dims, self.shape, self.aligned_size = n_dims, shape, aligned_size
+    def __init__(self, n_dims=4, shape=(1, 384, 384, 3), aligned_size=4096, dtype=0):
+        self.n_dims, self.shape, self.aligned_size, self.dtype = n_dims, shape, aligned_size, dtype
 
 
 class _FakeRknn:
+    """Mock RKNN3Lite — replaces the vendored ``wdnai._librknn.RKNN3Lite``
+    for tests that don't have a real NPU.
+
+    The session_run contract is the same as :class:`wdnai._librknn.RKNN3Lite`:
+    ``(ret, [n_decode, n_prefill, llm_start, llm_end])``. The mock
+    writes the decoded text into the sink attached via the callback
+    bundle so ``_run_llm`` / ``run`` see it.
+    """
+
     # Class-level list of mock device IDs returned by ``get_devices_id()``.
-    # Tests that exercise the ``npu=`` path monkey-patch this to control
-    # what's resolvable via ``wdnai.backends.resolve_device_id``.
     mock_devices = [b"0001:11:00.0", b"0003:31:00.0", b"deadbeef"]
 
     def __init__(self, llm_mode=False, deepstack_n=0, vocab_size=64):
@@ -56,21 +63,25 @@ class _FakeRknn:
         self.last_prompt = None
         self.last_init_runtime_kwargs = None
         self.session_calls = 0
-        self._sinks = []
+        self._sinks: list = []
         self._tokenizer = _MockTokenizer(vocab_size)
+        # The shim's ``rknn_config`` is the user-mutable RKNN3Config struct.
+        from types import SimpleNamespace
+        self.rknn_config = SimpleNamespace()
+        self.rknn_config.user_mem_internal = 0
+        self.rknn_config.user_mem_weight = 0
 
     def load_rknn(self, *a, **kw): return 0
     def init_runtime(self, *a, **kw):
         self.last_init_runtime_kwargs = kw
         return 0
     def set_chat_template(self, *a, **kw): return 0
+    def clear_kvcache(self, *a, **kw): return 0
     def release(self): return 0
 
     def get_inputs_tensor_attr(self): return [self._in_attr]
     def get_outputs_tensor_attr(self): return [self._out_attr]
     def get_devices_id(self):
-        # Always returns a fresh list (real RKNN3Runtime is constructed
-        # and released each time, so each call is independent).
         return list(self.mock_devices)
 
     def inference(self, inputs=None, data_format=None):
@@ -87,7 +98,6 @@ class _FakeRknn:
         tok = self._tokenizer
         if self.llm_mode:
             ids = [ord(c) % tok._vocab for c in (prompt or "") if ord(c) < 128]
-            # 如果 prompt 里有 JSON Schema 提示词，就回 JSON 模拟"听话的模型"
             if "JSON Schema" in (prompt or ""):
                 text = '{"act": "run", "level": 2}'
             else:
@@ -98,73 +108,67 @@ class _FakeRknn:
             sink.text = text
         return 0, [10, 5, 0.0, 0.001]
 
-
-# --------------------------------------------------------------------------- #
-class _MockFactory:
-    """冒充 RKNN3Lite 的构造器：每次调用产生一个 _FakeRknn。"""
-
-    def __new__(cls, llm_mode=False, verbose=False, deepstack_n=0, vocab_size=64):
-        return _FakeRknn(llm_mode=llm_mode, deepstack_n=deepstack_n, vocab_size=vocab_size)
+    def rknn3_query(self, cmd, index=0): return 0
 
 
 # --------------------------------------------------------------------------- #
 def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
-    """把 rknn3lite + transformers + 关键 helper 全部 monkey-patch 成 mock。"""
-    import rknn3lite.api as api
+    """Mock wdnai._librknn.RKNN3Lite + transformers + key helpers.
+
+    Also rebinds ``build_llm_callback`` so the produced callback
+    bundle stashes the most-recently-created :class:`_FakeRknn` on
+    ``last_rknn['obj']`` (used by ``session_run`` to know which sink
+    to update).
+    """
     import wdnai.backends._common as common
     import wdnai.backends.text as text_mod
     import wdnai.backends.vlm as vlm_mod
+    import wdnai._librknn as librknn
 
     # ---- 1) RKNN3Lite 构造器：返回 _FakeRknn ----
     def make(llm_mode=False, verbose=False):
         return _FakeRknn(llm_mode=llm_mode, deepstack_n=deepstack_n, vocab_size=vocab_size)
-    api.RKNN3Lite = make
+    librknn.RKNN3Lite = make
 
-    # ---- 2) LLMResultCallback：吞掉 cffi 回调（结果由 session_run 同步写 sink） ----
-    from rknn3lite.api import LLMResultCallback
-    def noop_result_cb(sink):
-        def cb(userdata, result_ptr, state): return 0
-        return LLMResultCallback(cb)
-    common.make_result_callback = noop_result_cb
-
-    # ---- 3) Tokenizer / Embed 加载 ----
+    # ---- 2) Tokenizer / Embed 加载 ----
     common.load_tokenizer = lambda path: _MockTokenizer(vocab_size)
     common.load_embed_table = lambda path, vs: np.zeros((vs, 8), dtype=np.float16)
 
-    # ---- 4) 各后端模块里也都重新绑一遍（它们是 from import） ----
+    # ---- 3) 各后端模块里也都重新绑一遍（它们是 from import） ----
     text_mod.load_tokenizer = common.load_tokenizer
     text_mod.load_embed_table = common.load_embed_table
-    text_mod.make_result_callback = common.make_result_callback
     vlm_mod.load_tokenizer = common.load_tokenizer
     vlm_mod.load_embed_table = common.load_embed_table
-    vlm_mod.make_result_callback = common.make_result_callback
 
-    # ---- 5) build_llm_callback：构造完把 sink 注册到 rknn._sinks ----
-    orig_build_llm_cb = common.build_llm_callback
-    last_rknn = {"obj": None}
+    # ---- 4) build_llm_callback：返回的 bundle 把 sink 串到 rknn._sinks ----
+    # Strategy: build the real bundle (so result_cb gets called with
+    # ``(sink_, token_ids, state)``), then on the produced bundle
+    # append the sink to the most-recently-created ``_FakeRknn``'s
+    # ``_sinks`` list. ``session_run`` will then update sink.text
+    # exactly like the production shim's trampoline does.
+    last_rknn: dict = {"obj": None}
+    orig_build = common.build_llm_callback
 
-    # 关键：先设 last_rknn，再调原 __init__（build_llm_callback 在 __init__ 内部被调）
+    def hooked_build(tokenizer, embeds, sink):
+        bundle = orig_build(tokenizer, embeds, sink)
+        if last_rknn["obj"] is not None:
+            last_rknn["obj"]._sinks.append(sink)
+        return bundle
+    common.build_llm_callback = hooked_build
+    text_mod.build_llm_callback = hooked_build
+    vlm_mod.build_llm_callback = hooked_build
+
+    # ---- 5) backend __init__ monkey-patches: track "last created rknn" ----
     orig_text_init = text_mod.TextBackend.__init__
-    def h_text(self, spec):
-        last_rknn["obj"] = self.rknn  # 暂存 rknn，但 self.rknn 此刻还没创建
-        # 实际上 rknn 是在 __init__ 第一步建的，所以我们要拆开
-    text_mod.TextBackend.__init__ = h_text
 
-    # 改用更稳的方案：直接 monkey-patch build_llm_callback，让它用 rknn 引用闭包
-    # 把 rknn 的 _sinks 列表暴露成"全局最近一次构造的 rknn"
-    # —— 借助 text/vlm backend 的 __init__ 第一步 rknn 创建时机
-    orig_text_init = text_mod.TextBackend.__init__
-    def h_text2(self, spec, *, npu=None, device_id=None):
-        # 1) 先建 rknn（同步原 __init__ 的第一行）
-        from rknn3lite.api import RKNN3Lite  # 已被 monkey-patch
+    def h_text(self, spec, *, npu=None, device_id=None):
+        from wdnai._librknn import RKNN3Lite  # 已 monkey-patch 成 make()
         if not spec.rknn_path or not spec.weight_path:
             raise ValueError("missing path")
         self.rknn = RKNN3Lite(llm_mode=True, verbose=spec.verbose)
         if self.rknn.load_rknn(spec.rknn_path, spec.weight_path) != 0:
             raise RuntimeError("load failed")
-        # 2) 暂存，让后续 build_llm_callback 找得到
         last_rknn["obj"] = self.rknn
-        # 3) 跑剩下的初始化
         from wdnai.backends._common import (
             StreamSink, build_llm_args, apply_chat_template,
         )
@@ -172,8 +176,6 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
         self.embeds = text_mod.load_embed_table(spec.embed_path, spec.vocab_size)
         self.sink = StreamSink(tokenizer=self.tokenizer)
         cb = text_mod.build_llm_callback(self.tokenizer, self.embeds, self.sink)
-        # Use the real resolver so ``npu`` / ``device_id`` flow through
-        # identically to the unpatched backend.
         from wdnai.backends import resolve_device_id
         resolved = resolve_device_id(RKNN3Lite, npu, device_id)
         if self.rknn.init_runtime(
@@ -183,11 +185,12 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
         ) != 0:
             raise RuntimeError("init_runtime failed")
         apply_chat_template(self.rknn)
-    text_mod.TextBackend.__init__ = h_text2
+    text_mod.TextBackend.__init__ = h_text
 
     orig_vlm_init = vlm_mod.VLMBackend.__init__
+
     def h_vlm(self, spec, *, npu=None, device_id=None):
-        from rknn3lite.api import RKNN3Lite
+        from wdnai._librknn import RKNN3Lite
         if not spec.rknn_llm_path or not spec.rknn_vision_path:
             raise ValueError("missing path")
         self.spec = spec
@@ -196,12 +199,6 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
         vp = spec.rknn_vision_path
         if self.rknn_vision.load_rknn(vp, vp.replace(".rknn3", ".weight")) != 0:
             raise RuntimeError("vision load failed")
-        # Wrap the single mock vision RKNN into a one-element
-        # ``_vision_variants`` list so the multi-resolution-aware
-        # ``_pick_variant`` / ``_build_image_inputs`` code paths find
-        # it. Production ``VLMBackend.__init__`` builds the same list
-        # from directory discovery; the mock short-circuits to a single
-        # variant at ``spec.image_size``.
         from wdnai.backends.vlm import _VisionVariant
         self._vision_variants = [_VisionVariant(
             image_size=spec.image_size,
@@ -239,15 +236,6 @@ def _install_mocks(deepstack_n: int = 0, vocab_size: int = 64):
             raise RuntimeError("llm init failed")
         apply_chat_template(self.rknn_llm)
     vlm_mod.VLMBackend.__init__ = h_vlm
-
-    def hooked_build(tokenizer, embeds, sink):
-        cb = orig_build_llm_cb(tokenizer, embeds, sink)
-        if last_rknn["obj"] is not None:
-            last_rknn["obj"]._sinks.append(sink)
-        return cb
-    common.build_llm_callback = hooked_build
-    text_mod.build_llm_callback = hooked_build
-    vlm_mod.build_llm_callback = hooked_build
 
 
 # --------------------------------------------------------------------------- #
@@ -829,8 +817,8 @@ def test_preprocess_to_variant_dispatches_by_n_dims():
             # ``_preprocess_to_variant`` follows the runtime query,
             # not a preset config flag.
             if self._image_size == 384:
-                return [SimpleNamespace(n_dims=4, shape=(1, 384, 384, 3))]
-            return [SimpleNamespace(n_dims=2, shape=(2304, 1536))]
+                return [SimpleNamespace(n_dims=4, shape=(1, 384, 384, 3), dtype=0)]
+            return [SimpleNamespace(n_dims=2, shape=(2304, 1536), dtype=0)]
 
     v_384 = _VisionVariant(
         image_size=384, rknn=_StubRknn(), rknn_path="/f/384.rknn", weight_path="/f/384.weight",
@@ -959,7 +947,7 @@ def test_letterbox_resize_embeds_into_preprocess():
 
     class _StubRknn:
         def get_inputs_tensor_attr(self):
-            return [SimpleNamespace(n_dims=4, shape=(1, 384, 384, 3))]
+            return [SimpleNamespace(n_dims=4, shape=(1, 384, 384, 3), dtype=0)]
         def inference(self, inputs=None):
             return [np.zeros((1, 384, 384, 16), dtype=np.float16)]
 
@@ -1145,9 +1133,9 @@ def test_run_images_forwards_image_size():
     class _StubRknn:
         def get_inputs_tensor_attr(self):
             from types import SimpleNamespace
-            return [SimpleNamespace(n_dims=4, shape=(1, 384, 384, 3))]
+            return [SimpleNamespace(n_dims=4, shape=(1, 384, 384, 3), dtype=0)]
         def get_outputs_tensor_attr(self):
-            return [SimpleNamespace(aligned_size=4096)]
+            return [SimpleNamespace(aligned_size=4096, dtype=0)]
         def inference(self, inputs):
             return [np.zeros((1, 32), dtype=np.float32)]
 

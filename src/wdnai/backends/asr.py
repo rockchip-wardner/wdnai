@@ -45,8 +45,6 @@ from ._common import (
     StreamSink,
     load_embed_table,
     load_tokenizer,
-    make_embed_callback,
-    make_tokenizer_callback,
     printf_perf,
     resolve_device_id,
 )
@@ -193,10 +191,7 @@ class ASRBackend:
         npu: Optional[int] = None,
         device_id: Optional[Union[bytes, str]] = None,
     ):
-        from rknn3lite.api import RKNN3Lite, RKLLMCallback  # type: ignore
-        from rknn3lite.api.rknn3_types import (
-            RKNN3QueryCmd, RKNN3MemAllocFlags,
-        )
+        from .._librknn import RKNN3Lite, build_llm_callback
 
         if not spec.asr_model_dir:
             raise ValueError(
@@ -286,12 +281,11 @@ class ASRBackend:
         self.rknn_llm.rknn_config.user_mem_internal = 1
 
         self.sink = StreamSink(tokenizer=self.tokenizer)
-        cb = RKLLMCallback()
-        cb.result_callback = _make_result_callback(self)
-        cb.tokenizer_callback, cb.tokenizer_userdata = make_tokenizer_callback(
-            self.tokenizer
+        cb = build_llm_callback(
+            result_cb=_make_result_callback(self),
+            tokenizer=self.tokenizer,
+            embeds_data=self.embeds,
         )
-        cb.embed_callback, cb.embed_userdata = make_embed_callback(self.embeds)
         if self.rknn_llm.init_runtime(
             target=spec.target, core_mask=spec.core_mask,
             llm_args=self._build_llm_args(spec), llm_callback=cb,
@@ -325,38 +319,27 @@ class ASRBackend:
 
     # ------------------------------------------------------------------ #
     def _setup_shared_internal_mem(self) -> None:
-        """Allocate one ``RKNN3TensorMemory`` per NPU core and hand it to
-        both contexts via ``set_internal_mem``.
+        """Allocate one ``rknn3_tensor_mem*`` per NPU core and hand it
+        to both contexts via ``set_internal_mem``.
 
         Mirrors ``init_internal_share`` in cpp/qwen3_asr.cc. Each
         core's ``internal_size`` is ``max(audio_internal, llm_internal)``
         — without sharing, the LLM's pre-allocation would clip the
         audio encoder's working set.
-
-        ``RKNN3Lite.create_mem`` only accepts ``RKNN3TensorAttr``, so
-        we call the underlying ``lib.rknn3_create_mem`` directly with
-        ``(size, core_id, flags)`` to get a bare POINTER back.
         """
-        from rknn3lite.api.rknn3_types import (
-            RKNN3QueryCmd, RKNN3MemAllocFlags, RKNN3CoreMemSize,
-        )
+        # RKNN3 query command int values match rknn3_api.h:
+        #   13 = RKNN3_QUERY_CORE_NUMBER
+        #   6  = RKNN3_QUERY_CORE_MEM_SIZE
+        #   1  = RKNN3_FLAG_MEMORY_CACHEABLE
+        CMD_CORE_NUMBER = 13
+        CMD_CORE_MEM_SIZE = 6
+        FLAG_CACHEABLE = 1
 
         def _query_core_mems(handle):
-            core_num = int(handle.rknn3_query(
-                RKNN3QueryCmd.RKNN3_QUERY_CORE_NUMBER,
-            ))
+            core_num = int(handle.rknn3_query(CMD_CORE_NUMBER) or 0)
             if core_num <= 0:
                 return []
-            sizes = (RKNN3CoreMemSize * core_num)()
-            ret = handle.rknn_runtime.lib.rknn3_query(
-                handle.rknn_runtime.context,
-                int(RKNN3QueryCmd.RKNN3_QUERY_CORE_MEM_SIZE),
-                ctypes.cast(sizes, ctypes.c_void_p),
-                ctypes.c_size_t(ctypes.sizeof(sizes)),
-            )
-            if ret < 0:
-                raise RuntimeError(f"rknn3_query CORE_MEM_SIZE failed: ret={ret}")
-            return [(s.internal_size, s.core_id) for s in sizes]
+            return handle.rknn3_query(CMD_CORE_MEM_SIZE) or []
 
         audio_cores = _query_core_mems(self.rknn_audio)
         llm_cores = _query_core_mems(self.rknn_llm)
@@ -366,16 +349,13 @@ class ASRBackend:
             a = audio_cores[i] if i < len(audio_cores) else None
             l = llm_cores[i] if i < len(llm_cores) else None
             internal = max(
-                a[0] if a is not None else 0,
-                l[0] if l is not None else 0,
+                int(a.internal_size) if a is not None else 0,
+                int(l.internal_size) if l is not None else 0,
             )
             if internal <= 0:
                 shared.append(None)
                 continue
-            mem = self.rknn_llm.rknn_runtime.create_mem(
-                internal, i,
-                RKNN3MemAllocFlags.RKNN3_FLAG_MEMORY_CACHEABLE,
-            )
+            mem = self.rknn_llm.create_mem(internal, i, FLAG_CACHEABLE)
             if not mem:
                 raise RuntimeError(
                     f"create_mem failed for core {i} size={internal}"
@@ -793,20 +773,35 @@ class _OnlineDecoder:
 # --------------------------------------------------------------------------- #
 # Result callback — builds tokens into StreamSink as the LLM streams.
 # --------------------------------------------------------------------------- #
-def _make_result_callback(b: "ASRBackend"):
-    from rknn3lite.api import LLMCallState, LLMResultCallback  # type: ignore
+# LLMCallState values (mirroring rknn3lite's enum). Kept here as plain
+# ints so this module doesn't import the (now internal) shim IntEnum.
+_LLM_RUN_NORMAL = 0
+_LLM_RUN_WAITING = 1
+_LLM_RUN_FINISH = 2
+_LLM_RUN_STOP = 3
+_LLM_RUN_MAX_NEW_TOKEN_REACHED = 4
+_LLM_RUN_ERROR = 5
 
-    def _cb(userdata, result_ptr, state):
+
+def _make_result_callback(b: "ASRBackend"):
+    """Build the user-side ``result_cb`` callable for the ASR LLM.
+
+    Signature matches :func:`wdnai._librknn.build_llm_callback`:
+    ``(userdata, token_ids: List[int], state: int) -> int``. The shim
+    auto-pins ``b`` as userdata so we receive the backend instance
+    here.
+    """
+    def _cb(_userdata, new_tokens, state):
         s = int(state)
-        if s == int(LLMCallState.RKLLM_RUN_ERROR):
+        if s == _LLM_RUN_ERROR:
             b.sink.error = "inference error"
             return 0
-        if s == int(LLMCallState.RKLLM_RUN_WAITING):
+        if s == _LLM_RUN_WAITING:
             return 0
         if s in (
-            int(LLMCallState.RKLLM_RUN_FINISH),
-            int(LLMCallState.RKLLM_RUN_STOP),
-            int(LLMCallState.RKLLM_RUN_MAX_NEW_TOKEN_REACHED),
+            _LLM_RUN_FINISH,
+            _LLM_RUN_STOP,
+            _LLM_RUN_MAX_NEW_TOKEN_REACHED,
         ):
             try:
                 full = _decode_safe(b.sink.tokenizer, b.sink.tokens)
@@ -817,11 +812,7 @@ def _make_result_callback(b: "ASRBackend"):
                 b.sink.error = f"decode error: {exc}"
             b.sink.finished = True
             return 0
-        if s == int(LLMCallState.RKLLM_RUN_NORMAL):
-            n = result_ptr.contents.num_tokens
-            new_tokens = [
-                int(result_ptr.contents.token_ids[i]) for i in range(n)
-            ]
+        if s == _LLM_RUN_NORMAL:
             b.sink.tokens.extend(new_tokens)
             if b.sink.first_token_time is None:
                 b.sink.first_token_time = _time.perf_counter()
@@ -835,7 +826,7 @@ def _make_result_callback(b: "ASRBackend"):
                 pass
         return 0
 
-    return LLMResultCallback(_cb)
+    return _cb
 
 
 def _decode_safe(tokenizer, tokens: List[int]) -> str:

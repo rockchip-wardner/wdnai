@@ -1,13 +1,14 @@
 """Shared logic for all backends: tokenizer / embed / callbacks / streaming result sink."""
 from __future__ import annotations
 
-import ctypes
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+
+from .._librknn import build_llm_callback as _build_llm_callback_impl
 
 # Set the HF mirror at import time, matching the example scripts
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com/")
@@ -89,17 +90,31 @@ _STATE_FINISH = (2, 3, 4)
 _FINISH_MSG = {2: "Finished", 3: "Stop", 4: "Max new token reached"}
 
 
-def make_result_callback(sink: StreamSink):
-    """Build an LLMResultCallback the C library can invoke."""
-    from rknn3lite.api import LLMResultCallback  # type: ignore  # noqa: WPS433
+class _ResultCallbackAdapter:
+    """Bridges a :class:`StreamSink` to the shim's result callback contract.
 
-    def _cb(userdata, result_ptr, state):
-        if state == _STATE_ERROR:
+    The shim's :func:`wdnai._librknn.build_llm_callback` trampoline
+    auto-pins the bound method's ``__self__`` and invokes the callable
+    as ``cb(self, tokens, state)``. This adapter wraps the sink in a
+    small object so that the shim can pick up ``self = sink`` correctly
+    via ``__self__`` introspection, instead of treating the bare
+    closure as the userdata.
+    """
+
+    __slots__ = ("sink",)
+
+    def __init__(self, sink: StreamSink) -> None:
+        self.sink = sink
+
+    def __call__(self, _userdata, new_tokens, state):
+        sink = self.sink
+        s = int(state)
+        if s == _STATE_ERROR:
             sink.error = "inference error"
             return 0
-        if state == _STATE_WAITING:
+        if s == _STATE_WAITING:
             return 0
-        if state in _STATE_FINISH:
+        if s in _STATE_FINISH:
             if sink.tokens:
                 try:
                     full = _decode_safe(sink.tokenizer, sink.tokens)
@@ -109,11 +124,9 @@ def make_result_callback(sink: StreamSink):
                 except Exception as e:  # noqa: BLE001
                     sink.error = f"decode error: {e}"
             sink.finished = True
-            sink.perf["finish_state"] = state
+            sink.perf["finish_state"] = s
             return 0
-        if state == _STATE_NORMAL:
-            n = result_ptr.contents.num_tokens
-            new_tokens = [result_ptr.contents.token_ids[i] for i in range(n)]
+        if s == _STATE_NORMAL:
             sink.tokens.extend(new_tokens)
             if sink.first_token_time is None:
                 sink.first_token_time = time.perf_counter()
@@ -122,50 +135,20 @@ def make_result_callback(sink: StreamSink):
                 delta = full[len(sink.text):]
                 if delta:
                     sink.text += delta
-            except Exception:  # noqa: BLE001
-                # Trailing UTF-8 truncation; wait for the next chunk
+            except Exception:  # noqa: BLE001 — Trailing UTF-8 chunk
                 return 0
         return 0
 
-    return LLMResultCallback(_cb)
 
+def _make_sink_result_cb(sink: StreamSink):
+    """Build the user-side ``result_cb`` callable for ``build_llm_callback``.
 
-def make_tokenizer_callback(tokenizer) -> Tuple[Any, Any]:
-    from rknn3lite.api import LLMTokenizerCallback  # type: ignore
-
-    def _cb(userdata, text_ptr, text_len, tokens_ptr, n_tokens_max):
-        text = text_ptr.decode("utf-8")
-        inputs = tokenizer(text, return_tensors="np", truncation=True)
-        tokens = inputs["input_ids"][0][:n_tokens_max]
-        n = len(tokens)
-        if n <= 0:
-            return 0
-        for i in range(n):
-            tokens_ptr[i] = int(tokens[i])
-        return n
-
-    userdata = ctypes.py_object(tokenizer)
-    return LLMTokenizerCallback(_cb), ctypes.cast(ctypes.pointer(userdata), ctypes.c_void_p)
-
-
-def make_embed_callback(embeds_data: np.ndarray) -> Tuple[Any, Any]:
-    from rknn3lite.api import LLMGetEmbedCallback  # type: ignore
-
-    def _cb(userdata, tokens_ptr, num_tokens, embed, length):
-        embedding_dim = embeds_data.shape[1]
-        expected_len = num_tokens * embedding_dim * np.dtype(np.float16).itemsize
-        if length != expected_len:
-            return -1
-        dst = np.ctypeslib.as_array(
-            ctypes.cast(embed, ctypes.POINTER(ctypes.c_uint16)),
-            shape=(num_tokens * embedding_dim,),
-        ).view(np.float16)
-        tokens = [tokens_ptr[i] for i in range(num_tokens)]
-        dst[:] = embeds_data[tokens].ravel()
-        return 0
-
-    userdata = ctypes.py_object(embeds_data)
-    return LLMGetEmbedCallback(_cb), ctypes.cast(ctypes.pointer(userdata), ctypes.c_void_p)
+    Returns a bound method (via :class:`_ResultCallbackAdapter`) so the
+    shim can auto-pin the ``StreamSink`` as C-side userdata; a free
+    closure would be passed as the userdata itself and the C trampoline
+    would have no way to reach the sink.
+    """
+    return _ResultCallbackAdapter(sink).__call__
 
 
 # --------------------------------------------------------------------------- #
@@ -191,17 +174,24 @@ def load_embed_table(path: str, vocab_size: int) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# Assemble RKLLMCallback (result + tokenizer + embed)
+# Assemble the LLM callback bundle consumed by ``RKNN3Lite.init_runtime``.
+#
+# Returns an opaque ``_LLMCallbackBundle`` from :mod:`wdnai._librknn`;
+# the bundle's C-side trampoline reads each token from the C
+# ``RKLLMResult`` and writes into ``sink``.
 # --------------------------------------------------------------------------- #
 def build_llm_callback(tokenizer, embeds_data: np.ndarray, sink: StreamSink):
-    from rknn3lite.api import RKLLMCallback  # type: ignore
+    """Build the LLM callback bundle for ``init_runtime(llm_callback=...)``.
 
-    cb = RKLLMCallback()
-    cb.result_callback = make_result_callback(sink)
-    cb.result_userdata = None
-    cb.tokenizer_callback, cb.tokenizer_userdata = make_tokenizer_callback(tokenizer)
-    cb.embed_callback, cb.embed_userdata = make_embed_callback(embeds_data)
-    return cb
+    Kept as a function for source compatibility with the previous
+    rknn3lite version; the new shim handles ctypes userdata
+    marshalling internally.
+    """
+    return _build_llm_callback_impl(
+        result_cb=_make_sink_result_cb(sink),
+        tokenizer=tokenizer,
+        embeds_data=embeds_data,
+    )
 
 
 # --------------------------------------------------------------------------- #

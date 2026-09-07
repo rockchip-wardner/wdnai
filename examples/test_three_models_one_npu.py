@@ -1,5 +1,6 @@
 """Test whether 3 RKNN models (LLM + 384 vision + 768 vision) can coexist
-on a single RK1828 NPU via direct rknn3lite calls.
+on a single RK1828 NPU via direct librknn3 calls (through
+``wdnai._librknn``).
 
 Bypasses the wdnai SDK entirely. Goal: isolate whether the three
 ``init_runtime`` calls can succeed sequentially on one NPU, or
@@ -29,8 +30,9 @@ from pathlib import Path
 
 import numpy as np
 
-# rknn3lite lazy-load: imported lazily inside the test functions so the
-# import-side failure modes don't pollute the diagnostic output.
+# librknn3 / wdnai._librknn are imported lazily inside the test
+# functions so the import-side failure modes (NPU driver init) don't
+# pollute the diagnostic output when only --help is being requested.
 
 
 _DEFAULT_MODEL_DIR = "/userdata/models/Qwen3-VL-4B"
@@ -56,7 +58,7 @@ def _load_vision(
     device_id, role: str,
 ) -> int:
     """Vision variant: load + init_runtime. Returns init_runtime's ret."""
-    from rknn3lite.api import RKNN3Lite  # type: ignore
+    from wdnai._librknn import RKNN3Lite  # type: ignore  # noqa: WPS433
     rknn = RKNN3Lite()
     rc = rknn.load_rknn(rknn_path, weight_path)
     print(f"  [{role}] load_rknn({Path(rknn_path).name}) -> {rc}")
@@ -74,13 +76,10 @@ def _load_llm(
     device_id, role: str = "llm",
 ) -> int:
     """LLM: load + init_runtime with llm_args + llm_callback."""
-    from rknn3lite.api import (  # type: ignore
-        RKNN3Lite, RKLLMCallback, LLMResultCallback,
-        LLMTokenizerCallback, LLMGetEmbedCallback,
-    )
     # Match wdnai.backends._common.load_tokenizer: GGUF files go through
     # wdnai.gguf_tokenizer (custom parser), not AutoTokenizer.from_pretrained.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from wdnai._librknn import RKNN3Lite, build_llm_callback  # type: ignore  # noqa: E402,WPS433
     from wdnai.gguf_tokenizer import load_tokenizer_from_gguf  # type: ignore  # noqa: E402
 
     rknn = RKNN3Lite(llm_mode=True, verbose=False)
@@ -92,7 +91,7 @@ def _load_llm(
 
     # The qwen3-vl-4b LLM export uses these sample defaults (matching
     # ``wdnai.SystemLanguageModel.qwen3_vl_4b`` + the upstream
-    # rknn3-toolkit-lite example layout).
+    # rknn3_model_zoo example layout).
     llm_args = [{
         "max_new_tokens": 1024,
         "top_k": 1,
@@ -110,45 +109,15 @@ def _load_llm(
     tokenizer = load_tokenizer_from_gguf(tokenizer_path)
     embeds_data = np.fromfile(embed_path, dtype=np.float16).reshape(151936, -1)
 
-    # Minimal callbacks — enough for init_runtime; we never actually run.
-    def _noop_result_cb(_userdata, _result, _state):
-        return 0
-
-    def _tokenizer_cb(userdata, text_ptr, text_len, tokens_ptr, n_max):
-        tok = userdata.contents.value  # py_object round-trip
-        text = text_ptr.decode("utf-8")
-        ids = tok(text, return_tensors="np", truncation=True)["input_ids"][0][:n_max]
-        n = len(ids)
-        if n <= 0:
-            return 0
-        for i in range(n):
-            tokens_ptr[i] = int(ids[i])
-        return n
-
-    def _embed_cb(userdata, tokens_ptr, num_tokens, embed, length):
-        ed = userdata.contents.value
-        dim = ed.shape[1]
-        expected_len = num_tokens * dim * np.dtype(np.float16).itemsize
-        if length != expected_len:
-            return -1
-        dst = np.ctypeslib.as_array(
-            ctypes.cast(embed, ctypes.POINTER(ctypes.c_uint16)),
-            shape=(num_tokens * dim,),
-        ).view(np.float16)
-        dst[:] = ed[[tokens_ptr[i] for i in range(num_tokens)]].ravel()
-        return 0
-
-    cb = RKLLMCallback()
-    cb.result_callback = LLMResultCallback(_noop_result_cb)
-    cb.result_userdata = None
-
-    cb.tokenizer_callback = LLMTokenizerCallback(_tokenizer_cb)
-    tok_userdata = ctypes.py_object(tokenizer)
-    cb.tokenizer_userdata = ctypes.cast(ctypes.pointer(tok_userdata), ctypes.c_void_p)
-
-    cb.embed_callback = LLMGetEmbedCallback(_embed_cb)
-    ed_userdata = ctypes.py_object(embeds_data)
-    cb.embed_userdata = ctypes.cast(ctypes.pointer(ed_userdata), ctypes.c_void_p)
+    # Build the LLM callback bundle via the shim's helper. We pass a
+    # no-op ``result_cb`` so the C side has somewhere to write tokens
+    # to if we ever do call ``session_run`` (this test only exercises
+    # ``init_runtime``, never ``session_run``).
+    cb = build_llm_callback(
+        result_cb=lambda _userdata, _tokens, _state: 0,
+        tokenizer=tokenizer,
+        embeds_data=embeds_data,
+    )
 
     rc = rknn.init_runtime(
         target=target, core_mask=core_mask,
@@ -159,7 +128,7 @@ def _load_llm(
 
 
 def _resolve_device_id(npu: int | None):
-    from rknn3lite.api import RKNN3Lite  # type: ignore
+    from wdnai._librknn import RKNN3Lite  # type: ignore
     if npu is None:
         return None
     ids = RKNN3Lite().get_devices_id()

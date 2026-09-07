@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 from ._common import (
     StreamSink,
@@ -30,7 +30,7 @@ class TextBackend:
         npu: Optional[int] = None,
         device_id: Optional[Union[bytes, str]] = None,
     ):
-        from rknn3lite.api import RKNN3Lite  # type: ignore
+        from .._librknn import RKNN3Lite
 
         if not spec.rknn_path or not spec.weight_path:
             raise ValueError(
@@ -69,7 +69,7 @@ class TextBackend:
         """Run a single text inference and return the full text."""
         self.sink.reset()
         t0 = time.perf_counter()
-        kwargs = {"prompt": prompt}
+        kwargs: Dict[str, Any] = {"prompt": prompt}
         for k in ("max_new_tokens", "enable_thinking", "keep_history"):
             if k in overrides and overrides[k] is not None:
                 kwargs[k] = overrides[k]

@@ -29,13 +29,14 @@ def build_backend(
     """Pick the backend implementation based on ``spec.kind``.
 
     ``"asr"`` is loaded on demand — :mod:`wdnai.backends.asr` imports
-    rknn3lite at module load time, which segfaults on non-RK hosts.
+    :mod:`wdnai._librknn` (which loads librknn3) at module load time,
+    which segfaults on non-RK hosts.
 
     ``npu`` and ``device_id`` are NPU-selection hints forwarded to the
     backend constructor. They are mutually exclusive at the
     :class:`LLMSession` level; this factory just passes them through.
     Actual resolution against ``RKNN3Lite().get_devices_id()`` happens
-    inside each backend's ``__init__`` — keeping the RKNN3 native
+    inside each backend's ``__init__`` — keeping the librknn3 native
     driver init lazy and out of the way of any co-resident ``wdnav``
     process.
     """
