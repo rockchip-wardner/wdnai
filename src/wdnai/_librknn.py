@@ -991,14 +991,11 @@ class _Runtime:
 
     Mirrors the slice of rknn3lite's ``RKNN3Runtime`` that the wdnai
     backends actually touch (``lib``, ``context``, ``inputs``,
-    ``outputs``, ``set_shape``, ``get_inputs_tensor_attr``,
-    ``get_outputs_tensor_attr``, ``create_mem``, ``set_internal_mem``).
-    The omni backend also pokes at ``inputs[i].attr.contents`` after
-    calling :meth:`set_shape` (rknn3lite v1.0.4's stale-attr-cache
-    workaround) — to keep that pattern working we expose ``inputs``
-    as a list of mutable ``_RknnTensor`` structs whose ``attr``
-    pointer is a real ``POINTER(_TensorAttr)`` that Python can
-    dereference / mutate.
+    ``outputs``, ``set_shape``, ``create_mem``, ``set_internal_mem``).
+    :meth:`set_shape` re-queries fresh ``rknn3_query(INPUT_ATTR/OUTPUT_ATTR)``
+    and re-allocates the input/output buffers, so callers don't need
+    to re-query attrs after a shape switch (unlike the old rknn3lite
+    v1.0.4 wheel, which left ``inputs[i].attr`` stale).
     """
 
     def __init__(self, lib: ctypes.CDLL, target: str, device_id: Optional[bytes]):
@@ -1069,9 +1066,9 @@ class _Runtime:
         ``_RknnTensor`` arrays the user (or :meth:`inference`) reads.
 
         Idempotent: subsequent calls re-allocate (the previous
-        buffers are released first). The omni backend's
-        ``apply_audio_shape`` calls this indirectly via
-        :meth:`set_shape`.
+        buffers are released first). Called by :meth:`set_shape` on
+        every shape switch so the runtime always sees fresh
+        ``rknn3_query(INPUT_ATTR/OUTPUT_ATTR)`` values.
         """
         self._check_alive()
         self._release_user_mem()

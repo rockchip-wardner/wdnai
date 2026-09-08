@@ -10,9 +10,10 @@ rknn_qwen2_5_omni_audio_demo.py``)::
            →  raw text.
 
 The audio encoder is a dynamic-shape RKNN with two pre-exported shapes;
-``select_audio_shape`` picks the smallest one whose ``n_frame`` fits, and
-``apply_audio_shape`` patches ``rknn3lite`` v1.0.4's stale attr cache so
-the next ``run()`` actually sees the new shape.
+``select_audio_shape`` picks the smallest one whose ``n_frame`` fits,
+and ``apply_audio_shape`` switches the runtime's active shape (the
+vendored ``wdnai._librknn`` shim's ``set_shape`` already re-queries
+fresh attrs and re-allocates the input/output buffers).
 
 Unlike ASR, the LLM input is a free-form prompt string (with ``<audio>``
 auto-prepended) plus an ``RKNN3Audio`` struct injected via
@@ -71,49 +72,19 @@ def select_audio_shape(audio_length: int) -> int:
 
 
 def apply_audio_shape(rknn_audio, shape_id: int) -> None:
-    """Switch the audio RKNN runtime to ``shape_id`` and patch attr caches.
+    """Switch the audio RKNN runtime to ``shape_id``.
 
-    The ``rknn3lite`` Python wrapper (v1.0.4) has a bug where ``set_shape()``
-    updates ``shape_infos[]`` but NOT the runtime's cached
-    ``inputs[i].attr`` / ``outputs[i].attr`` ctypes structs. Without a
-    manual patch the next ``rknn3_run()`` fails with::
-
-        inputs[0].attr->dims[2] = 600, but shape_infos[1].input_attrs[0].dims[2] = 300
-
-    This function patches those attrs in-place from the freshly-returned
-    ``get_inputs_tensor_attr()`` / ``get_outputs_tensor_attr()`` queries,
-    which DO reflect the new shape.
+    The vendored ``wdnai._librknn`` shim's ``_Runtime.set_shape`` already
+    re-queries ``rknn3_query(INPUT_ATTR/OUTPUT_ATTR)`` and re-allocates
+    the input/output buffers for the new shape, so callers don't need
+    any extra attr-cache patching (unlike the old ``rknn3lite`` v1.0.4
+    wheel, which had a bug leaving ``inputs[i].attr`` stale after
+    ``set_shape`` — that workaround lived here before the shim port).
     """
     runtime = rknn_audio.rknn_runtime
     if runtime is None or getattr(runtime, "set_shape", None) is None:
         return
     runtime.set_shape(shape_id)
-    in_attrs = runtime.get_inputs_tensor_attr()
-    out_attrs = runtime.get_outputs_tensor_attr()
-    for i, src in enumerate(in_attrs):
-        dst = runtime.inputs[i].attr.contents
-        dst.n_dims = src.n_dims
-        for d in range(16):
-            dst.shape[d] = src.shape[d]
-        dst.n_elems = src.n_elems
-        dst.n_stride = src.n_stride
-        for d in range(17):
-            dst.stride[d] = src.stride[d]
-        dst.aligned_size = src.aligned_size
-        dst.dtype = src.dtype
-        dst.layout = src.layout
-    for i, src in enumerate(out_attrs):
-        dst = runtime.outputs[i].attr.contents
-        dst.n_dims = src.n_dims
-        for d in range(16):
-            dst.shape[d] = src.shape[d]
-        dst.n_elems = src.n_elems
-        dst.n_stride = src.n_stride
-        for d in range(17):
-            dst.stride[d] = src.stride[d]
-        dst.aligned_size = src.aligned_size
-        dst.dtype = src.dtype
-        dst.layout = src.layout
 
 
 def _build_padded_mask(actual_len: int, n_frame: int) -> np.ndarray:
