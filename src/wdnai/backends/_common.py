@@ -140,8 +140,16 @@ class _ResultCallbackAdapter:
         return 0
 
 
-def _make_sink_result_cb(sink: StreamSink):
-    """Build the user-side ``result_cb`` callable for ``build_llm_callback``.
+def make_result_callback(sink: StreamSink):
+    """Build the user-side ``result_cb`` callable for
+    :func:`build_llm_callback`.
+
+    Public hook — wdnwebui's ``chat_stream.py`` monkey-patches this to
+    inject a text-delta observer without modifying the SDK. The
+    returned callable has the shim's signature
+    ``(userdata, new_tokens: List[int], state: int) -> int``; the
+    stream sink is mutated in place (``.tokens``, ``.text``,
+    ``.error``, ``.finished``, ``.perf``).
 
     Returns a bound method (via :class:`_ResultCallbackAdapter`) so the
     shim can auto-pin the ``StreamSink`` as C-side userdata; a free
@@ -188,7 +196,7 @@ def build_llm_callback(tokenizer, embeds_data: np.ndarray, sink: StreamSink):
     marshalling internally.
     """
     return _build_llm_callback_impl(
-        result_cb=_make_sink_result_cb(sink),
+        result_cb=make_result_callback(sink),
         tokenizer=tokenizer,
         embeds_data=embeds_data,
     )
