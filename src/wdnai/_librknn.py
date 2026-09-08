@@ -1457,21 +1457,31 @@ class _LLMSession:
             isinstance(x, (RKNN3Image, RKNN3Audio)) for x in (inputs or [])
         )
 
-        # 1) Auxiliary inputs (deepstack, etc.) — kept in order
+        # ``rknn3_session_run`` 严格要求 ``inputs[0]`` 必须是
+        # multimodal（``RKNN3_LLM_INPUT_MULTIMODAL``），aux 必须
+        # 排在它后面 —— 看 C 库错误
+        # ``RKLLMSession: Please put the LLM input at the first
+        # position!``，以及 C++ 参考
+        # ``examples/Qwen3_VL/cpp/llm/rknn_qwen3_vl_llm.cc:174-180``
+        # 先 ``inputs[0].input_type = RKNN3_LLM_INPUT_MULTIMODAL``
+        # 再 ``for i in range(3) inputs[i+1].input_type = ...AUX``。
+        # 早期版本把 aux 排在前面，结果 C 库把首个 aux 当成 LLM
+        # input 校验失败 → ``ret=-1``。注释里说"double-prompt caused
+        # ret=-1"是把表面症状记成原因；真正原因是 inputs 顺序颠倒。
+        if has_multimodal:
+            for x in inputs:
+                if isinstance(x, (RKNN3Image, RKNN3Audio)):
+                    packed.append(self._pack_multimodal(x, prompt, enable_thinking))
+        # Auxiliary inputs (deepstack, etc.) — kept in order
+        # AFTER the multimodal. 严格按 vlm.py 构造顺序保留 aux 索引
+        # （vlm.py 给每个 aux 设 ``aux.index = 2 + i``，与模型
+        # ``rknn3_query`` 查到的 deepstack input attr.index 一致）。
         if inputs:
             for x in inputs:
                 if isinstance(x, RKNN3AuxTensorWrapper):
                     aux = self._pack_aux(x)
                     packed.append(aux)
-        # 2) Multimodal (image / audio) — the C++ reference sends ONLY
-        # the multimodal input and embeds the prompt into it
-        # (``tensor.prompt = "<image> " + prompt``). Don't tack a
-        # separate PROMPT input on after — that double-prompt caused
-        # ``rknn3_session_run`` to return -1 on Qwen3-VL / Qwen3.5-VL.
         if has_multimodal:
-            for x in inputs:
-                if isinstance(x, (RKNN3Image, RKNN3Audio)):
-                    packed.append(self._pack_multimodal(x, prompt, enable_thinking))
             return packed
         # 3) Single-payload (prompt / embeds / tokens) — text-only path
         if prompt is not None:
@@ -1574,6 +1584,34 @@ class _LLMSession:
         return li
 
     def _pack_aux(self, aux: RKNN3AuxTensorWrapper) -> _LLMInput:
+        """Pack one aux input — with lazy **per-slot pre-allocation**.
+
+        Critical lesson learned on RK3588 (2026-09-08):
+        ``rknn3_create_mem`` for aux tensors is a **finite-pool**
+        resource on the NPU driver. Calling it once per inference
+        exhausts the pool within ~8 frames and the driver returns
+        ``MSG_MEM_CREATE_ACK fail`` + ``rknn3_create_mem: device
+        failed to create memory``. With the wrong pre-allocation
+        strategy, ``_pack_aux`` would then raise a Python exception
+        that crosses through the ctypes boundary into the reply
+        path, and the worker segfaults (``rc=-11``) — the user's
+        symptom is "video detection dies after a few frames".
+
+        The fix follows the C++ reference
+        ``examples/Qwen3_VL/cpp/llm/rknn_qwen3_vl_llm.cc:61-120``:
+        allocate the 3 deepstack mem blocks **once** in
+        ``_LLMRuntime.__init__`` (lazily, on first ``_pack_aux``
+        call) and reuse them for every subsequent frame — only the
+        **bytes inside** the buffer are overwritten each call. The
+        attr (shape / dtype / index / aligned_size) is also cached
+        on first call so we never re-allocate.
+
+        Sized to ``aux.align_size`` (which vlm.py sets to the vision
+        output's ``aligned_size`` at session init), so the buffer
+        exactly fits the largest deepstack output the model will
+        emit at this ``image_size`` — no over-allocation, no
+        re-allocation, no driver pool leak.
+        """
         li = _LLMInput()
         li.role = None
         li.input_type = c_int(int(_LLMInputType.AUX))
@@ -1582,31 +1620,78 @@ class _LLMSession:
             data = np.ascontiguousarray(aux.aux_data.astype(np.float16, copy=False))
         else:
             data = np.zeros(0, dtype=np.float16)
+
+        # Lazy alloc: first ``_pack_aux`` call creates the mem pool,
+        # every subsequent call reuses the cached blocks. We key the
+        # pool by ``(align_size,)`` — a model with two vision variants
+        # (e.g. 384 / 768) sees different align_size per image_size
+        # and gets a separate pool, but within one size the same
+        # buffer is reused for every frame.
+        pool_key = int(aux.align_size)
+        pool = self.runtime._aux_pool.get(pool_key)
+        if pool is None:
+            size = max(pool_key, 1)
+            mem_ptr = self.runtime.lib.rknn3_create_mem(
+                self.runtime.context,
+                c_uint64(size),
+                c_int32(0),
+                c_int32(int(_MemAllocFlags.CACHEABLE)),
+            )
+            if not mem_ptr:
+                # Driver refused. The right move is to surface a
+                # clean error to the worker reply path (so the main
+                # process can log + respawn) rather than letting a
+                # Python exception escape through ctypes and segfault.
+                # We stash the message in a shared dict and let the
+                # caller of ``_pack_inputs`` raise — see
+                # ``_pack_inputs``.
+                self.runtime._aux_last_err = (
+                    f"rknn3_create_mem (aux, size={size}) failed"
+                )
+                raise RuntimeError(self.runtime._aux_last_err)
+            attr = _TensorAttr()
+            attr.index = c_uint32(int(aux.index))
+            attr.n_elems = c_uint32(int(data.size))
+            attr.n_dims = c_uint32(int(min(data.ndim, _MAX_DIMS)))
+            for i in range(min(data.ndim, _MAX_DIMS)):
+                attr.shape[i] = c_uint32(int(data.shape[i]))
+            attr.dtype = c_int(int(RKNN3TensorType.RKNN3_TENSOR_FLOAT16))
+            attr.aligned_size = c_uint64(size)
+            self.runtime._aux_attr_refs.append(attr)
+            pool = {
+                "mem_ptr": int(mem_ptr),
+                "size": size,
+                "attr": attr,
+            }
+            self.runtime._aux_pool[pool_key] = pool
+        # ``mem_ptr`` in cache is a raw ctypes pointer address (int).
+        # Wrap in c_void_p so the downstream cast treats it as an
+        # opaque pointer (matches what rknn3_create_mem returned).
+        mem_ptr = c_void_p(pool["mem_ptr"])
         self._input_pin_refs.append(data)
-        size = data.nbytes or int(aux.align_size)
-        mem_ptr = self.runtime.lib.rknn3_create_mem(
-            self.runtime.context,
-            c_uint64(max(size, 1)),
-            c_int32(0),
-            c_int32(int(_MemAllocFlags.CACHEABLE)),
-        )
-        if not mem_ptr:
-            raise RuntimeError("rknn3_create_mem (aux) failed")
-        # Copy data into the aux buffer
+
+        # Copy fresh bytes into the pre-allocated buffer.
         mem_struct = ctypes_cast(mem_ptr, POINTER(_TensorMemory))
         if data.size > 0 and mem_struct.contents.virt_addr:
+            # ``data`` may be a 2-D ``(n_patches, embed_dim)`` array
+            # (vision RKNN deepstack outputs, e.g. Qwen3-VL-4B @ 384
+            # emits ``(144, 2560)``). The destination is a 1-D fp16
+            # view of the same total length, so numpy cannot auto-
+            # broadcast a 2-D source into it — ``dst[:] = data``
+            # raises ``ValueError: could not broadcast input array
+            # from shape (144, 2560) into shape (368640,)``.
+            # ``ravel()`` returns a flat view when possible (no copy);
+            # the assignment writes bytes in C order, matching the
+            # C-side ``rknn3_session_run`` layout.
+            flat = data.ravel() if data.ndim != 1 else data
+            buf_bytes = mem_struct.contents.size
             dst = np.ctypeslib.as_array(
                 ctypes_cast(mem_struct.contents.virt_addr, POINTER(c_uint8)),
-                shape=(mem_struct.contents.size,),
-            ).view(np.float16)[:data.size]
-            dst[:] = data
-        self.runtime._aux_mem_refs.append(int(mem_ptr))
-        attr = _TensorAttr()
-        attr.index = c_uint32(int(aux.index))
-        attr.n_elems = c_uint32(int(data.size))
-        attr.n_dims = c_uint32(2 if data.ndim >= 2 else 1)
-        attr.aligned_size = c_uint64(max(int(aux.align_size), data.nbytes))
-        self.runtime._aux_attr_refs.append(attr)
+                shape=(buf_bytes,),
+            ).view(np.float16)[:flat.size]
+            dst[:] = flat
+
+        attr = pool["attr"]
         aux_t.mem = ctypes_cast(mem_ptr, POINTER(_TensorMemory))
         aux_t.attr = pointer(attr)
         return li
@@ -1740,6 +1825,11 @@ class _LLMRuntime(_Runtime):
         super().__init__(lib, target, device_id)
         self._aux_mem_refs: List[int] = []
         self._aux_attr_refs: List[_TensorAttr] = []
+        # Per-align-size aux-mem pool (see ``_pack_aux`` docstring).
+        # Key = ``aux.align_size``; value = ``{"mem_ptr", "size", "attr"}``.
+        # Lazy alloc on first ``_pack_aux``; reused for every subsequent
+        # frame so we never re-call ``rknn3_create_mem`` mid-session.
+        self._aux_pool: Dict[int, dict] = {}
         self.session: Optional[_LLMSession] = None
 
     def release(self) -> None:
@@ -1749,6 +1839,19 @@ class _LLMRuntime(_Runtime):
             except Exception:  # noqa: BLE001
                 pass
             self.session = None
+        # Destroy every cached aux-mem block from ``_aux_pool``. Note
+        # ``_aux_pool`` keys by ``align_size``, so a session that ran
+        # two vision variants (384 + 768) drops two blocks; a
+        # single-variant session drops one. Old transient-tracking
+        # lists (``_aux_mem_refs`` / ``_aux_attr_refs``) are kept for
+        # ABI compat but are unused by the lazy-pool path.
+        for entry in self._aux_pool.values():
+            try:
+                self.lib.rknn3_destroy_mem(
+                    self.context, c_void_p(int(entry["mem_ptr"])))
+            except Exception:  # noqa: BLE001
+                pass
+        self._aux_pool.clear()
         for ptr in self._aux_mem_refs:
             try:
                 self.lib.rknn3_destroy_mem(self.context, c_void_p(ptr))

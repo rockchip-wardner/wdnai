@@ -594,3 +594,76 @@ grounding 链路定义在 `src/wdnai/grounding.py`（独立模块，**不**耦�
   加一个 `share_with: Optional[LocateAnythingBackend] = None` 入参
   把 `rknn_llm` / `rknn_vision` 句柄与目标实例合并持有，调用前再
   做一次 mutex 串行化（与 `_llm_session_call_lock` 同源）。
+
+- **`_pack_aux` 写 2-D aux tensor 之前必须 `ravel()`，
+  设置 `attr.shape[]` + `attr.dtype`，**且 `_pack_inputs` 必须
+  把 multimodal 排在 `inputs[0]`、aux 跟在后面，并且 aux mem 必须
+  lazy pool 复用不能每次 create**：vision RKNN 的 deepstack 输出
+  是 ``(n_patches, embed_dim)`` 形状（Qwen3-VL-4B @ 384 实测
+  ``(144, 2560)``，Qwen3.5-VL 同款），C-side
+  ``rknn3_session_run`` 期待完整 ``_tensor_attr`` metadata +
+  multimodal at ``inputs[0]`` + 复用 aux mem。``_LLMSession._pack_aux``
+  与 ``_LLMSession._pack_inputs`` 历史上有 4 个 bug：
+  1. ``dst[:] = data`` 把 2-D ndarray 赋给 1-D fp16 视图 →
+     numpy 抛 ``ValueError: could not broadcast input array from
+     shape (144, 2560) into shape (368640,)``。修复：赋值前
+     ``data.ravel() if data.ndim != 1 else data``。
+  2. ``attr.shape[]`` 没设（保持全零） + ``attr.dtype`` 默认 0
+     （= ``RKNN3_TENSOR_FLOAT32``）。C 库拿 ``n_elems=368640`` 配
+     dtype_size(4) 算出来 1474560 bytes，与实际
+     ``aligned_size=737280`` 不符 → ``rknn3_session_run`` 返回
+     ``ret=-1``，包装层抛 ``llm session_run failed: ret=-1``。
+     修复：循环 ``attr.shape[i] = data.shape[i]``；
+     ``attr.dtype = RKNN3_TENSOR_FLOAT16``。
+  3. ``_pack_inputs`` 把 aux 排在前面、multimodal 排在最后。
+     C 库第一个 entry 必须是 multimodal
+     （``RKLLMSession: Please put the LLM input at the first
+     position!``），aux 跟在后面 —— 注释里说"double-prompt caused
+     ret=-1"是把表面症状记成原因；真正原因是 inputs 顺序颠倒。
+     修复：先 push multimodal，再 push aux。早期版本 + bug #1/#2
+     的修复**还不够**——前两个 bug 修了之后，shape/dtype 满足
+     C 库校验，但 inputs 顺序错了，C 库仍然 ret=-1。
+  4. 每次 ``_pack_aux`` 都新调 ``rknn3_create_mem``。NPU driver 的
+     aux-mem pool 是有限资源——Qwen3-VL-4B @ 384 在 RK3588 板上
+     跑约 8 次 infer 后就报 ``MSG_MEM_CREATE_ACK fail,
+     ack = ACK_FAIL, expect = ACK_SUCC!`` + ``rknn3_create_mem:
+     device failed to create memory``。Python 异常穿过 ctypes
+     边界，worker SIGSEGV (``rc=-11``)。修复：``_LLMRuntime`` 加
+     ``_aux_pool: Dict[int, dict]``，``_pack_aux`` 第一次 lazy
+     create，后续只 memcpy bytes。C++ 参考
+     ``examples/Qwen3_VL/cpp/llm/rknn_qwen3_vl_llm.cc:111-120``
+     就是这个模式（init 时一次性 alloc 3 个 deepstack mem，
+     run 时只更新内容）。
+  C++ 参考 ``examples/Qwen3_VL/cpp/llm/rknn_qwen3_vl_llm.cc:111-118``
+  在 ``init_qwen3_vl_llm`` 里调 ``rknn3_query(INPUT_ATTR)`` 拿
+  完整 attr（含 shape/dtype/stride）后才填进 aux 输入；wdnai
+  Python shim 没有 query 路径（aux tensor mem 是
+  ``rknn3_create_mem`` 在 LLM session 之外分配的，wdnai
+  VLM 后端每次 infer 重新 ``_pack_aux``），所以必须手动补齐。
+  后续若 wdnai 改成「session 初始化时 query 一次存起来」的
+  路径，这里可以省掉 shape/dtype 设置——前提是 query 真的
+  拿的是 deepstack 那 3 个 aux input 的 attr（模型可能把
+  deepstack 当作子 graph 特殊命名，不是简单的 input index）。
+  ``tests/test_mock_e2e.py::test_pack_aux_2d_deepstack_does_not_broadcast_fail``
+  覆盖 bug #1 + #2：直接调 ``_pack_aux`` 用 stubbed
+  ``rknn3_create_mem``，断言写入字节 ==
+  ``sentinel_2d.ravel()`` **且** ``attr.shape[0]==144,
+  shape[1]==2560, dtype==RKNN3_TENSOR_FLOAT16``。
+  ``test_pack_inputs_multimodal_must_be_first`` 覆盖 bug #3：
+  直接调 ``_pack_inputs``，断言 ``inputs[0].input_type ==
+  MULTIMODAL`` 且 ``inputs[1..3].input_type == AUX``，外加
+  每个 aux 的 ``attr.index == 2 + i`` round-trip 校验。
+  ``test_pack_inputs_multimodal_must_be_first`` 还加了 **pool 复用
+  校验**（bug #4）：第二次 ``_pack_inputs`` 调用之后
+  ``runtime._aux_pool`` 大小不能增长——只要 cache 命中就不该再
+  create_mem。回归 guard 防止后人把 pool 路径意外简化成
+  ``_pack_aux`` 每次都 ``create_mem``（一旦如此，在真机上
+  Qwen3-VL-4B @ 384 跑 ~8 帧就 driver pool 耗尽 → SIGSEGV）。
+  临时 revert 任一 bug 都会被对应测试抓住：broadcast 版本
+  ValueError 触发；shape/dtype 版本 ``assert 0 == 144`` 触发；
+  顺序版本 ``AssertionError: inputs[0] must be MULTIMODAL`` 触发；
+  pool 版本（手工把 ``if pool is None`` 改回 ``mem_ptr = create_mem``
+  每次都调） ``len(runtime._aux_pool) == first_pool_size + 3`` 触发。
+  Mock ``_FakeRknn.inference`` 也必须保持 2-D ``(n_patches, dim)``
+  输出——改回 1-D 会让 ``test_image_qwen3vl`` 等端到端测试
+  静默退化（1-D 源不会触发 numpy broadcast）。

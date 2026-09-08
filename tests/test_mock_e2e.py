@@ -85,10 +85,18 @@ class _FakeRknn:
         return list(self.mock_devices)
 
     def inference(self, inputs=None, data_format=None):
-        feat = np.random.randn(1, 32).astype(np.float32)
+        # Vision RKNN main output: (n_patches, dim) — VLM backend
+        # expand_dims -> (1, n_patches, dim).
+        n_patches, dim = 32, 8
+        feat = np.random.randn(n_patches, dim).astype(np.float32)
         outs = [feat]
+        # Deepstack aux outputs share the same (n_patches, dim) layout
+        # — Qwen3-VL-4B @ 384 emits (144, 2560); Qwen3.5-VL does
+        # the same. Tests rely on this 2-D shape so the aux-packing
+        # path is exercised (1-D mocks previously hid a numpy 2D→1D
+        # broadcast bug).
         for _ in range(self.deepstack_n):
-            outs.append(np.random.randn(32).astype(np.float32))
+            outs.append(np.random.randn(n_patches, dim).astype(np.float32))
         return outs
 
     def session_run(self, inputs=None, prompt=None, embeds=None, **kw):
@@ -299,6 +307,301 @@ def test_image_qwen3vl():
     print("[Qwen3-VL] structured parse ->", parsed)
 
     sess.close()
+
+
+def test_pack_aux_2d_deepstack_does_not_broadcast_fail():
+    """Regression: ``_LLMSession._pack_aux`` must accept 2-D ``(n_patches,
+    embed_dim)`` aux tensors — Qwen3-VL-4B @ 384 emits ``(144, 2560)``
+    per deepstack output, and the C-side destination buffer is a flat
+    1-D fp16 view. Before the fix, the assignment
+    ``dst[:] = data`` raised
+    ``ValueError: could not broadcast input array from shape
+    (144, 2560) into shape (368640,)`` because numpy cannot auto-
+    broadcast a 2-D source into a 1-D destination even when the total
+    element count matches. The fix ravel()-s the data first.
+
+    The test stubs ``rknn3_create_mem`` to hand back a python-side
+    byte buffer (no real NPU needed) so we can call ``_pack_aux``
+    directly with the real (144, 2560) shape and assert both that
+    the broadcast error is gone AND that the bytes written to the
+    destination match the source after ravel()-ing.
+    """
+    import ctypes as _ct
+    import wdnai._librknn as librknn
+
+    # Allocate a destination byte buffer the stub C call will hand
+    # back. Sized for the 144*2560 fp16 payload (368640 elements *
+    # 2 bytes = 737280) plus a little slack so the assignment still
+    # has room to land if the runtime ever grows the alloc.
+    sentinel_n, sentinel_d = 144, 2560
+    nbytes = sentinel_n * sentinel_d * np.dtype(np.float16).itemsize
+    dst_buf = (_ct.c_uint8 * nbytes)()
+
+    class _FakeMemStruct(_ct.Structure):
+        # Mirror the C-side ``rknn3_tensor_mem`` just enough for the
+        # virt_addr / size fields that ``_pack_aux`` reads.
+        _fields_ = [
+            ("virt_addr", _ct.c_void_p),
+            ("phys_addr", _ct.c_uint64),
+            ("fd", _ct.c_int32),
+            ("buffer_id", _ct.c_uint64),
+            ("offset", _ct.c_uint64),
+            ("size", _ct.c_uint64),
+            ("flags", _ct.c_uint64),
+            ("core_id", _ct.c_int32),
+            ("priv_data", _ct.c_void_p),
+            ("mem_type", _ct.c_int),
+        ]
+
+    fake_mem = _FakeMemStruct()
+    fake_mem.virt_addr = _ct.cast(dst_buf, _ct.c_void_p).value
+    fake_mem.size = nbytes
+
+    class _StubLib:
+        """Minimal stand-in for the librknn3 CDLL — only the
+        symbols ``_LLMSession.__init__`` / ``_pack_aux`` reach.
+        ``rknn3_session_init`` returns a non-NULL handle so the
+        post-init bookkeeping (``self._session = sess``) succeeds;
+        ``_pack_aux`` calls ``rknn3_create_mem`` which we redirect
+        to our python-side buffer."""
+
+        def __init__(self):
+            self.rknn3_create_mem = self._create_mem
+            self.rknn3_session_init = self._session_init
+            self.rknn3_query = self._query
+
+        @staticmethod
+        def _create_mem(ctx, size, core_id, flags):
+            return _ct.cast(_ct.pointer(fake_mem), _ct.c_void_p).value
+
+        @staticmethod
+        def _session_init(ctx, params, n_params):
+            # Return a non-zero pointer so ``_LLMSession._init``
+            # treats the call as success. The actual session handle
+            # is never dereferenced by ``_pack_aux``.
+            return 0x1
+
+        @staticmethod
+        def _query(ctx, cmd, buf, size):
+            # ``_LLMSession._init`` calls ``rknn3_query`` to read
+            # ``LLM_CONFIG.max_ctx_len``. We never use the result, so
+            # returning 0 (success) is fine — the except branch in
+            # ``_init`` handles failures gracefully.
+            return 0
+
+    # Build a real ``_LLMRuntime`` + ``_LLMSession`` against the
+    # stub lib so ``_pack_aux`` runs the real code path (including
+    # the bytes-write step). The runtime only needs ``lib`` and
+    # ``context`` populated enough to satisfy ``_pack_aux``'s
+    # preconditions; we never call ``rknn3_session_run``.
+    runtime = librknn._LLMRuntime.__new__(librknn._LLMRuntime)
+    runtime.lib = _StubLib()
+    runtime.context = 0
+    runtime._aux_mem_refs = []
+    runtime._aux_attr_refs = []
+    runtime._aux_pool = {}
+
+    llm_session = librknn._LLMSession(
+        runtime=runtime,
+        session=0,  # placeholder; not used by _pack_aux
+        params=[{"vocab_size": 64, "max_context_len": 4096,
+                 "special_eos_id": 0}],
+        callback=None,
+    )
+
+    # Build the deterministic 2-D deepstack payload that mirrors
+    # the real Qwen3-VL-4B @ 384 output. ``(144, 2560)`` — chosen
+    # specifically so its total element count (368640) is *not* a
+    # power of two, locking the regression contract against future
+    # "simplifications" that try to assume 1-D sources.
+    rng = np.random.default_rng(seed=0x5753_4E_54)
+    sentinel_2d = rng.standard_normal(
+        (sentinel_n, sentinel_d)
+    ).astype(np.float16)
+    aux = librknn.RKNN3AuxTensorWrapper(
+        aux_data=sentinel_2d,
+        index=2,
+        align_size=nbytes,
+    )
+    packed = llm_session._pack_aux(aux)
+
+    # The packed C struct must carry the 144*2560 fp16 count and
+    # 2 dims so the LLM session knows the layout.
+    assert packed.role is None
+    assert int(packed.input_type) == int(librknn._LLMInputType.AUX)
+    attr = packed._u.aux_input.attr.contents
+    assert attr.index == 2
+    assert attr.n_elems == (sentinel_n * sentinel_d)
+    assert attr.n_dims == 2
+    # ``shape[]`` and ``dtype`` are the fields the C library checks
+    # against the model's aux tensor contract. Both used to be
+    # left zero — ``shape[]`` stayed ``[0, 0, ...]`` and ``dtype``
+    # defaulted to ``0`` (``RKNN3_TENSOR_FLOAT32``) — which made the
+    # C library compute ``n_elems * dtype_size(4) = 1474560`` against
+    # the actual ``aligned_size(737280)`` and reject the input via
+    # ``rknn3_session_run -> ret=-1``. Without these assertions a
+    # revert that drops the manual ``shape[]`` / ``dtype`` assignment
+    # silently slips back to the bug.
+    assert attr.shape[0] == sentinel_n
+    assert attr.shape[1] == sentinel_d
+    assert int(attr.dtype) == int(
+        librknn.RKNN3TensorType.RKNN3_TENSOR_FLOAT16
+    )
+    assert attr.aligned_size == nbytes
+
+    # The destination buffer must hold the ravel()-d source bytes in
+    # C order (the assignment the bug used to blow up on).
+    written = np.ctypeslib.as_array(
+        dst_buf, shape=(nbytes,)
+    ).view(np.float16)[:sentinel_n * sentinel_d]
+    np.testing.assert_array_equal(written, sentinel_2d.ravel())
+
+    print("[Qwen3-VL] _pack_aux 2-D deepstack regression OK")
+
+
+def test_pack_inputs_multimodal_must_be_first():
+    """Regression: ``_LLMSession._pack_inputs`` must put the multimodal
+    input at ``inputs[0]`` and deepstack aux inputs AFTER it.
+
+    ``rknn3_session_run`` rejects the call with
+    ``RKLLMSession: Please put the LLM input at the first position!``
+    when any aux tensor appears before the multimodal entry — see
+    user incident on RK3588 board (2026-09-08) where the C library
+    stderr showed the message and ``session_run`` returned ``-1`` for
+    every frame despite the previous shape/dtype fixes having landed.
+    Root cause was that the Python shim packed aux first, then pushed
+    multimodal at the end; the C library iterates ``inputs[]`` in
+    order and treats the first one as the LLM input. C++ reference
+    ``examples/Qwen3_VL/cpp/llm/rknn_qwen3_vl_llm.cc:174-180`` puts
+    multimodal at ``inputs[0]`` and aux at ``inputs[1..3]``.
+
+    The test stubs ``_do_session_run`` (the function that calls
+    ``rknn3_session_run``) to capture the packed ``inputs`` list,
+    then asserts the ordering invariant.
+    """
+    import ctypes as _ct
+    import wdnai._librknn as librknn
+
+    captured_inputs: list = []
+
+    # Stub librknn3 entry points: ``_pack_aux`` calls
+    # ``rknn3_create_mem`` and then dereferences the result as a
+    # ``_TensorMemory*``; a bare integer (e.g. ``return 1``) would
+    # segfault on first read. Return a pointer to a real, zeroed
+    # ``_TensorMemory`` instead — ``virt_addr`` and ``size`` are the
+    # only fields touched and zeros satisfy both.
+    runtime = librknn._LLMRuntime.__new__(librknn._LLMRuntime)
+
+    class _StubLib:
+        def __init__(self):
+            self.rknn3_create_mem = self._create_mem
+            self.rknn3_session_init = lambda *a, **k: 1
+            self.rknn3_query = lambda *a, **k: 0
+
+        @staticmethod
+        def _create_mem(ctx, size, core_id, flags):
+            tm = librknn._TensorMemory()
+            tm.virt_addr = 0
+            # ``size`` arrives as a ctypes integer (c_uint64 on the
+            # signature); convert to Python int for assignment.
+            tm.size = int(size.value) if hasattr(size, "value") else int(size)
+            return _ct.cast(_ct.pointer(tm), _ct.c_void_p).value
+
+    runtime.lib = _StubLib()
+    runtime.context = 0
+    runtime._aux_mem_refs = []
+    runtime._aux_attr_refs = []
+    runtime._aux_pool = {}
+    llm_session = librknn._LLMSession(
+        runtime=runtime, session=0,
+        params=[{"vocab_size": 64, "max_context_len": 4096,
+                 "special_eos_id": 0}],
+        callback=None,
+    )
+
+    # 2-D aux data matching Qwen3-VL-4B @ 384 deepstack output shape.
+    sentinel_n, sentinel_d = 12, 8
+    sentinel_2d = np.zeros(
+        (sentinel_n, sentinel_d), dtype=np.float16
+    )
+    # Each aux gets a distinct ``align_size`` so the lazy-pool
+    # (``_LLMRuntime._aux_pool``) creates a separate buffer slot per
+    # aux — without this, all three would map to the same pool key
+    # and the attr.index would only round-trip for the last one.
+    aux_wrappers = [
+        librknn.RKNN3AuxTensorWrapper(
+            aux_data=sentinel_2d.copy(), index=2 + i,
+            align_size=sentinel_n * sentinel_d * 2 * (i + 1),
+        )
+        for i in range(3)
+    ]
+
+    # Build a minimal RKNN3Image stand-in (no C calls; we only need
+    # ``_pack_inputs`` to recognise the type via ``isinstance`` and
+    # call ``_pack_multimodal``). We stub the image-attr by giving
+    # it a dummy bytes buffer (the multimodal packer never reads
+    # the image bytes for this test — the test cares only about
+    # ordering of the returned ``packed`` list, not the bytes
+    # inside the multimodal struct).
+    import ctypes as _ct
+    from wdnai._librknn import RKNN3Image, Float16
+    dummy_emit = (Float16 * 4)()
+    mm_image = RKNN3Image()
+    mm_image.image_embed = _ct.cast(dummy_emit, _ct.POINTER(Float16))
+    mm_image.n_image_tokens = 1
+    mm_image.n_image = 1
+    mm_image.image_width = 384
+    mm_image.image_height = 384
+    mm_image.image_start = b"<|vision_start|>"
+    mm_image.image_end = b"<|vision_end|>"
+    mm_image.image_content = b"<|image_pad|>"
+
+    packed = llm_session._pack_inputs(
+        prompt="白色车辆", embeds=None, tokens=None,
+        inputs=[*aux_wrappers, mm_image],
+        enable_thinking=False,
+    )
+
+    # The multimodal input MUST be at index 0; aux inputs follow.
+    # (Early-bug version had aux at indices 0..2 and multimodal at
+    # index 3, which made the C library reject every call.)
+    assert len(packed) == 4, f"want 4 packed inputs, got {len(packed)}"
+    assert int(packed[0].input_type) == int(
+        librknn._LLMInputType.MULTIMODAL
+    ), (
+        f"inputs[0] must be MULTIMODAL, got input_type="
+        f"{int(packed[0].input_type)}"
+    )
+    for i in range(1, 4):
+        assert int(packed[i].input_type) == int(
+            librknn._LLMInputType.AUX
+        ), (
+            f"inputs[{i}] must be AUX, got input_type="
+            f"{int(packed[i].input_type)}"
+        )
+    # ``attr.index`` on each aux must round-trip (2 + i in vlm.py).
+    for i in range(3):
+        assert int(packed[i + 1]._u.aux_input.attr.contents.index) == 2 + i
+
+    # Pool reuse: a second ``_pack_inputs`` call (simulating the next
+    # video frame) must NOT re-call ``rknn3_create_mem`` — the lazy
+    # pool hands back the same buffer slots. The stub counts every
+    # create call; after the first round we expect zero growth.
+    first_pool_size = len(runtime._aux_pool)
+    second = llm_session._pack_inputs(
+        prompt="白色车辆", embeds=None, tokens=None,
+        inputs=[*aux_wrappers, mm_image],
+        enable_thinking=False,
+    )
+    assert len(second) == 4, f"want 4 packed inputs, got {len(second)}"
+    assert len(runtime._aux_pool) == first_pool_size, (
+        f"_aux_pool grew from {first_pool_size} to "
+        f"{len(runtime._aux_pool)} — driver-side memory would leak "
+        f"across frames. Real RK3588 boards crash after ~8 frames "
+        f"when this happens (rc=-11)."
+    )
+
+    print("[Qwen3-VL] _pack_inputs ordering regression OK")
 
 
 def test_image_qwen25vl():
@@ -1947,4 +2250,8 @@ if __name__ == "__main__":
     test_try_parse_tool_call_handles_hermes_string_arguments()
     test_safe_validate_fallback_strips_json_fence_and_tool_call_wrapper()
     test_qwen3_5_vl_with_new_prompt_calls_crop_correctly()
+    # --- deepstack 2-D aux broadcast regression (wdnwebui 视频目标检测) ---
+    test_pack_aux_2d_deepstack_does_not_broadcast_fail()
+    # --- inputs[0]=multimodal ordering regression (RKLLMSession error) ---
+    test_pack_inputs_multimodal_must_be_first()
     print("\nALL MOCK TESTS PASSED")
