@@ -654,7 +654,21 @@ def _safe_schema(generating: Optional[Type[T]]) -> str:
     if not schema:
         return ""
     try:
-        return str(schema)
+        # v0.13 fix (Qwen3.5-VL-4B schema-echo): emit standard JSON
+        # (json.dumps, double quotes + ``ensure_ascii=False`` for
+        # Chinese chars) instead of Python dict repr (single quotes)
+        # so the model doesn't confuse the schema hint with the expected
+        # output format. Qwen3.5-4B reads the ``fenced ```` ```json``
+        # `` block as the schema definition and copies it back when
+        # asked to "Output JSON only", producing
+        # ``{"properties": {...}, "title": "TargetDoc", "type": ...}``
+        # instead of a real instance. (Qwen3-VL-4B with the old
+        # ``str(schema)`` repr is also unhappy but only on some frames
+        # — see AGENTS.md caveat about repr vs json.dumps for
+        # qwen3-vl-4b; switching to json.dumps is a strict improvement
+        # for the qwen3-5-vl-4b class and is no-op for qwen3-vl-4b
+        # on frames where the model already returned a valid instance.)
+        return json.dumps(schema, ensure_ascii=False, indent=2)
     except Exception:
         return ""
 
