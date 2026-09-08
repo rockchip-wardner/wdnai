@@ -381,6 +381,22 @@ name `wdnai`, distribution name `wdnai`.
   形态并用 `np.ctypeslib.as_array(cast(embed_ptr, POINTER(c_uint16)),
   shape=(length//2,)).view(np.float16)` 自己包 view。
 
+### 修改守则
+
+改动某个功能的时候，不影响其它功能；如果需要改动到公共功能，需要自动
+跑真实测试每个关联的功能项是否都正常。
+
+- 改动只触及目标功能及其直接依赖，不顺手 refactor 无关代码。
+- 公共功能改动（`wdnai._librknn` shim、`gguf_tokenizer.py`、
+  `backends/` 下的 `@WdnaiCallable` 工厂、`SystemLanguageModel` 预设
+  工厂、`Attachment` 序列化、tokenizer 接口等被多个 backend / 多个
+  调用方共享的模块）必须跑所有关联 backend / 关联功能的真实测试
+  （不是仅 `tests/test_smoke.py` 那种 import-only），不允许"测试跳过"
+  或"代码改对了就行"。
+- 失败 → 修到全通过再交；下游 `wdnwebui` 集成页面（视频描述 / 视频
+  目标检测 / 视频内容检索 / 语音生成 / 文本对话 / 微信视频）必须
+  至少 smoke 一遍。
+
 ### 文本推理（LLM）
 
 ```python
