@@ -747,7 +747,6 @@ def _result_trampoline(user_cb: Callable[..., int]):
     """
     @_RESULT_CB
     def _cb(userdata, result_ptr, state):
-        import os as _os
         py_obj = ctypes.cast(userdata, POINTER(ctypes.py_object)).contents.value
         # ``result_ptr`` is NULL in the FINISH / WAITING / ERROR states;
         # only NORMAL / decode carries actual token IDs. Match rknn3lite
@@ -757,12 +756,8 @@ def _result_trampoline(user_cb: Callable[..., int]):
             tokens = [int(result_ptr.contents.token_ids[i]) for i in range(n)]
         else:
             tokens = []
-        if _os.environ.get("WDNAI_DEBUG_CB"):
-            print(f"[cb] py_obj={py_obj!r} state={state} tokens={tokens}", flush=True)
         try:
             rc = int(user_cb(py_obj, tokens, int(state)))
-            if _os.environ.get("WDNAI_DEBUG_CB"):
-                print(f"[cb] user_cb returned {rc}; py_obj type={type(py_obj).__name__}; getattr sink text: {getattr(py_obj, 'text', '?')!r}", flush=True)
         except Exception:  # noqa: BLE001 — never let a Python error into C
             rc = -1
         return rc
@@ -823,6 +818,7 @@ def build_llm_callback(
     embeds_data: Optional[np.ndarray] = None,
     embed_callback: Optional[Callable[..., int]] = None,
     output_cb: Optional[Callable[..., int]] = None,
+    output_tensors: Optional[Any] = None,
     sampling_cb: Optional[Callable[..., int]] = None,
     input_cb: Optional[Callable[..., int]] = None,
 ) -> _LLMCallbackBundle:
@@ -955,6 +951,20 @@ def build_llm_callback(
         bundle.struct.output_callback = _cb
         bundle.struct.output_userdata = _pin_userdata(bundle, target)
         bundle._trampolines.append(_cb)
+
+    # ---- output tensors (pre-allocated, for the talker path) -------- #
+    # Must live on the same callback struct as ``output_callback`` or
+    # the C library invokes the callback against an empty tensor array
+    # and ``past_hidden`` (output index 1) never arrives.
+    if output_tensors is not None:
+        n = len(output_tensors)
+        bundle.output_tensors = ctypes_cast(
+            pointer(output_tensors), POINTER(_RknnTensor),
+        )
+        bundle.n_output_tensors = c_uint32(n)
+        bundle.struct.output_tensors = bundle.output_tensors
+        bundle.struct.n_output_tensors = c_uint32(n)
+        bundle.pins.append(output_tensors)   # keep ctypes array alive
 
     # ---- sampling / input (passthrough) ----------------------------- #
     if sampling_cb is not None:
@@ -1433,9 +1443,16 @@ class _LLMSession:
             # means "unbounded" — Qwen3-VL / Qwen3.5-VL with that
             # setting allocate a huge prefill buffer and crash with
             # ``std::bad_alloc`` as soon as the prompt is non-trivial.
-            # Cap to a sane value so a missing ``max_new_tokens=``
-            # override doesn't bring down the driver.
-            self._infer_param.max_new_tokens = c_int32(1024)
+            # Prefer the session-configured ``max_new_tokens`` from the
+            # init args (rknn3lite semantics: code_predictor=15,
+            # talker=8192 — see examples/Qwen3_TTS/cpp/talker.cc:266).
+            sess_max = 0
+            if self._params and isinstance(self._params[0], dict):
+                sess_max = int(self._params[0].get("max_new_tokens", 0) or 0)
+            if sess_max > 0:
+                self._infer_param.max_new_tokens = c_int32(sess_max)
+            else:
+                self._infer_param.max_new_tokens = c_int32(1024)
         if prefill_only is not None:
             self._infer_param.prefill_only = c_bool(bool(prefill_only))
         if disable_sampling is not None:
@@ -1524,7 +1541,14 @@ class _LLMSession:
         li.input_type = c_int(int(_LLMInputType.EMBED))
         t = li._u.llm_input
         self._input_pin_refs.append(embeds)   # keep buffer alive
-        t.name = None
+        # LLM graphs export the embed input as ``input_embeds`` — the
+        # C++ reference sets it (talker.cc:250) and so must we, else
+        # the C library can't bind the input and the run returns
+        # RKLLM_RUN_ERROR. Mirrors the multimodal path's
+        # ``_pack_multimodal`` requirement.
+        name_cp = c_char_p(b"input_embeds")
+        self._input_anchor_refs.append(name_cp)   # pins the c_char_p + its bytes
+        t.name = name_cp
         t.prompt = None
         t.embed = c_void_p(embeds.ctypes.data)
         t.tokens = None
@@ -1777,8 +1801,13 @@ def _pack_llm_params(
     result is all zeros.
     """
     out: List[_LLMParam] = []
-    logits_anchor = logits_name.encode("utf-8")
     for d in args:
+        # Per-arg override of the logits tensor name — most rknn3-model-zoo
+        # graphs name it ``"output"``, but the Qwen3-TTS talker /
+        # code_predictor export it as ``"logits"`` (talker.cc:1095/1192).
+        # Wrong name → RKLLM_RUN_ERROR.
+        arg_logits = d.pop("logits_name", logits_name) if isinstance(d, dict) else logits_name
+        logits_anchor = arg_logits.encode("utf-8")
         p = _LLMParam()
         p.logits_name = c_char_p(logits_anchor)
         p.max_context_len = c_int32(int(d.get("max_context_len", 4096)))

@@ -788,6 +788,9 @@ class Qwen3TTSDriver:
             "special_eos_id": CODEC_EOS_TOKEN_ID,
             "max_new_tokens": CODEC_MAX_CONTEXT_LEN,
             "keep_history": 0,
+            # logits tensor is named ``"logits"`` not ``"output"``;
+            # see talker.cc:1192.
+            "logits_name": "logits",
             **self.code_predictor_sampling,
         }]
 
@@ -845,6 +848,7 @@ class Qwen3TTSDriver:
             result_cb=self._talker_result_callback,
             embed_callback=self._talker_embed_callback,
             output_cb=self._talker_output_callback,
+            output_tensors=output_tensors,
         )
 
         args = [{
@@ -853,6 +857,9 @@ class Qwen3TTSDriver:
             "special_eos_id": CODEC_EOS_TOKEN_ID,
             "max_new_tokens": QWEN3_TTS_MAX_CONTEXT_LEN,
             "keep_history": 0,
+            # logits tensor is named ``"logits"`` not ``"output"``;
+            # see talker.cc:1095.
+            "logits_name": "logits",
             **self.talker_sampling,
         }]
 

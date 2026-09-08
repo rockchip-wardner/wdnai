@@ -151,7 +151,16 @@ class LLMSession:
         # perf-table printout when the caller doesn't want it.
         overrides.setdefault("perf", perf)
 
-        full_prompt = self._compose_prompt(prompt, generating, tool_specs)
+        # TTS backends consume the prompt as the **text-to-speak** — the
+        # JSON-schema hint injected by ``generating=`` (a Qwen3-VLM/LLM
+        # concept) would otherwise be spoken aloud as part of the
+        # audio. Strip it from the prompt but keep ``generating=`` for
+        # the output-side ``LMOutput`` wrapping below.
+        prompt_generating = generating
+        backend_kind = getattr(getattr(self._backend, "spec", None), "kind", None)
+        if backend_kind == "tts":
+            prompt_generating = None
+        full_prompt = self._compose_prompt(prompt, prompt_generating, tool_specs)
         if debug:
             print(f"[wdnai.debug] prompt      = {prompt!r}")
             print(f"[wdnai.debug] full_prompt = {full_prompt!r}")
