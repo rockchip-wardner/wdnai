@@ -177,7 +177,15 @@ def load_tokenizer(path: str):
 
 
 def load_embed_table(path: str, vocab_size: int) -> np.ndarray:
-    arr = np.fromfile(path, dtype=np.float16)
+    # Use mmap instead of np.fromfile so the embed table's pages are
+    # released to the OS as soon as the last reference is dropped —
+    # np.fromfile mallocs the buffer into the glibc arena which only
+    # ever grows and is not returned to the OS until process exit,
+    # causing worker RSS to accumulate ~600 MB per load/unload cycle.
+    # All 6 callers (Text/VLM/Omni/Embedding/LocateAnything/ASR) are
+    # read-only on the embed table (asr.py's fancy indexing returns
+    # copies), so ``mode='r'`` is safe.
+    arr = np.memmap(path, dtype=np.float16, mode='r')
     return arr.reshape(vocab_size, -1)
 
 
