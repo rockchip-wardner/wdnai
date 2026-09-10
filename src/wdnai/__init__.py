@@ -35,6 +35,7 @@ from ._generable import Generable
 from .attachment import Attachment, AudioAttachment, ImageAttachment, TextAttachment
 from .lm_output import LMOutput
 from .model import ModelSpec, SystemLanguageModel
+from .prompt import LocatePrompt, Prompt
 from .session import LLMSession
 from .backends.locate_anything import LocateAnythingBackend
 
@@ -50,6 +51,8 @@ __all__ = [
     "LMOutput",
     "ModelSpec",
     "SystemLanguageModel",
+    "Prompt",
+    "LocatePrompt",
     "LLMSession",
     "LocateAnythingBackend",
 ]
