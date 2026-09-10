@@ -42,8 +42,8 @@ from typing import List, Optional
 import cv2
 
 from wdnai import (
-    Attachment,
     Generable,
+    ImageAttachment,
     LMOutput,
     LLMSession,
     SystemLanguageModel,
@@ -108,7 +108,7 @@ async def main() -> None:
             session.reset()
             result = await session.respond(
                 prompt=args.prompt,
-                attachment=[Attachment(img)],
+                attachment=[ImageAttachment(img)],
                 generating=ImageCaption,
                 image_size=args.image_size,
                 perf=args.perf,

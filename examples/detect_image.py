@@ -11,10 +11,12 @@
 
     WDNAI_MODELS_DIR=/path/to/models
 
-This example shows the v2 ``Attachment`` API:
+This example shows the v2 ``Attachment`` hierarchy:
 
-* ``attachment`` is now a **list** of ``Attachment`` so one session can
-  accept heterogeneous payloads (text + image + video + audio).
+* ``attachment`` is now a **list** of the three concrete subclasses
+  (:class:`TextAttachment` / :class:`ImageAttachment` /
+  :class:`AudioAttachment`) so one session can accept heterogeneous
+  payloads (text + image + audio).
 * ``generating`` accepts an ``@Generable`` class that inherits from
   ``LMOutput`` so the parsed result carries an ``attachment`` slot the
   SDK can populate automatically (TTS-style binaries).
@@ -30,10 +32,10 @@ from typing import List, Literal
 import cv2
 
 from wdnai import (
-    Attachment,
     Callable,
     Field,
     Generable,
+    ImageAttachment,
     LMOutput,
     LLMSession,
     SystemLanguageModel,
@@ -74,7 +76,7 @@ async def main():
             session.reset()
             result = await session.respond(
                 prompt=prompt,
-                attachment=[Attachment(img)],
+                attachment=[ImageAttachment(img)],
                 generating=Event,
                 tools=[alarm],
             )

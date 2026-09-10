@@ -317,7 +317,7 @@ class OmniBackend:
 
     def run_text(self, prompt: str, **kw: Any) -> str:
         raise RuntimeError(
-            "OmniBackend.run_text(): pass Attachment(wav_bytes, kind='audio') "
+            "OmniBackend.run_text(): pass AudioAttachment(wav_bytes) "
             "to LLMSession.respond() and the SDK will route to run_audio()."
         )
 

@@ -8,7 +8,9 @@ for the design notes.
 Quick start (Qwen3-VL image):
 
     from typing import Literal
-    from wdnai import Generable, Field, Attachment, LMOutput, LLMSession, SystemLanguageModel
+    from wdnai import (
+        Generable, Field, ImageAttachment, LMOutput, LLMSession, SystemLanguageModel,
+    )
 
     @Generable
     class Event(LMOutput):
@@ -19,7 +21,7 @@ Quick start (Qwen3-VL image):
     session = LLMSession(model=model)
     out = await session.respond(
         msg="Analyze this image",
-        attachment=[Attachment(img)],
+        attachment=[ImageAttachment(img)],
         generating=Event,
     )
 """
@@ -30,7 +32,7 @@ from typing import *
 
 from ._callable import Callable
 from ._generable import Generable
-from .attachment import Attachment
+from .attachment import Attachment, AudioAttachment, ImageAttachment, TextAttachment
 from .lm_output import LMOutput
 from .model import ModelSpec, SystemLanguageModel
 from .session import LLMSession
@@ -42,6 +44,9 @@ __all__ = [
     "Generable",
     "Callable",
     "Attachment",
+    "TextAttachment",
+    "ImageAttachment",
+    "AudioAttachment",
     "LMOutput",
     "ModelSpec",
     "SystemLanguageModel",

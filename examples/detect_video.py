@@ -14,7 +14,13 @@ from pathlib import Path
 
 import cv2
 import wdnav
-from wdnai import Attachment, Generable, Field, LLMSession, SystemLanguageModel
+from wdnai import (
+    Generable,
+    Field,
+    ImageAttachment,
+    LLMSession,
+    SystemLanguageModel,
+)
 from typing import Literal
 
 
@@ -101,7 +107,7 @@ async def main() -> None:
                 session.reset()
                 result = await session.respond(
                     prompt=PROMPT,
-                    attachment=Attachment(frame),
+                    attachment=ImageAttachment(frame),
                     generating=Event,
                 )
                 print(f"  act  = {result.act!r}")

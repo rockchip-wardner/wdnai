@@ -1,6 +1,7 @@
-"""LLM / VLM / TTS session: routes a list of ``Attachment`` objects and
-supports structured output (``LMOutput`` subclasses + plain ``@Generable``
-classes alike)."""
+"""LLM / VLM / TTS session: routes a list of :class:`Attachment` objects
+(:class:`TextAttachment` / :class:`ImageAttachment` / :class:`AudioAttachment`)
+and supports structured output (``LMOutput`` subclasses + plain
+``@Generable`` classes alike)."""
 from __future__ import annotations
 
 import json
@@ -17,7 +18,12 @@ from ._callable import (
     render_tools_block,
     try_parse_tool_call,
 )
-from .attachment import Attachment
+from .attachment import (
+    Attachment,
+    AudioAttachment,
+    ImageAttachment,
+    TextAttachment,
+)
 from .backends import build_backend
 from .lm_output import LMOutput
 from .model import ModelSpec
@@ -36,17 +42,25 @@ class LLMSession:
             tokenizer_path=..., embed_path=...,
         )
         async with LLMSession(model=model) as sess:
-            out = await sess.respond(prompt="...", attachment=[Attachment(img)])
+            out = await sess.respond(prompt="...", attachment=[ImageAttachment(img)])
 
-    ``attachment`` is now a **list** of :class:`Attachment` (or a single
-    ``Attachment`` for backward compat). This lets one session take in
-    heterogeneous payloads — e.g. a text prompt + an image for VLM,
-    or an audio config + a text instruction for TTS.
+    ``attachment`` accepts a single :class:`Attachment` (or subclass)
+    or a list of them. The three concrete subclasses are:
+
+    - :class:`TextAttachment` — plain text (chat prompts, TTS input)
+    - :class:`ImageAttachment` — one or more BGR ndarray frames (VLM input;
+      multi-frame replaces the legacy ``kind="video"`` path)
+    - :class:`AudioAttachment` — raw bytes + MIME type (TTS output, Omni /
+      ASR audio input)
+
+    Heterogeneous lists are fine: ``[TextAttachment(prompt), ImageAttachment(frame)]``
+    routes text to the prompt prefix and the image to the VLM backend.
 
     ``generating`` accepts either a ``@Generable``-decorated class or a
     subclass of :class:`LMOutput`. ``LMOutput`` carries an
     ``attachment`` field; when a TTS-style backend produces audio
-    bytes, the SDK fills it in automatically.
+    bytes, the SDK fills it in automatically with one or more
+    :class:`AudioAttachment` instances.
 
     NPU selection: pass exactly one of ``npu=`` (zero-based index into
     ``RKNN3Lite().get_devices_id()``) or ``device_id=`` (raw device
@@ -80,7 +94,8 @@ class LLMSession:
     def _coerce_attachments(
         attachment: Union[None, Attachment, List[Attachment]],
     ) -> List[Attachment]:
-        """Accept ``None`` / a single ``Attachment`` / a list of them.
+        """Accept ``None`` / a single ``Attachment`` (or subclass) / a
+        list of them.
 
         Older call sites pass a single ``Attachment``; new ones pass a
         list. Both are accepted; we normalise to ``List[Attachment]``.
@@ -246,7 +261,7 @@ class LLMSession:
             print(f"[wdnai.debug] parsed = {result!r}")
         return result
 
-    # ------------------------------------------------------------------ #
+# ------------------------------------------------------------------ #
     def _dispatch(
         self,
         prompt: str,
@@ -262,24 +277,23 @@ class LLMSession:
             run = getattr(self._backend, "run_text", None) or self._backend.run
             return run(prompt, **overrides), []
 
-                # Split attachments by channel. Audio is routed to
-        # ``backend.run_audio`` when the backend exposes one (ASR);
-        # image / video / text-prefixes work as before; unknown kinds
-        # fall through to ``run_text``.
+        # Split attachments by channel via ``isinstance`` dispatch. Audio
+        # is routed to ``backend.run_audio`` when the backend exposes one
+        # (ASR); image frames go to ``run_images`` (multi-frame replaces
+        # the legacy ``kind="video"`` path); text-prefixes join the
+        # prompt. Unknown attachment subclasses fall through to
+        # ``run_text``.
         images: List = []
-        video_frames: List = []
         text_prefixes: List[str] = []
-        audio_payloads: List[Attachment] = []
+        audio_payloads: List[AudioAttachment] = []
         other: List[Attachment] = []
 
         for att in attachments:
-            if att.kind == "image":
+            if isinstance(att, ImageAttachment):
                 images.extend(att.images)
-            elif att.kind == "video":
-                video_frames.extend(att.frames)
-            elif att.kind == "text":
+            elif isinstance(att, TextAttachment):
                 text_prefixes.append(att.text or "")
-            elif att.kind == "audio":
+            elif isinstance(att, AudioAttachment):
                 audio_payloads.append(att)
             else:
                 other.append(att)
@@ -304,14 +318,8 @@ class LLMSession:
             )
             return text, []
 
-
-
-
         if images:
             text = self._backend.run_images(full_prompt, images, **overrides)
-            return text, []
-        if video_frames:
-            text = self._backend.run_video(full_prompt, video_frames, **overrides)
             return text, []
         if other:
             # Pass-through to run_text for now (TTS-style backends will

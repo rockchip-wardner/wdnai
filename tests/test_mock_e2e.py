@@ -7,6 +7,151 @@ import numpy as np
 
 
 # --------------------------------------------------------------------------- #
+# Attachment hierarchy — direct constructor tests
+# --------------------------------------------------------------------------- #
+def test_attachment_subclass_constructors():
+    """``TextAttachment`` / ``ImageAttachment`` / ``AudioAttachment`` are
+    the public carriers; ``Attachment`` is the abstract base + legacy
+    factory (``Attachment(content, kind=...)`` syntax)."""
+    from wdnai import (
+        Attachment, TextAttachment, ImageAttachment, AudioAttachment,
+    )
+
+    # Explicit subclass constructors
+    t = TextAttachment("hello")
+    assert t.kind == "text" and t.text == "hello"
+    assert isinstance(t, Attachment)
+
+    img = np.zeros((4, 5, 3), dtype=np.uint8)
+    i = ImageAttachment(img)
+    assert i.kind == "image" and len(i.images) == 1 and i.images[0] is img
+    assert isinstance(i, Attachment)
+
+    frames = [img, img.copy()]
+    im = ImageAttachment(frames)
+    assert im.kind == "image" and len(im.images) == 2
+    assert im.images[0] is frames[0] and im.images[1] is frames[1]
+    assert isinstance(im, Attachment)
+
+    au = AudioAttachment(b"\x00\x01\x02")
+    assert au.kind == "audio" and au.data == b"\x00\x01\x02"
+    assert au.mime_type == "audio/wav"
+    assert isinstance(au, Attachment)
+
+    # Cross-class isinstance is negative
+    assert not isinstance(t, ImageAttachment)
+    assert not isinstance(i, TextAttachment)
+    assert not isinstance(au, ImageAttachment)
+
+    # Subclass strict types
+    try:
+        TextAttachment(123)  # type: ignore[arg-type]
+        raise AssertionError("TextAttachment(123) should raise")
+    except TypeError:
+        pass
+
+    try:
+        ImageAttachment("not an array")  # type: ignore[arg-type]
+        raise AssertionError("ImageAttachment('str') should raise")
+    except TypeError:
+        pass
+
+    try:
+        AudioAttachment("not bytes")  # type: ignore[arg-type]
+        raise AssertionError("AudioAttachment('str') should raise")
+    except TypeError:
+        pass
+
+
+def test_attachment_legacy_factory_routing():
+    """Legacy ``Attachment(content, kind=...)`` syntax still routes to
+    the matching concrete subclass (back-compat for pre-refactor call
+    sites)."""
+    from wdnai import (
+        Attachment, TextAttachment, ImageAttachment, AudioAttachment,
+    )
+    import numpy as np
+
+    img = np.zeros((4, 5, 3), dtype=np.uint8)
+
+    # ndarray → ImageAttachment
+    a = Attachment(img)
+    assert isinstance(a, ImageAttachment)
+
+    # list of ndarrays → ImageAttachment (multi-frame)
+    a = Attachment([img, img])
+    assert isinstance(a, ImageAttachment) and len(a.images) == 2
+
+    # str → TextAttachment (default and explicit)
+    a = Attachment("plain")
+    assert isinstance(a, TextAttachment) and a.text == "plain"
+    a = Attachment("plain", kind="text")
+    assert isinstance(a, TextAttachment) and a.text == "plain"
+
+    # bytes → AudioAttachment (default and explicit)
+    a = Attachment(b"\x00")
+    assert isinstance(a, AudioAttachment) and a.mime_type == "audio/wav"
+    a = Attachment(b"\x00", kind="audio", mime_type="audio/pcm")
+    assert isinstance(a, AudioAttachment) and a.mime_type == "audio/pcm"
+
+    # The kind="video" path is removed (use ImageAttachment(frames))
+    try:
+        Attachment("/tmp/foo.mp4", kind="video")
+        raise AssertionError("Attachment(kind='video') should raise")
+    except TypeError:
+        pass
+
+    # Bare Attachment() raises (no channel)
+    try:
+        Attachment()
+        raise AssertionError("Attachment() should raise")
+    except TypeError:
+        pass
+
+
+def test_session_coerce_attachments_accepts_hierarchy():
+    """``LLMSession._coerce_attachments`` accepts a single subclass
+    instance, a list of mixed subclasses, or None — and normalises to
+    ``List[Attachment]``."""
+    from wdnai import (
+        LLMSession, TextAttachment, ImageAttachment, AudioAttachment,
+    )
+    import numpy as np
+
+    img = np.zeros((4, 5, 3), dtype=np.uint8)
+
+    assert LLMSession._coerce_attachments(None) == []
+
+    single = LLMSession._coerce_attachments(TextAttachment("hi"))
+    assert isinstance(single, list) and len(single) == 1
+    assert isinstance(single[0], TextAttachment)
+
+    mixed = LLMSession._coerce_attachments(
+        [TextAttachment("hi"), ImageAttachment(img), AudioAttachment(b"\x00")],
+    )
+    assert len(mixed) == 3
+    assert [type(x).__name__ for x in mixed] == [
+        "TextAttachment", "ImageAttachment", "AudioAttachment",
+    ]
+
+    # Legacy factory-produced instance is also accepted
+    from wdnai import Attachment
+    legacy = LLMSession._coerce_attachments(Attachment("hi"))
+    assert isinstance(legacy[0], TextAttachment)
+
+    # Reject non-Attachment, non-list, non-None at the top level
+    # (list elements are trusted — caller is responsible for the
+    # contents; downstream ``_dispatch`` would crash on a bad element
+    # at the ``isinstance`` branch, which is the right place for that
+    # error to surface).
+    try:
+        LLMSession._coerce_attachments("just a string")
+        raise AssertionError("non-Attachment single should raise")
+    except TypeError:
+        pass
+
+
+# --------------------------------------------------------------------------- #
 def _make_workspace():
     tmp = tempfile.mkdtemp(prefix="wdnai_mock_")
     emb = np.arange(64 * 8, dtype=np.uint16).view(np.float16).reshape(64, 8).copy()
@@ -669,7 +814,7 @@ def test_overrides_passed_to_session_run():
 def test_session_respond_full_flow():
     """通过 LLMSession.respond() 走完整链路：prompt 注入 + JSON 解析 + pydantic。"""
     import asyncio
-    from wdnai import LLMSession, SystemLanguageModel, Attachment
+    from wdnai import LLMSession, SystemLanguageModel, ImageAttachment
     from pydantic import BaseModel, Field
     from typing import Optional
 
@@ -695,7 +840,7 @@ def test_session_respond_full_flow():
         # 2) 图像
         img = np.zeros((480, 640, 3), dtype=np.uint8)
         out2 = await sess.respond(
-            prompt="请分析这张图的行为", attachment=Attachment(img),
+            prompt="请分析这张图的行为", attachment=ImageAttachment(img),
         )
         assert isinstance(out2, str) and out2
         print("[session] image respond ->", repr(out2))
@@ -703,7 +848,7 @@ def test_session_respond_full_flow():
         # 3) 图像 + 结构化输出（注入 JSON hint + 解析）
         out3 = await sess.respond(
             prompt="请分析这张图的行为",
-            attachment=Attachment(img),
+            attachment=ImageAttachment(img),
             generating=Event,
         )
         # mock 返回的 prompt 是 "[vision-mock] <image>请分析这张图的行为 + JSON hint"，
@@ -1668,7 +1813,7 @@ def test_respond_thinking_block_stripped_in_schema():
     try:
         out = asyncio.run(sess.respond(
             prompt="describe",
-            attachment=__import__("wdnai").Attachment(
+            attachment=__import__("wdnai").ImageAttachment(
                 np.zeros((480, 640, 3), dtype=np.uint8)
             ),
             generating=Event,
@@ -1711,7 +1856,7 @@ def test_respond_hallucinated_tool_name_recovers_schema():
     try:
         out = asyncio.run(sess.respond(
             prompt="detect plate",
-            attachment=__import__("wdnai").Attachment(
+            attachment=__import__("wdnai").ImageAttachment(
                 np.zeros((480, 640, 3), dtype=np.uint8)
             ),
             generating=Event,
@@ -1757,7 +1902,7 @@ def test_respond_hallucinated_tool_name_with_invalid_arguments_falls_through():
     try:
         out = asyncio.run(sess.respond(
             prompt="detect",
-            attachment=__import__("wdnai").Attachment(
+            attachment=__import__("wdnai").ImageAttachment(
                 np.zeros((480, 640, 3), dtype=np.uint8)
             ),
             generating=Event,
@@ -1801,7 +1946,7 @@ def test_respond_tool_call_xml_wrapper_stripped():
     try:
         out = asyncio.run(sess.respond(
             prompt="detect",
-            attachment=__import__("wdnai").Attachment(
+            attachment=__import__("wdnai").ImageAttachment(
                 np.zeros((480, 640, 3), dtype=np.uint8)
             ),
             tools=[Crop],
@@ -2020,7 +2165,7 @@ def test_qwen3_5_vl_with_new_prompt_calls_crop_correctly():
     import asyncio
     from typing import Annotated
     from pydantic import BaseModel, Field
-    from wdnai import Attachment, Callable as _Callable
+    from wdnai import ImageAttachment, Callable as _Callable
 
     class Event(BaseModel):
         text: str = Field(description="event text")
@@ -2042,7 +2187,7 @@ def test_qwen3_5_vl_with_new_prompt_calls_crop_correctly():
     try:
         out = asyncio.run(sess.respond(
             prompt="detect plate",
-            attachment=Attachment(np.zeros((480, 640, 3), dtype=np.uint8)),
+            attachment=ImageAttachment(np.zeros((480, 640, 3), dtype=np.uint8)),
             generating=Event,
             tools=[Crop],
         ))

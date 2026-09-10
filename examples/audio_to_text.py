@@ -32,7 +32,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from wdnai import (
-    Attachment,
+    AudioAttachment,
     LLMSession,
     SystemLanguageModel,
 )
@@ -198,7 +198,7 @@ async def main() -> None:
             on_commit = printer if args.online else None
 
             raw = await session.respond(
-                attachment=[Attachment(pcm, kind="audio")],
+                attachment=[AudioAttachment(pcm, mime_type="audio/pcm")],
                 sample_rate=sample_rate,
                 n_channels=n_channels,
                 sample_width=sample_width,

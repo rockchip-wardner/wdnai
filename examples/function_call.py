@@ -31,10 +31,10 @@ from typing import Annotated, Literal
 import cv2
 
 from wdnai import (
-    Attachment,
     Callable,
     Field,
     Generable,
+    ImageAttachment,
     LLMSession,
     SystemLanguageModel,
 )
@@ -87,7 +87,7 @@ async def main(image: Path) -> None:
         session.reset()
         result = await session.respond(
             prompt=prompt,
-            attachment=[Attachment(img)],
+            attachment=[ImageAttachment(img)],
             tools=[Alarm, Notify],   # both tools available
             generating=Event,        # model may emit Event JSON instead
             debug=False,

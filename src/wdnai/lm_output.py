@@ -18,11 +18,20 @@ from .attachment import Attachment
 class LMOutput(BaseModel):
     """Structured output with optional binary attachments."""
 
-    # ``Attachment`` isn't a pydantic model; tell pydantic to skip
-    # schema introspection (we never serialise attachments to JSON).
+    # ``Attachment`` and its subclasses aren't pydantic models; tell
+    # pydantic to skip schema introspection (we never serialise
+    # attachments to JSON). Any subclass of :class:`Attachment`
+    # (TextAttachment / ImageAttachment / AudioAttachment) is accepted
+    # in the list at runtime — the type hint is just a hint for static
+    # checkers.
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     attachment: List[Attachment] = Field(
         default_factory=list,
-        description="Output attachments. Populated by the session after respond().",
+        description=(
+            "Output attachments. Populated by the session after respond(). "
+            "In practice this list contains AudioAttachment instances for "
+            "TTS / Omni outputs, ImageAttachment for VLM-decoded images, "
+            "TextAttachment for free-form text payloads, or a mix thereof."
+        ),
     )

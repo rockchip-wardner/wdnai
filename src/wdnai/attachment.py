@@ -1,8 +1,23 @@
-"""Attachment: text / image / video / audio / raw bytes.
+"""Attachment hierarchy.
 
-Unified carrier for inputs and outputs of an ``LLMSession``. The
-``kind`` field selects which channel populates (``images`` /
-``frames`` / ``text`` / ``data``).
+    Attachment  (base class + legacy factory constructor)
+    ├── TextAttachment    — ``kind="text"``  (plain string)
+    ├── ImageAttachment   — ``kind="image"`` (one or more BGR ndarray frames)
+    └── AudioAttachment   — ``kind="audio"`` (raw bytes + MIME type)
+
+New code should construct the explicit subclass
+(``TextAttachment(s)`` / ``ImageAttachment(arr)`` /
+``AudioAttachment(b)``) so the channel is visible at the call site and
+``isinstance`` dispatch at the consumer side is type-safe.
+
+The legacy ``Attachment(s)`` / ``Attachment(arr)`` /
+``Attachment(b"...", kind="audio")`` syntax still works — the base
+class' ``__new__`` routes the call to the matching concrete subclass
+and returns it. There is intentionally no ``VideoAttachment`` subclass:
+the legacy ``kind="video"`` path that sampled 5 frames via cv2 is
+removed; callers wanting video frames now sample themselves (typically
+via ``wdnav.VideoCapture.read0()``) and pass the list as
+``ImageAttachment(frames)``.
 """
 from __future__ import annotations
 
@@ -11,74 +26,126 @@ from typing import TYPE_CHECKING, List, Optional, Union
 if TYPE_CHECKING:  # noqa: F401
     import numpy as np
 
-# ``wdnav`` is an optional peer dependency. ``Attachment`` only needs the
-# ``DecodedFrame`` class to detect ``wdnav.VideoCapture.read0()`` outputs;
-# keep the import lazy so a system without ``wdnav`` installed can still
-# import ``wdnai`` and use the ndarray / text / bytes constructors.
+# ``wdnav`` is an optional peer dependency. ``ImageAttachment`` only
+# needs the ``DecodedFrame`` class to detect ``wdnav.VideoCapture.read0()``
+# outputs; keep the import lazy so a system without ``wdnav`` installed
+# can still import ``wdnai`` and use the ndarray / text / bytes
+# constructors.
 try:
     from wdnav.mpp import DecodedFrame as _WdnavDecodedFrame  # noqa: F401
 except ImportError:
     _WdnavDecodedFrame = None  # type: ignore[assignment]
 
 
+# --------------------------------------------------------------------------- #
+# Base class + legacy factory routing
+# --------------------------------------------------------------------------- #
 class Attachment:
-    """Attachment sent to / received from an LLM / VLM / TTS session.
+    """Base class for inputs to / outputs from an :class:`LLMSession`.
 
-    Construction supports:
+    Subclasses (:class:`TextAttachment`, :class:`ImageAttachment`,
+    :class:`AudioAttachment`) carry exactly the payload that matches
+    their channel — no union ``.text / .images / .frames / .data`` slot
+    bag. The base class itself carries no payload; it exists so the
+    caller can ``isinstance(item, Attachment)``-check and so the
+    legacy ``Attachment(...)`` factory syntax still resolves.
 
-    - Single image: ``Attachment(img)`` where ``img`` is a BGR ndarray.
-    - Multiple images: ``Attachment([img1, img2, ...])``.
-    - 0-copy frame from ``wdnav.VideoCapture.read0()``: ``Attachment(frame0)``
-      where ``frame0`` is an ``wdnav.mpp.DecodedFrame``. Internally calls
-      ``frame0.numpy()`` (RGA DMA→CPU materialisation) and proceeds as a
-      regular image attachment. ``wdnav`` is an optional peer dependency —
-      if it is not installed, the constructor falls through to the
-      usual ``TypeError`` for unsupported types.
-    - Text: ``Attachment("the prompt text")`` or ``Attachment("…", kind="text")``.
-      When the string happens to also be an existing file path, pass
-      ``kind="text"`` explicitly to opt out of the video heuristic.
-    - Audio bytes (TTS output): ``Attachment(wav_bytes, kind="audio")``.
-    - Video file path: ``Attachment("/path/to.mp4", kind="video")``.
-    - Raw bytes (video or generic): ``Attachment(b"...", kind="video")``.
-
-    Attributes (the channel that's populated depends on ``kind``):
-
-    - ``kind``     — ``"text" | "image" | "video" | "audio"``.
-    - ``text``     — str content (when ``kind="text"``).
-    - ``images``   — list[BGR ndarray] (when ``kind="image"``).
-    - ``frames``   — list[BGR ndarray] (when ``kind="video"``; sampled at
-                    construction).
-    - ``data``     — raw bytes (when ``kind="audio"`` or raw video).
-    - ``mime_type`` — optional, e.g. ``"audio/wav"``.
+    **Legacy factory syntax**: ``Attachment(s)`` / ``Attachment(arr)`` /
+    ``Attachment(b"...", kind="audio")`` are still accepted — the
+    ``__new__`` method below routes to the matching concrete subclass
+    and returns it. New code should call the explicit subclass
+    constructor so the channel is obvious at the call site.
     """
+
+    def __new__(cls, *args, **kwargs):
+        # Subclass constructors (``ImageAttachment(...)``, etc.) bypass
+        # the factory branch (cls != Attachment). Only the bare
+        # ``Attachment(...)`` call routes through here.
+        if cls is Attachment:
+            if not args and not kwargs:
+                raise TypeError(
+                    "Attachment is abstract — use TextAttachment, "
+                    "ImageAttachment, or AudioAttachment."
+                )
+            return _attachment_factory(*args, **kwargs)
+        return super().__new__(cls)
+
+    # Subclasses MUST override ``kind`` with a class-level string
+    # (``kind = "text"`` / ``"image"`` / ``"audio"``). The base class
+    # declares it as an empty string sentinel so attribute access never
+    # raises — concrete instances always have a non-empty ``kind``.
+    kind: str = ""
+
+    def to_payload(self) -> dict:  # pragma: no cover
+        """Diagnostic summary; overridden by subclasses."""
+        return {"kind": self.kind}
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"{type(self).__name__}(kind={self.kind!r})"
+
+
+# --------------------------------------------------------------------------- #
+# Concrete subclasses
+# --------------------------------------------------------------------------- #
+class TextAttachment(Attachment):
+    """Plain text carrier (chat prompts, TTS text-to-speak)."""
+
+    kind = "text"
+
+    def __init__(self, text: str, **_) -> None:
+        # The ``**_`` sink absorbs legacy factory kwargs — when
+        # ``Attachment.__new__`` routes ``Attachment("text", kind="text")``
+        # to ``TextAttachment("text")``, Python then re-invokes this
+        # ``__init__`` with the original kwargs (including ``kind="text"``);
+        # the sink swallows them so the public signature stays strict
+        # for direct construction.
+        if not isinstance(text, str):
+            raise TypeError(
+                f"TextAttachment expects str, got {type(text).__name__}"
+            )
+        self.text: str = text
+
+    def to_payload(self) -> dict:
+        return {"kind": self.kind, "n_chars": len(self.text)}
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"TextAttachment(text={len(self.text)}chars)"
+
+
+class ImageAttachment(Attachment):
+    """One or more BGR ndarray frames, fed to the VLM backend.
+
+    Accepts:
+
+    - ``ImageAttachment(img)`` where ``img`` is a BGR ndarray.
+    - ``ImageAttachment([img1, img2, ...])`` for multi-frame inputs.
+      This replaces the legacy ``kind="video"`` constructor path:
+      callers sample frames themselves (e.g. via
+      ``wdnav.VideoCapture.read0()``) and pass the list.
+    - 0-copy frame from ``wdnav.VideoCapture.read0()``:
+      ``ImageAttachment(frame0)`` where ``frame0`` is an
+      ``wdnav.mpp.DecodedFrame``. The constructor calls
+      ``frame0.numpy()`` (RGA DMA→CPU materialisation) and proceeds
+      as a regular ndarray.
+    """
+
+    kind = "image"
 
     def __init__(
         self,
-        content: Union["np.ndarray", List["np.ndarray"], str, bytes, bytearray],
-        kind: Optional[str] = None,
-        mime_type: Optional[str] = None,
+        content: Union["np.ndarray", List["np.ndarray"]],
+        **_,
     ) -> None:
+        # The ``**_`` sink absorbs legacy factory kwargs (``kind`` /
+        # ``mime_type``) — see ``TextAttachment.__init__`` for the
+        # rationale. Public signature stays strict for direct
+        # construction.
         try:
             import numpy as _np  # noqa: WPS433
         except ImportError:
             _np = None  # type: ignore[assignment]
-        self._np = _np
 
-        self.text: Optional[str] = None
-        self.images: List["np.ndarray"] = []
-        self.frames: List["np.ndarray"] = []
-        self.data: bytes = b""
-        self.mime_type = mime_type
-
-        # ---------- 0-copy frame: wdnav.mpp.DecodedFrame ----------
-        # ``wdnav.VideoCapture.read0()`` returns a ``DecodedFrame`` whose
-        # backing storage is a DMA-BUF fd (kernel-side, owned by MPP).
-        # Calling ``.numpy()`` hands the fd to RGA, which materialises
-        # the frame into a contiguous BGR ndarray in one hardware pass.
-        # After that the pipeline (``_preprocess_image``,
-        # ``_build_image_inputs``) runs unchanged — equivalent to
-        # ``Attachment(frame0.numpy())`` but lets the caller keep the
-        # DecodedFrame handle until ``Attachment`` is constructed.
+        # 0-copy frame: wdnav.mpp.DecodedFrame
         if _WdnavDecodedFrame is not None and isinstance(content, _WdnavDecodedFrame):
             arr = content.numpy()
             if _np is None or not isinstance(arr, _np.ndarray):
@@ -86,151 +153,154 @@ class Attachment:
                     f"{type(content).__name__}.numpy() must return np.ndarray, "
                     f"got {type(arr).__name__}"
                 )
-            self.kind = "image"
-            self.images = [arr]
+            self.images: List["np.ndarray"] = [arr]
             return
 
-        # ---------- image (ndarray / list[ndarray]) ----------
         if _np is not None and isinstance(content, _np.ndarray):
-            self.kind = "image"
             self.images = [content]
             return
+
         if (
             _np is not None
             and isinstance(content, list)
             and all(isinstance(x, _np.ndarray) for x in content)
         ):
-            self.kind = "image"
             self.images = list(content)
             return
 
-        # ---------- raw bytes ----------
-        if isinstance(content, (bytes, bytearray)):
-            data = bytes(content)
-            # Default bytes → audio (the more common TTS output shape);
-            # callers can override with kind="video" for raw video streams.
-            self.kind = kind or "audio"
-            self.data = data
-            if self.mime_type is None:
-                self.mime_type = "audio/wav"
-            return
-
-        # ---------- string ----------
-        if isinstance(content, str):
-            # Honor explicit kind first.
-            if kind == "text":
-                self.kind = "text"
-                self.text = content
-                return
-            if kind == "video":
-                self.kind = "video"
-                self.frames = self._sample_video(content)
-                return
-            # Heuristic: existing file → video; otherwise treat as text.
-            if self._looks_like_path(content):
-                try:
-                    frames = self._sample_video(content)
-                except Exception:
-                    self.kind = "text"
-                    self.text = content
-                else:
-                    self.kind = "video"
-                    self.frames = frames
-            else:
-                self.kind = "text"
-                self.text = content
-            return
-
         raise TypeError(
-            f"Unsupported attachment type: {type(content).__name__!r}. "
-            "Expected np.ndarray | List[np.ndarray] | str | bytes | bytearray."
+            f"ImageAttachment expects np.ndarray or List[np.ndarray]; "
+            f"got {type(content).__name__!r}"
         )
 
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _looks_like_path(s: str) -> bool:
-        """Heuristic: treat ``str`` as a video path only if it points to
-        an existing file with a video-y extension. Otherwise assume text."""
-        import os
-        if "\n" in s or "\r" in s:
-            return False
-        if not os.path.exists(s) or not os.path.isfile(s):
-            return False
-        _, ext = os.path.splitext(s)
-        return ext.lower() in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv"}
-
-    # ------------------------------------------------------------------ #
-    def _sample_video(self, path: str, n_frames: int = 5, frame_size: int = 384):
-        """Evenly sample ``n_frames`` from the video. Returns a list of BGR ndarrays."""
-        try:
-            import cv2  # noqa: WPS433
-        except ImportError as e:
-            raise ImportError("Video handling requires opencv-python (cv2)") from e
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            raise FileNotFoundError(f"Cannot open video: {path}")
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        if total <= 0:
-            frames = []
-            for i in range(n_frames):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(round(2 * i * fps)))
-                ok, f = cap.read()
-                if not ok or f is None:
-                    break
-                frames.append(f)
-        else:
-            idxs = [int(round(total * (i + 0.5) / n_frames)) for i in range(n_frames)]
-            frames = []
-            for idx in idxs:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                ok, f = cap.read()
-                if not ok or f is None:
-                    continue
-                frames.append(f)
-        cap.release()
-        if not frames:
-            raise RuntimeError(f"Failed to sample frames from video: {path}")
-        return frames
-
-    # ------------------------------------------------------------------ #
-    def to_payload(self) -> dict:  # pragma: no cover
-        out = {"kind": self.kind}
-        if self.kind == "image":
-            out["n_images"] = len(self.images)
-        elif self.kind == "video":
-            out["n_frames"] = len(self.frames)
-        elif self.kind == "text":
-            out["n_chars"] = len(self.text or "")
-        elif self.kind == "audio":
-            out["n_bytes"] = len(self.data)
-            out["mime_type"] = self.mime_type
-        return out
+    def to_payload(self) -> dict:
+        return {"kind": self.kind, "n_images": len(self.images)}
 
     def __repr__(self) -> str:  # pragma: no cover
-        if self.kind == "image":
-            return f"Attachment(images={len(self.images)})"
-        if self.kind == "video":
-            return f"Attachment(frames={len(self.frames)})"
-        if self.kind == "text":
-            n = len(self.text or "")
-            return f"Attachment(text={n}chars)"
-        if self.kind == "audio":
-            return f"Attachment(audio={len(self.data)}B, mime={self.mime_type})"
-        return f"Attachment(kind={self.kind!r})"
+        return f"ImageAttachment(images={len(self.images)})"
 
-    # Convenience factories -------------------------------------------- #
-    @classmethod
-    def text(cls, content: str) -> "Attachment":
-        """Explicit text attachment (skips the path heuristic)."""
-        return cls(content, kind="text")
 
-    @classmethod
-    def video_path(cls, path: str) -> "Attachment":
-        """Explicit video-from-file attachment (skips the path heuristic)."""
-        return cls(path, kind="video")
+class AudioAttachment(Attachment):
+    """Raw audio bytes + MIME type, fed to TTS / ASR / Omni backends.
 
-    @classmethod
-    def audio_bytes(cls, data: bytes, mime_type: str = "audio/wav") -> "Attachment":
-        """Explicit audio attachment (TTS output carrier)."""
-        return cls(data, kind="audio", mime_type=mime_type)
+    The SDK doesn't decode the bytes — backend-specific ``run_audio``
+    implementations consume them as-is (TTS uses ``audio/wav`` 24 kHz
+    mono 32-bit IEEE float; Omni / ASR use 16 kHz mono s16le PCM).
+    """
+
+    kind = "audio"
+
+    def __init__(
+        self,
+        data: Union[bytes, bytearray],
+        mime_type: str = "audio/wav",
+        **_,
+    ) -> None:
+        # The ``**_`` sink absorbs legacy factory kwargs (``kind``) —
+        # see ``TextAttachment.__init__`` for the rationale. Public
+        # signature stays strict for direct construction.
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError(
+                f"AudioAttachment expects bytes, got {type(data).__name__}"
+            )
+        self.data: bytes = bytes(data)
+        self.mime_type: Optional[str] = mime_type
+
+    def to_payload(self) -> dict:
+        return {
+            "kind": self.kind,
+            "n_bytes": len(self.data),
+            "mime_type": self.mime_type,
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"AudioAttachment(audio={len(self.data)}B, mime={self.mime_type})"
+
+
+# --------------------------------------------------------------------------- #
+# Legacy factory routing — used by ``Attachment.__new__`` when the bare
+# base class is invoked. Preserves the old ``Attachment(content, kind=...)``
+# syntax so call sites written before the hierarchy refactor keep working.
+# --------------------------------------------------------------------------- #
+def _attachment_factory(
+    content,
+    kind: Optional[str] = None,
+    mime_type: Optional[str] = None,
+) -> Attachment:
+    """Route the legacy ``Attachment(content, kind=...)`` syntax to the
+    matching concrete subclass.
+
+    Mirrors the historical heuristics so existing call sites keep
+    working:
+
+    - ``Attachment(ndarray)`` → :class:`ImageAttachment`
+    - ``Attachment([ndarray, ...])`` → :class:`ImageAttachment` (multi-frame)
+    - ``Attachment(str)`` → :class:`TextAttachment` (no more path→video sampling)
+    - ``Attachment(bytes)`` → :class:`AudioAttachment` (default; TTS output shape)
+    - ``Attachment(str, kind="text")`` → :class:`TextAttachment` (explicit)
+    - ``Attachment(bytes, kind="audio")`` → :class:`AudioAttachment` (explicit)
+
+    The legacy ``kind="video"`` constructor path is removed — there is
+    no ``VideoAttachment`` subclass. Callers wanting video frames sample
+    themselves (typically via ``wdnav.VideoCapture.read0()``) and pass
+    the list as ``ImageAttachment(frames)``.
+    """
+    # Reject the deprecated video path with an informative error so the
+    # caller can migrate cleanly instead of silently dropping frames.
+    if kind == "video":
+        raise TypeError(
+            "Attachment(kind='video') is no longer supported — there is no "
+            "VideoAttachment subclass. Sample the video yourself "
+            "(e.g. via wdnav.VideoCapture.read0()) and pass the frames "
+            "as ImageAttachment(frames)."
+        )
+
+    try:
+        import numpy as _np  # noqa: WPS433
+    except ImportError:
+        _np = None  # type: ignore[assignment]
+
+    # ndarray / list[ndarray] / wdnav.DecodedFrame → ImageAttachment
+    if _WdnavDecodedFrame is not None and isinstance(content, _WdnavDecodedFrame):
+        return ImageAttachment(content)
+    if _np is not None and isinstance(content, _np.ndarray):
+        return ImageAttachment(content)
+    if (
+        _np is not None
+        and isinstance(content, list)
+        and all(isinstance(x, _np.ndarray) for x in content)
+    ):
+        return ImageAttachment(content)
+
+    # bytes → AudioAttachment (default; TTS output shape)
+    if isinstance(content, (bytes, bytearray)):
+        if kind not in (None, "audio"):
+            raise TypeError(
+                f"Attachment(bytes, kind={kind!r}): only kind='audio' is "
+                f"supported; bytes with kind='video' is no longer supported."
+            )
+        return AudioAttachment(bytes(content), mime_type=mime_type or "audio/wav")
+
+    # str → TextAttachment (no more path→video heuristic)
+    if isinstance(content, str):
+        if kind not in (None, "text"):
+            raise TypeError(
+                f"Attachment(str, kind={kind!r}): only kind='text' is "
+                f"supported (no VideoAttachment subclass); pass an "
+                f"ImageAttachment(frames) for video inputs."
+            )
+        return TextAttachment(content)
+
+    raise TypeError(
+        f"Unsupported attachment type: {type(content).__name__!r}. "
+        "Use TextAttachment(text), ImageAttachment(img | [img, ...]), "
+        "or AudioAttachment(bytes, mime_type=...)."
+    )
+
+
+__all__ = [
+    "Attachment",
+    "TextAttachment",
+    "ImageAttachment",
+    "AudioAttachment",
+]

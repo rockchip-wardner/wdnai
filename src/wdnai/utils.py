@@ -127,7 +127,7 @@ def letterbox_resize_with_meta(
 
         canvas, meta = letterbox_resize_with_meta(img, 384)
         # ask VLM what to crop
-        result = await session.respond(attachment=Attachment(canvas), ...)
+        result = await session.respond(attachment=ImageAttachment(canvas), ...)
         # bbox is in 0-1000 coords of `canvas`
         x1, y1, x2, y2 = unletterbox_bbox(result.bbox, meta)
         roi = img[int(y1):int(y2), int(x1):int(x2)]

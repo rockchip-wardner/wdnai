@@ -8,7 +8,7 @@ parameters, etc.). ``SystemLanguageModel`` is the catalog entry point, exposing
 
 Typical usage::
 
-    from wdnai import SystemLanguageModel, LLMSession, Attachment
+    from wdnai import SystemLanguageModel, LLMSession, ImageAttachment
 
     model = SystemLanguageModel.qwen3_vl_2b().with_paths(
         rknn_llm_path="/userdata/Qwen3-VL-2B-llm.rknn3",
@@ -17,7 +17,7 @@ Typical usage::
         embed_path="/userdata/Qwen3-VL-2B-llm.embed.bin",
     )
     session = LLMSession(model=model)
-    out = await session.respond(msg="describe the image", attachment=Attachment(img))
+    out = await session.respond(msg="describe the image", attachment=ImageAttachment(img))
 """
 from __future__ import annotations
 
@@ -900,10 +900,11 @@ class SystemLanguageModel:
         The SDK auto-prepends ``<audio>`` to the user prompt before sending
         it to the LLM, so callers just write a plain text instruction::
 
+            from wdnai import AudioAttachment
             async with LLMSession(model=SystemLanguageModel.qwen_2_5_omni_3b()) as sess:
                 text = await sess.respond(
                     prompt="请描述这段音频的内容",
-                    attachment=[Attachment(pcm, kind="audio")],
+                    attachment=[AudioAttachment(pcm, mime_type="audio/pcm")],
                     sample_rate=..., n_channels=..., sample_width=...,
                 )
         """

@@ -9,7 +9,7 @@ hosts without the upstream demo directory. ``import wdnai.backends.tts``
 is now self-contained.
 
 ``run_text(prompt)`` returns the prompt unchanged along with a
-single :class:`Attachment` carrying the synthesised WAV bytes; the
+single :class:`AudioAttachment` carrying the synthesised WAV bytes; the
 SDK assigns that attachment to ``LMOutput.attachment``.
 
 Model layout on disk (matches :mod:`wdnai.models`):
@@ -64,7 +64,7 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 import numpy as np
 
 from .._librknn import RKNN3Lite, build_llm_callback
-from ..attachment import Attachment
+from ..attachment import AudioAttachment
 from ._common import resolve_device_id
 
 # LLMCallState integer values used by the TTS callbacks below. Kept
@@ -1518,7 +1518,7 @@ class Qwen3TTSDriver:
 class TTSBackend:
     """TTS backend — text-in, audio-out.
 
-    ``run_text(prompt)`` returns ``(prompt_str, [Attachment])`` where
+    ``run_text(prompt)`` returns ``(prompt_str, [AudioAttachment])`` where
     the attachment carries the synthesised WAV bytes. ``LLMSession``
     unpacks the tuple and assigns the attachment to ``LMOutput.attachment``
     so the v2 caller sees a unified output.
@@ -1562,13 +1562,16 @@ class TTSBackend:
         LOG.info("TTSBackend initialised; model_dir=%s", self.model_dir)
 
     # ------------------------------------------------------------------ #
-    def run_text(self, prompt: str, **overrides: Any) -> Tuple[str, List[Attachment]]:
+    def run_text(self, prompt: str, **overrides: Any) -> Tuple[str, List["Attachment"]]:
         """Public entry point invoked by ``LLMSession._dispatch``.
 
         Drives the TTS pipeline via the demo's ``run_with_progress``
         and packages the resulting WAV bytes as an
-        :class:`Attachment` (``kind="audio"``).
+        :class:`AudioAttachment` (24 kHz mono 32-bit IEEE float WAV).
         """
+        # Forward-declared in the signature for type tools — imported
+        # locally below where needed.
+        from ..attachment import Attachment  # noqa: F401
         ref_speaker = overrides.get("ref_speaker", "girl_base")
         language = overrides.get("language", "auto")
         speaker = overrides.get("speaker", "")
@@ -1603,7 +1606,7 @@ class TTSBackend:
                 pass
 
         return prompt, [
-            Attachment(wav_bytes, kind="audio", mime_type="audio/wav"),
+            AudioAttachment(wav_bytes, mime_type="audio/wav"),
         ]
 
     # ------------------------------------------------------------------ #

@@ -54,7 +54,13 @@ from typing import Any, Optional, Tuple
 import cv2
 import numpy as np
 import wdnav
-from wdnai import Attachment, Generable, Field, LLMSession, SystemLanguageModel
+from wdnai import (
+    Generable,
+    Field,
+    ImageAttachment,
+    LLMSession,
+    SystemLanguageModel,
+)
 from typing import Literal
 from dataclasses import replace
 
@@ -194,7 +200,7 @@ async def _run_detect_once(session, prompt, frame, schema, *, vote_k: int = 1, d
     """Run a single detect-mode VLM call on a copy of frame."""
     kwargs = dict(
         prompt=prompt,
-        attachment=Attachment(frame),
+        attachment=ImageAttachment(frame),
         generating=schema,
         debug=debug,
     )
@@ -208,7 +214,7 @@ async def _run_ocr_once(session, roi, *, vote_k: int = 1, debug: bool = False):
     """Run a single OCR-mode VLM call on a copy of roi."""
     kwargs = dict(
         prompt=build_ocr_prompt(),
-        attachment=Attachment(roi),
+        attachment=ImageAttachment(roi),
         generating=PlateOCR,
         debug=debug,
     )

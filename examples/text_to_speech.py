@@ -7,7 +7,7 @@ bytes）全部封装在 SDK 的 ``TTSBackend`` 里（参见
 
 1. 构造 ``model = SystemLanguageModel.qwen3_tts()``
 2. ``session = LLMSession(model=model)``
-3. ``result = await session.respond(attachment=[Attachment(text, kind="text")], generating=TTSResult)``
+3. ``result = await session.respond(attachment=[TextAttachment(text)], generating=TTSResult)``
 4. 从 ``result.attachment[0].data`` 拿到 WAV bytes，自己做后处理（落盘 + 播放）
 
 参考 ``detect_image.py`` 的模式（list of Attachment + ``@Generable`` 继承
@@ -45,12 +45,12 @@ from typing import List
 import numpy as np
 
 from wdnai import (
-    Attachment,
     Field,
     Generable,
     LMOutput,
     LLMSession,
     SystemLanguageModel,
+    TextAttachment,
 )
 
 LOG = logging.getLogger("text_to_speech")
@@ -208,7 +208,7 @@ async def main() -> None:
         # when the user wants silence. When the flag is False the SDK
         # streams live; we don't replay afterwards.
         result = await session.respond(
-            attachment=[Attachment(args.text, kind="text")],
+            attachment=[TextAttachment(args.text)],
             generating=TTSResult,
             ref_speaker=args.ref_speaker,
             language=args.language,

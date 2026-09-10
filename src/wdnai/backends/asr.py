@@ -645,7 +645,7 @@ class ASRBackend:
     # relying on AttributeError.
     def run_text(self, prompt: str, **kw: Any) -> str:
         raise RuntimeError(
-            "ASRBackend.run_text(): pass Attachment(wav_bytes, kind='audio') "
+            "ASRBackend.run_text(): pass AudioAttachment(wav_bytes) "
             "to LLMSession.respond() and the SDK will route to run_audio()."
         )
 
