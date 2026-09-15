@@ -575,13 +575,23 @@ class LLMSession:
 
         Call this between loop iterations to force the model to start from a
         clean state — trades a bit of speed for determinism.
+
+        Backend RKNN3Lite handles are named inconsistently across backends:
+        ``TextBackend`` stores ``self.rknn`` while ASR / Embedding / Omni /
+        LocateAnything store ``self.rknn_llm``. Probing both keeps ``reset()``
+        effective everywhere — with only ``rknn_llm`` it was a silent no-op
+        for text chat, letting KV history accumulate across agent-loop
+        rounds (the model then re-emitted the previous round's output and
+        generated raw ``<|im_start|>`` markers).
         """
-        rknn_llm = getattr(self._backend, "rknn_llm", None)
-        if rknn_llm is not None and hasattr(rknn_llm, "clear_kvcache"):
-            try:
-                rknn_llm.clear_kvcache()
-            except Exception:
-                pass
+        for attr in ("rknn_llm", "rknn"):
+            rknn_llm = getattr(self._backend, attr, None)
+            if rknn_llm is not None and hasattr(rknn_llm, "clear_kvcache"):
+                try:
+                    rknn_llm.clear_kvcache()
+                except Exception:
+                    pass
+                return
 
     def majority_vote(self, k: int, **kwargs: Any) -> Any:
         """Run the current ``prompt`` + attachment ``k`` times synchronously and return the most common result.

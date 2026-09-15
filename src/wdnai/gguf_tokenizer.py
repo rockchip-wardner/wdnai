@@ -95,7 +95,15 @@ def load_tokenizer_from_gguf(gguf_path: str):
     # the inner word, ``>``.
     in_vocab = [t for t in multimodal_tokens if t in vocab]
     missing = [t for t in multimodal_tokens if t not in vocab]
-    extra = in_vocab
+    # ChatML control markers must be ``special`` too: the model can emit
+    # ``<|im_start|>`` (a new turn boundary) when it degenerates, and with
+    # ``skip_special_tokens=True`` a non-special marker is *not* skipped —
+    # the literal ``"<|im_start|>"`` then leaks into the decoded text.
+    # (``<|im_end|>`` is already special via ``eos_token`` below.)
+    # ``<think>`` / ``</think>`` are deliberately NOT registered — callers
+    # rely on them appearing in the text to split the thinking channel.
+    chatml_control = [t for t in ("<|im_start|>",) if t in vocab]
+    extra = in_vocab + chatml_control
     if missing:
         tok_obj.add_tokens(missing)
 
