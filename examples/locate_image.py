@@ -58,7 +58,7 @@ The visualised boxes are written to ``locate_anything_vis.jpg`` by default;
     .venv/bin/python .venv/src/wdnai/examples/locate_image.py
     .venv/bin/python .venv/src/wdnai/examples/locate_image.py \\
         --image bus.jpg \\
-        --prompt "Locate all the instances that matches the following description: person"
+        --prompt "Locate all the instances that matches the following description: person</c>car"
     .venv/bin/python .venv/src/wdnai/examples/locate_image.py --no-vis \\
         --image bus.jpg
 """
