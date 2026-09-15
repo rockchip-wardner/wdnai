@@ -636,6 +636,9 @@ def _bind_prototypes(L: ctypes.CDLL) -> None:
     L.rknn3_session_set_llm_param.argtypes = [c_void_p, c_void_p, c_int]
     L.rknn3_session_set_llm_param.restype = c_int
 
+    L.rknn3_session_query_state.argtypes = [c_void_p, c_void_p]
+    L.rknn3_session_query_state.restype = c_int
+
 
 # =============================================================================
 # 6. LLM callback bundle
@@ -1910,7 +1913,6 @@ class RKNN3Lite:
         self.weight_path: Optional[str] = None
         self.rknn_config = _RknnConfig()        # user-mutable before init
         self.rknn_runtime: Optional[_Runtime] = None
-        self._first_token_time: Optional[float] = None
         self._llm_args: Optional[List[dict]] = None
         self._llm_callback: Optional[_LLMCallbackBundle] = None
         self._init_device_id: Optional[bytes] = None
@@ -2030,26 +2032,75 @@ class RKNN3Lite:
         rt = self.rknn_runtime
         if not isinstance(rt, _LLMRuntime) or rt.session is None:
             return -1, []
-        self._first_token_time = None
         packed = rt.session._pack_inputs(
             prompt=prompt, embeds=embeds, tokens=tokens,
             inputs=inputs, enable_thinking=enable_thinking,
         )
+        # Wall-clock anchors for ``printf_perf``: callers compute
+        # prefill_ms = (sink.first_token_time - llm_start) * 1000
+        # decode_ms  = (llm_end             - sink.first_token_time) * 1000
+        # so both ends need real ``time.perf_counter()`` values — NOT 0.0
+        # (which previously made ``prefill_ms`` print
+        # ``first_token_time * 1000``, i.e. seconds since process start).
+        llm_start = time.perf_counter()
         ret = run_fn(
             keep_history=keep_history, max_new_tokens=max_new_tokens,
             prefill_only=prefill_only, disable_sampling=disable_sampling,
             inputs=packed,
         )
-        # rknn3lite's session_run returns `[n_decode, n_prefill,
-        # llm_start, llm_end]`; we don't track per-token counts
-        # without a result callback, but the perf display in
-        # ``_common.printf_perf`` only reads ``first_token_time`` /
-        # ``llm_end`` for the breakdown so 0/0 + start/end is fine.
-        llm_start = 0.0
         llm_end = time.perf_counter()
-        if self._first_token_time is not None:
-            llm_start = self._first_token_time
-        return ret, [0, 0, llm_start, llm_end]
+
+        # Pull the authoritative prefill / decode token counts from the
+        # C side via ``rknn3_session_query_state`` — same API the C++
+        # LocateAnything / Qwen3_5_VL demos use to read state into
+        # ``rknn_perf_metrics_t`` (see e.g.
+        # ``rknn3-model-zoo/examples/LocateAnything/cpp/llm/
+        # rknn_locate_anything_llm.cc:156-164``). The shim's
+        # ``_LLMRunState`` mirrors librknn3's RKLLMRunState byte-for-byte
+        # (verified against ``rknn3_api.h:1058-1072``: same field order,
+        # 12 fields, identical widths including the 4-byte kvcache_policy
+        # enum at offset 72). Layout drift on a future librknn3 bump
+        # wouldn't raise — ctypes would just read garbage at the wrong
+        # offset — so the sanity bounds below fall back to
+        # ``len(sink.tokens)`` (decode) / 0 (prefill) when values look
+        # out of range. The upper bound 1_000_000 is intentionally
+        # generous (no model exceeds max_context_len that high) so it
+        # never trips on legitimate runs.
+        n_prefill_tokens = 0
+        n_decode_tokens = 0
+        try:
+            state = _LLMRunState()
+            qret = self.lib.rknn3_session_query_state(
+                rt.session._session,
+                ctypes_cast(pointer(state), c_void_p),
+            )
+            if qret == 0:
+                raw_prefill = int(state.n_prefill_tokens)
+                raw_decode = int(state.n_decode_tokens)
+                # Sanity bounds — sanity gate catches struct-layout drift
+                # before the garbage values propagate to ``printf_perf``.
+                if 0 < raw_prefill < 1_000_000 and 0 <= raw_decode < 1_000_000:
+                    n_prefill_tokens = raw_prefill
+                    n_decode_tokens = raw_decode
+                else:
+                    import logging as _logging
+                    _logging.getLogger("wdnai._librknn").warning(
+                        "rknn3_session_query_state returned out-of-range values "
+                        "(prefill=%d decode=%d qret=%d) — likely struct layout "
+                        "drift between shim's _LLMRunState and librknn3's "
+                        "RKLLMRunState. Falling back to sink.tokens for decode.",
+                        raw_prefill, raw_decode, qret,
+                    )
+                    n_decode_tokens = len(self.sink.tokens) if self.sink else raw_decode
+        except Exception as e:  # noqa: BLE001
+            # Symbol missing on this librknn3 build. Don't break the
+            # inference — degrade to 0/0 like the original shim did.
+            import logging as _logging
+            _logging.getLogger("wdnai._librknn").debug(
+                "rknn3_session_query_state unavailable, falling back to 0/0: %s", e
+            )
+
+        return ret, [n_decode_tokens, n_prefill_tokens, llm_start, llm_end]
 
     def session_run(
         self,
