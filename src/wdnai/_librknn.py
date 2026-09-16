@@ -1647,14 +1647,23 @@ class _LLMSession:
 
         # Lazy alloc: first ``_pack_aux`` call creates the mem pool,
         # every subsequent call reuses the cached blocks. We key the
-        # pool by ``(align_size,)`` — a model with two vision variants
-        # (e.g. 384 / 768) sees different align_size per image_size
-        # and gets a separate pool, but within one size the same
-        # buffer is reused for every frame.
-        pool_key = int(aux.align_size)
+        # pool by ``(align_size, aux_index)`` — a model with two
+        # vision variants (e.g. 384 / 768) sees different align_size
+        # per image_size and gets a separate pool; within one size the
+        # **same** aux input across frames reuses the same buffer.
+        #
+        # aux_index is part of the key because Qwen3-VL-4B emits 3
+        # deepstack aux tensors (at model input indices 2/3/4) and
+        # vlm.py currently sets all three to the same ``align_size``;
+        # a pure ``(align_size,)`` key would have all three share one
+        # mem block + one attr, which leaks ~1.5–1.8 GB of NPU memory
+        # on RK3588 because the driver can't reconcile the duplicate
+        # (mem, attr) entries on session teardown. See AGENTS.md for
+        # the full root-cause writeup.
+        pool_key = (int(aux.align_size), int(aux.index))
         pool = self.runtime._aux_pool.get(pool_key)
         if pool is None:
-            size = max(pool_key, 1)
+            size = max(int(aux.align_size), 1)
             mem_ptr = self.runtime.lib.rknn3_create_mem(
                 self.runtime.context,
                 c_uint64(size),

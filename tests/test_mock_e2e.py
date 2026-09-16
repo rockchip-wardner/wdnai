@@ -669,14 +669,20 @@ def test_pack_inputs_multimodal_must_be_first():
     sentinel_2d = np.zeros(
         (sentinel_n, sentinel_d), dtype=np.float16
     )
-    # Each aux gets a distinct ``align_size`` so the lazy-pool
-    # (``_LLMRuntime._aux_pool``) creates a separate buffer slot per
-    # aux — without this, all three would map to the same pool key
-    # and the attr.index would only round-trip for the last one.
+    # All three aux tensors share the SAME ``align_size`` — this is
+    # exactly what ``wdnai.backends.vlm._build_image_inputs`` does
+    # for Qwen3-VL-4B's 3 deepstack outputs (sets every aux's
+    # ``align_size`` to the first vision output's ``aligned_size``).
+    # Before the fix, this caused all 3 aux inputs to share one mem
+    # block + one attr (with ``index=2``), which leaked ~1.5–1.8 GB
+    # of NPU memory on RK3588. The fix keys the lazy-pool by
+    # ``(align_size, aux_index)`` so each aux gets its own mem block
+    # and its own correctly-indexed attr.
+    shared_align = sentinel_n * sentinel_d * 2
     aux_wrappers = [
         librknn.RKNN3AuxTensorWrapper(
             aux_data=sentinel_2d.copy(), index=2 + i,
-            align_size=sentinel_n * sentinel_d * 2 * (i + 1),
+            align_size=shared_align,
         )
         for i in range(3)
     ]
@@ -728,6 +734,21 @@ def test_pack_inputs_multimodal_must_be_first():
     for i in range(3):
         assert int(packed[i + 1]._u.aux_input.attr.contents.index) == 2 + i
 
+    # Regression guard: even when all 3 aux share one ``align_size``
+    # (Qwen3-VL-4B production layout — vlm.py copies the first vision
+    # output's aligned_size to every aux), each must get its own
+    # mem block. Sharing leaks ~1.5–1.8 GB of NPU memory on RK3588.
+    pool_mem_ids = {id(entry["mem_ptr"]) for entry in runtime._aux_pool.values()}
+    assert len(pool_mem_ids) == 3, (
+        f"3 aux inputs share only {len(pool_mem_ids)} unique mem_ptr(s); "
+        f"duplicate mem blocks leak NPU memory on session teardown. Pool "
+        f"key must include aux_index, not just align_size."
+    )
+    assert len(runtime._aux_pool) == 3, (
+        f"_aux_pool has {len(runtime._aux_pool)} entries after 3 aux "
+        f"with shared align_size; expected 3 (one per aux_index)."
+    )
+
     # Pool reuse: a second ``_pack_inputs`` call (simulating the next
     # video frame) must NOT re-call ``rknn3_create_mem`` — the lazy
     # pool hands back the same buffer slots. The stub counts every
@@ -746,7 +767,7 @@ def test_pack_inputs_multimodal_must_be_first():
         f"when this happens (rc=-11)."
     )
 
-    print("[Qwen3-VL] _pack_inputs ordering regression OK")
+    print("[Qwen3-VL] _pack_inputs ordering + per-aux mem regression OK")
 
 
 def test_image_qwen25vl():
