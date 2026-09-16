@@ -770,6 +770,135 @@ def test_pack_inputs_multimodal_must_be_first():
     print("[Qwen3-VL] _pack_inputs ordering + per-aux mem regression OK")
 
 
+def test_pack_inputs_text_only_pads_4_entry_layout_when_aux_pool_populated():
+    """Fix A regression: text-only ``_pack_inputs`` must produce 4-entry
+    ``[MULTIMODAL, AUX×3]`` layout when ``_aux_pool`` is populated.
+
+    Without it, vision(4) → text-only(1) flips the layout and
+    ``rknn3_session_destroy`` hangs in librknn3.so (SIGKILL after 3s).
+    Empty pool → legacy 1-entry ``[PROMPT]`` (no prior 4-entry layout,
+    no hang trigger).
+    """
+    import ctypes as _ct
+    import wdnai._librknn as librknn
+
+    aux_n, aux_d = 12, 8
+    aux_size_bytes = aux_n * aux_d * 2
+
+    class _StubLib:
+        def __init__(self):
+            self.rknn3_create_mem = self._create_mem
+            self.rknn3_session_init = lambda *a, **k: 1
+            self.rknn3_query = lambda *a, **k: 0
+            self.create_mem_log: list = []
+            self._bufs_by_ptr: dict = {}
+
+        def _create_mem(self, ctx, size, core_id, flags):
+            size_int = int(size.value) if hasattr(size, "value") else int(size)
+            buf = (_ct.c_uint8 * size_int)()
+            tm = librknn._TensorMemory()
+            tm.virt_addr = _ct.cast(buf, _ct.c_void_p).value
+            tm.size = size_int
+            ptr = _ct.cast(_ct.pointer(tm), _ct.c_void_p).value
+            self.create_mem_log.append((size_int, ptr))
+            self._bufs_by_ptr[ptr] = buf
+            return ptr
+
+    def _build_runtime():
+        runtime = librknn._LLMRuntime.__new__(librknn._LLMRuntime)
+        runtime.lib = _StubLib()
+        runtime.context = 0
+        runtime._aux_mem_refs = []
+        runtime._aux_attr_refs = []
+        runtime._aux_pool = {}
+        return runtime, librknn._LLMSession(
+            runtime=runtime, session=0,
+            params=[{"vocab_size": 64, "max_context_len": 4096,
+                     "special_eos_id": 0}],
+            callback=None,
+        )
+
+    # Populate _aux_pool as if a vision inference had run.
+    runtime, llm_session = _build_runtime()
+    for i in range(3):
+        llm_session._pack_aux(librknn.RKNN3AuxTensorWrapper(
+            aux_data=np.random.default_rng(seed=0xA0 + i).standard_normal(
+                (aux_n, aux_d)
+            ).astype(np.float16),
+            index=2 + i,
+            align_size=aux_size_bytes * (i + 1),
+        ))
+    assert len(runtime._aux_pool) == 3
+
+    test_prompt = (
+        "以下是一段视频中按时间顺序的 3 帧描述（起止帧号 600~660）。"
+        "请用不超过 120 字总结这段内容的关键信息。"
+    )
+    packed = llm_session._pack_inputs(
+        prompt=test_prompt, embeds=None, tokens=None,
+        inputs=None, enable_thinking=False,
+    )
+
+    # Mirrors C++ main.cc:393-411: layout stays at 4 entries
+    # [MULTIMODAL(zeroed-image) + 3×AUX(zeroed-mem)].
+    assert len(packed) == 4
+    assert int(packed[0].input_type) == int(librknn._LLMInputType.MULTIMODAL)
+    for i in range(1, 4):
+        assert int(packed[i].input_type) == int(librknn._LLMInputType.AUX)
+
+    mm = packed[0]._u.multimodal_input
+    assert mm.prompt is not None and mm.prompt.decode("utf-8") == test_prompt
+    assert mm.name == b"input_embeds"
+    assert int(mm.image.n_image_tokens) == 0
+    assert int(mm.image.n_image) == 0
+    assert mm.image.image_start is None
+    assert mm.image.image_end is None
+    assert mm.image.image_content is None
+    assert int(mm.n_tokens) == 0
+    assert bool(mm.enable_thinking) is False
+
+    # Mirrors C++ main.cc:393-399 memset: aux mem bytes zeroed before
+    # text-only forward pass (else C lib reads stale vision data).
+    pool_by_index = {
+        int(pool_entry["attr"].index): pool_entry
+        for _, pool_entry in runtime._aux_pool.items()
+    }
+    for i in range(3):
+        aux = packed[i + 1]._u.aux_input
+        assert int(aux.attr.contents.index) == 2 + i
+        mem_struct = _ct.cast(
+            _ct.c_void_p(int(pool_by_index[2 + i]["mem_ptr"])),
+            _ct.POINTER(librknn._TensorMemory)
+        ).contents
+        buf_addr, size = int(mem_struct.virt_addr), int(mem_struct.size)
+        if buf_addr and size > 0:
+            backing = _ct.cast(
+                _ct.c_void_p(buf_addr), _ct.POINTER(_ct.c_uint8 * size)
+            ).contents
+            assert all(b == 0 for b in backing[:size])
+
+    assert len(runtime.lib.create_mem_log) == 3  # placeholder reuses pool (no re-alloc)
+
+    # Second call: layout stays 4, pool still reused (chunk + final Apollo path).
+    packed2 = llm_session._pack_inputs(
+        prompt="第二次纯文本调用", embeds=None, tokens=None,
+        inputs=None, enable_thinking=False,
+    )
+    assert len(packed2) == 4
+    assert len(runtime.lib.create_mem_log) == 3
+
+    # Empty pool → legacy 1-entry [PROMPT] (pure-LLM, no prior 4-entry layout).
+    runtime2, llm_session2 = _build_runtime()
+    packed3 = llm_session2._pack_inputs(
+        prompt="纯文本 LLM 调用", embeds=None, tokens=None,
+        inputs=None, enable_thinking=False,
+    )
+    assert len(packed3) == 1
+    assert int(packed3[0].input_type) == int(librknn._LLMInputType.PROMPT)
+
+    print("[Qwen3-VL] _pack_inputs text-only layout-consistency (Fix A) OK")
+
+
 def test_image_qwen25vl():
     from wdnai import LLMSession, SystemLanguageModel
     embed, tok_dir = _make_workspace()

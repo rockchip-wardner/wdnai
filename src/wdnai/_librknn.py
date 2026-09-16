@@ -1469,6 +1469,7 @@ class _LLMSession:
     ) -> List[_LLMInput]:
         packed: List[_LLMInput] = []
         self._input_pin_refs.clear()
+        self._input_anchor_refs.clear()
 
         has_multimodal = any(
             isinstance(x, (RKNN3Image, RKNN3Audio)) for x in (inputs or [])
@@ -1502,7 +1503,17 @@ class _LLMSession:
             return packed
         # 3) Single-payload (prompt / embeds / tokens) — text-only path
         if prompt is not None:
-            packed.append(self._pack_prompt(prompt, enable_thinking))
+            # Fix A: 4-entry layout when _aux_pool populated (else destroy hangs). Mirrors C++ main.cc:393-411.
+            if self.runtime._aux_pool:
+                packed.append(
+                    self._pack_multimodal_placeholder(prompt, enable_thinking)
+                )
+                for pool_key, pool_entry in self._aux_placeholder_list():
+                    packed.append(
+                        self._pack_aux_placeholder(pool_key, pool_entry)
+                    )
+            else:
+                packed.append(self._pack_prompt(prompt, enable_thinking))
         elif embeds is not None:
             packed.append(self._pack_embed(embeds, enable_thinking))
         elif tokens is not None:
@@ -1511,6 +1522,54 @@ class _LLMSession:
             # Match rknn3lite: empty call still sends an empty prompt input
             packed.append(self._pack_prompt("", enable_thinking))
         return packed
+
+    def _aux_placeholder_list(self) -> List[Tuple[Any, dict]]:
+        """Snapshot _aux_pool items; preserves attr.index identity for release."""
+        return list(self.runtime._aux_pool.items())
+
+    def _pack_multimodal_placeholder(
+        self, prompt: str, enable_thinking: bool,
+    ) -> _LLMInput:
+        """Text-prompted, image-zeroed MULTIMODAL struct (Fix A). Mirrors C++ main.cc:401-405."""
+        li = _LLMInput()
+        li.role = None
+        li.input_type = c_int(int(_LLMInputType.MULTIMODAL))
+        mm_t = li._u.multimodal_input
+        if not hasattr(self, "_input_name_anchor"):
+            self._input_name_anchor = b"input_embeds"
+        name_cp = c_char_p(self._input_name_anchor)
+        self._input_anchor_refs.append((self._input_name_anchor, name_cp))
+        mm_t.name = name_cp
+        anchor = prompt.encode("utf-8")
+        prompt_cp = c_char_p(anchor)
+        self._input_anchor_refs.append((anchor, prompt_cp))
+        mm_t.prompt = prompt_cp
+        mm_t.tokens = None
+        mm_t.n_tokens = c_uint64(0)
+        mm_t.enable_thinking = c_bool(bool(enable_thinking))
+        return li
+
+    def _pack_aux_placeholder(
+        self, pool_key: Any, pool_entry: dict,
+    ) -> _LLMInput:
+        """Zero aux mem bytes (mirrors C++ main.cc:393-399 memset); reuse pool attr for driver slot identity."""
+        li = _LLMInput()
+        li.role = None
+        li.input_type = c_int(int(_LLMInputType.AUX))
+        aux_t = li._u.aux_input
+        mem_ptr = c_void_p(int(pool_entry["mem_ptr"]))
+        mem_struct = ctypes_cast(mem_ptr, POINTER(_TensorMemory))
+        size = int(mem_struct.contents.size)
+        if mem_struct.contents.virt_addr and size > 0:
+            dst = np.ctypeslib.as_array(
+                ctypes_cast(mem_struct.contents.virt_addr, POINTER(c_uint8)),
+                shape=(size,),
+            )
+            dst[:] = 0
+        attr = pool_entry["attr"]
+        aux_t.mem = ctypes_cast(mem_ptr, POINTER(_TensorMemory))
+        aux_t.attr = pointer(attr)
+        return li
 
     def _pack_prompt(self, prompt: str, enable_thinking: bool) -> _LLMInput:
         li = _LLMInput()
@@ -1877,12 +1936,13 @@ class _LLMRuntime(_Runtime):
             except Exception:  # noqa: BLE001
                 pass
             self.session = None
-        # Destroy every cached aux-mem block from ``_aux_pool``. Note
-        # ``_aux_pool`` keys by ``align_size``, so a session that ran
-        # two vision variants (384 + 768) drops two blocks; a
-        # single-variant session drops one. Old transient-tracking
-        # lists (``_aux_mem_refs`` / ``_aux_attr_refs``) are kept for
-        # ABI compat but are unused by the lazy-pool path.
+        # Destroy every cached aux-mem block from ``_aux_pool``. Pool
+        # key is ``(align_size, index)``, so a Qwen3-VL-4B session (3
+        # deepstack aux tensors @ 384) drops three blocks; a session
+        # that ran two vision variants (384 + 768) drops six (3 aux ×
+        # 2 variants). Old transient-tracking lists
+        # (``_aux_mem_refs`` / ``_aux_attr_refs``) are kept for ABI
+        # compat but are unused by the lazy-pool path.
         for entry in self._aux_pool.values():
             try:
                 self.lib.rknn3_destroy_mem(
