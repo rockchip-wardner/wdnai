@@ -24,6 +24,16 @@ Quick start (Qwen3-VL image):
         attachment=[ImageAttachment(img)],
         generating=Event,
     )
+
+NPU status / telemetry (memory, temperature, device list, version,
+reset) is exposed via :class:`wdnai.RknnSmi`, a ctypes shim over
+``/usr/lib/librknnsmi.so`` — the same C ABI the ``rknn-smi`` CLI uses,
+without shelling out to a subprocess:
+
+    from wdnai import RknnSmi
+    smi = RknnSmi()
+    for dev in smi.get_device_list():
+        print(dev["index"], dev["mode"], smi.get_device_temperature(dev["index"]))
 """
 from __future__ import annotations
 
@@ -32,6 +42,18 @@ from typing import *
 
 from ._callable import Callable
 from ._generable import Generable
+from ._librknnsmi import (
+    ChipHealthStatus,
+    CommMode,
+    PrefillMode,
+    ResetReason,
+    RknnSmi,
+    RknnSmiCallError,
+    RknnSmiError,
+    ThermalMode,
+    VersionType,
+    WorkMode,
+)
 from .attachment import Attachment, AudioAttachment, ImageAttachment, TextAttachment
 from .lm_output import LMOutput
 from .model import ModelSpec, SystemLanguageModel
@@ -55,6 +77,16 @@ __all__ = [
     "LocatePrompt",
     "LLMSession",
     "LocateAnythingBackend",
+    "RknnSmi",
+    "RknnSmiCallError",
+    "RknnSmiError",
+    "CommMode",
+    "VersionType",
+    "ChipHealthStatus",
+    "ResetReason",
+    "ThermalMode",
+    "WorkMode",
+    "PrefillMode",
 ]
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
