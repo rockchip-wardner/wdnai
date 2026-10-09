@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
 
 
 class Prompt(ABC):
@@ -148,4 +149,59 @@ class LocatePrompt(Prompt):
         raise AssertionError(f"unreachable mode: {self.mode!r}")
 
 
-__all__ = ["Prompt", "LocatePrompt"]
+# --------------------------------------------------------------------------- #
+# Multi-turn ChatML prompt assembly
+# --------------------------------------------------------------------------- #
+# Reinforcement appended after the tool block so the model emits exactly
+# ONE tool_call JSON object in the answer segment, avoiding the
+# "example first, real one second" multi-JSON failure mode. The parser
+# (wdnai._callable.try_parse_tool_call) takes the first match as a backstop.
+_TOOL_CALL_INSTRUCTION = (
+    "When you decide to call a tool, output **exactly one** JSON object "
+    "matching the format above. Do not output multiple JSON objects, "
+    "placeholder/example JSONs, or any text before/after the JSON."
+)
+
+
+def build_chatml_prompt(history: List[dict], user_text: str,
+                        tool_specs: Optional[List[dict]] = None) -> str:
+    """拼 ChatML 文本 prompt（多轮对话）。
+
+    ``tool_specs``（可选，``get_tool_specs(tools)`` 返回值）非空时，
+    渲染 wdnai 的 ``render_tools_block`` 并以独立段形式追加到 system
+    段之后、对话历史之前（与 ``LLMSession._compose_prompt`` 单轮路径把
+    工具块追加到末尾不同——多轮对话走独立段，结构清晰）。模型只需看到
+    工具描述，无需被历史 / 用户问题注意力分散。
+
+    同时追加 ``_TOOL_CALL_INSTRUCTION`` 强化指令，让 LLM 在 answer 段
+    只输出**单个** tool_call JSON。
+
+    输出是**裸 ChatML**（无 ``<|im_*|>`` marker）—— marker 由 C 侧的
+    chat template 负责插入，见 ``backends._common.apply_chat_template``。
+    """
+    # Lazy import: _common pulls in the RKNN shim, and prompt.py is
+    # imported by the session layer before backends are built.
+    from ._callable import render_tools_block
+    from .backends._common import (
+        CHATML_TURN_ASSISTANT, CHATML_TURN_SYSTEM, CHATML_TURN_USER,
+    )
+
+    parts = [f"{CHATML_TURN_SYSTEM}You are a helpful assistant.\n"]
+    if tool_specs:
+        parts.append("\n")
+        parts.append(render_tools_block(tool_specs))
+        parts.append("\n\n")
+        parts.append(_TOOL_CALL_INSTRUCTION)
+        parts.append("\n\n---\n\n")
+    for msg in history:
+        role = msg.get("role")
+        if role == "user":
+            parts.append(f"{CHATML_TURN_USER}{msg.get('content') or ''}\n")
+        elif role == "assistant":
+            parts.append(f"{CHATML_TURN_ASSISTANT}{msg.get('content') or ''}\n")
+    parts.append(f"{CHATML_TURN_USER}{user_text}\n")
+    parts.append(CHATML_TURN_ASSISTANT)
+    return "".join(parts)
+
+
+__all__ = ["Prompt", "LocatePrompt", "build_chatml_prompt"]

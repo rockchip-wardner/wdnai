@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -56,7 +56,19 @@ def resolve_device_id(
 # --------------------------------------------------------------------------- #
 @dataclass
 class StreamSink:
-    """Collects tokens / text / perf data produced by the RKNN streaming callback."""
+    """Collects tokens / text / perf data produced by the RKNN streaming callback.
+
+    Also the fan-out point for incremental streaming. Callers register a
+    plain Python callable with :meth:`add_observer` and receive every text
+    delta as soon as it is decoded, without patching the SDK.
+
+    **Observers run on the inference thread** (inside the RKNN result
+    callback), not on the event-loop thread — so they must stay short and
+    never block; hand heavy work off to your own queue. An observer that
+    raises is isolated: the exception is swallowed and the remaining
+    observers still run, because a broken callback must not abort
+    inference.
+    """
 
     tokenizer: Any = None
     tokens: List[int] = field(default_factory=list)
@@ -65,6 +77,33 @@ class StreamSink:
     finished: bool = False
     error: Optional[str] = None
     perf: Dict[str, float] = field(default_factory=dict)
+    # Observer registry. Excluded from repr/eq so the dataclass' printed
+    # form and equality are unchanged by the streaming support.
+    _observers: List[Callable[[str], None]] = field(
+        default_factory=list, repr=False, compare=False
+    )
+
+    def add_observer(self, cb: Callable[[str], None]) -> None:
+        """Register ``cb(delta)``. No-op for ``None``; ignores duplicates."""
+        if cb is not None and cb not in self._observers:
+            self._observers.append(cb)
+
+    def remove_observer(self, cb: Callable[[str], None]) -> None:
+        """Unregister ``cb``. Unregistering an unknown callback is a no-op."""
+        try:
+            self._observers.remove(cb)
+        except ValueError:
+            pass
+
+    def _notify(self, delta: str) -> None:
+        if not delta or not self._observers:
+            return
+        # Snapshot: an observer is allowed to add/remove observers.
+        for cb in list(self._observers):
+            try:
+                cb(delta)
+            except Exception:  # noqa: BLE001 — see class docstring
+                pass
 
     def reset(self) -> None:
         self.tokens.clear()
@@ -73,6 +112,9 @@ class StreamSink:
         self.finished = False
         self.error = None
         self.perf.clear()
+        # ``_observers`` deliberately survives reset(): observers are bound
+        # to the session lifetime (or to one respond() call registered by
+        # LLMLocalSession), not to a single inference run.
 
 
 def _decode_safe(tokenizer, tokens: List[int]) -> str:
@@ -121,6 +163,7 @@ class _ResultCallbackAdapter:
                     delta = full[len(sink.text):]
                     if delta:
                         sink.text += delta
+                        sink._notify(delta)
                 except Exception as e:  # noqa: BLE001
                     sink.error = f"decode error: {e}"
             sink.finished = True
@@ -135,6 +178,7 @@ class _ResultCallbackAdapter:
                 delta = full[len(sink.text):]
                 if delta:
                     sink.text += delta
+                    sink._notify(delta)
             except Exception:  # noqa: BLE001 — Trailing UTF-8 chunk
                 return 0
         return 0
@@ -144,17 +188,16 @@ def make_result_callback(sink: StreamSink):
     """Build the user-side ``result_cb`` callable for
     :func:`build_llm_callback`.
 
-    Public hook — wdnwebui's ``chat_stream.py`` monkey-patches this to
-    inject a text-delta observer without modifying the SDK. The
-    returned callable has the shim's signature
+    The returned callable has the shim's signature
     ``(userdata, new_tokens: List[int], state: int) -> int``; the
     stream sink is mutated in place (``.tokens``, ``.text``,
-    ``.error``, ``.finished``, ``.perf``).
+    ``.error``, ``.finished``, ``.perf``) and every text delta is
+    fanned out to the observers registered via ``sink.add_observer``.
 
     Returns a bound method (via :class:`_ResultCallbackAdapter`) so the
-    shim can auto-pin the ``StreamSink`` as C-side userdata; a free
-    closure would be passed as the userdata itself and the C trampoline
-    would have no way to reach the sink.
+    sink can be auto-pinned as C-side userdata; a free closure would be
+    passed as the userdata itself and the C trampoline would have no way
+    to reach the sink.
     """
     return _ResultCallbackAdapter(sink).__call__
 
@@ -213,9 +256,24 @@ def build_llm_callback(tokenizer, embeds_data: np.ndarray, sink: StreamSink):
 # --------------------------------------------------------------------------- #
 # ChatML template — identical across all four example scripts
 # --------------------------------------------------------------------------- #
-CHATML_SYSTEM = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-CHATML_USER = "<|im_start|>user\n"
-CHATML_ASSISTANT = "<|im_end|>\n<|im_start|>assistant\n"
+# Bare (marker-free) turn prefixes. This is the form actually handed to
+# ``session_run``; RKNN's C-side chat template — installed by
+# ``apply_chat_template`` below — wraps each turn in the ``<|im_*|>``
+# markers. ``LLMSession._compose_prompt`` builds multi-turn prompts from
+# these, so they are the single source of truth for both the bare and the
+# marked form.
+CHATML_TURN_SYSTEM = "system\n"
+CHATML_TURN_USER = "user\n"
+CHATML_TURN_ASSISTANT = "assistant\n"
+
+_IM_START = "<|im_start|>"
+_IM_END = "<|im_end|>"
+
+# Marked form, expressed in terms of the bare prefixes above so the two
+# cannot drift apart. Byte-identical to the literals these replaced.
+CHATML_SYSTEM = f"{_IM_START}{CHATML_TURN_SYSTEM}You are a helpful assistant.{_IM_END}\n"
+CHATML_USER = f"{_IM_START}{CHATML_TURN_USER}"
+CHATML_ASSISTANT = f"{_IM_END}\n{_IM_START}{CHATML_TURN_ASSISTANT}"
 
 
 def apply_chat_template(rknn_llm) -> None:

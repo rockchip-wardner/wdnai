@@ -91,9 +91,23 @@ name `wdnai`, distribution name `wdnai`.
   `Qwen3.5-4B-llm.1828.rknn` is what distinguishes it from a pure
   text LLM — no separate text-only Qwen3.5-4B RKNN is shipped (one
   RKNN powers both text-chat and video-describe capabilities).
-- `src/wdnai/session.py` — `LLMSession`: `async def respond(prompt,
-  attachment, generating, tools, debug, perf, **overrides)`. Owns
-  one backend (chosen by `ModelSpec.kind`). Responsibilities:
+- `src/wdnai/session.py` — **传输无关的会话接口 + 两个实现**：
+  - `LLMSession(ABC)` — 接口。拥有**所有**必须跨进程一致的逻辑：
+    prompt 组装（`_compose_prompt`）、tool-call 解析、schema 校验
+    （`_parse_output`）。签名：
+    `async def respond(prompt, attachment, generating, tools, debug,
+    perf, on_delta, history, **overrides)`。唯一交给子类的缝是
+    `abstract async _dispatch(prompt, attachments, *, on_delta) ->
+    (text, attachments_out)`。
+  - `LLMLocalSession` — 本机 NPU 实现，`__init__` 建 backend，
+    `_dispatch` 丢线程池。**`LLMSession(model=…)` 仍是可调用的**（走
+    `__new__` 垫片转成 `LLMLocalSession` + `DeprecationWarning`，
+    保留一个版本周期），`isinstance(x, LLMSession)` 对两个实现都为真。
+  - `wdndds.LLMRPCSession(LLMSession)` — DDS RPC 实现（wdndds 包内，
+    反向依赖本包）。
+  - 由此 `generating=` / `tools=` **完全不过线**：它们只在调用方进程被
+    消费，worker 只见到一个 prompt 字符串 + 附件列表。
+  Responsibilities:
   attachment channel-splitting (images / video frames / text prefixes
   / passthrough), ChatML prompt assembly + JSON-Schema hint injection,
   tool-call routing (`@Callable` branch vs `generating=` branch
@@ -328,11 +342,16 @@ name `wdnai`, distribution name `wdnai`.
   不要 import `rknn3lite`，否则一台非 RK 机器上 `import wdnai` 会因为加载
   RKNN3 native libs 而 segfault（与 `wdnwebui` 里 `WdnaiDetector._load_wdnai`
   的约束同源）。
-- **rknn3lite 是同步 C API，`LLMSession.respond` 是 async 但目前不丢线程池**：
-  backend 的 `run` / `run_text` / `run_images` 是同步阻塞调用；`respond`
-  当前直接在事件循环里跑（≈ 1s @ 4B）。如果上层要在事件循环里并行多次
-  `respond`，调用方自行 `asyncio.gather` 或者丢 `loop.run_in_executor`。
-  wdnwebui 的 `WdnaiDetector` 已经在自己的 `Thread` 里跑整条 `respond` 链。
+- **rknn3lite 是同步 C API，`LLMLocalSession` 已把阻塞调用丢进线程池**：
+  backend 的 `run` / `run_text` / `run_images` 仍是同步阻塞调用
+  （≈ 1s @ 4B），但 `LLMLocalSession._dispatch` 通过
+  `loop.run_in_executor(self._executor, …)` 把它们提交到
+  `ThreadPoolExecutor(max_workers=1)`，所以 `respond` 是真正的协程，
+  事件循环不会被推理卡住。**单 worker 是刻意的**：一个 RKNN3 handle
+  不可重入，且要跟 `wdndds.LLMRPCSession` 的串行语义对齐。要在事件
+  循环里并行多次 `respond`，调用方自行 `asyncio.gather` 即可
+  （每个 session 自带一把锁；跨 session 并行才吃多卡）。
+  wdnwebui 的 `WdnaiDetector` 仍在自己的 `Thread` 里跑整条 `respond` 链。
 - **JSON hint 的 schema 渲染用 `str(dict)`，不要换成 `json.dumps(indent=2)`**：
   legacy 实现（141ee17）写的就是 `f"{user_msg}\n\n{hint}\n```json\n{schema}\n```"`
   其中 `schema` 是 pydantic 的 `repr(dict)`（单行、单引号 key、Python

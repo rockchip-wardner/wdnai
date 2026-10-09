@@ -9,7 +9,8 @@ Quick start (Qwen3-VL image):
 
     from typing import Literal
     from wdnai import (
-        Generable, Field, ImageAttachment, LMOutput, LLMSession, SystemLanguageModel,
+        Generable, Field, ImageAttachment, LMOutput, LLMLocalSession,
+        SystemLanguageModel,
     )
 
     @Generable
@@ -18,12 +19,18 @@ Quick start (Qwen3-VL image):
         level: Literal["Normal", "Warning"] = Field(default="Normal")
 
     model = SystemLanguageModel.qwen3_vl_4b()
-    session = LLMSession(model=model)
+    session = LLMLocalSession(model=model)
     out = await session.respond(
-        msg="Analyze this image",
+        prompt="Analyze this image",
         attachment=[ImageAttachment(img)],
         generating=Event,
     )
+
+``LLMSession`` is the transport-agnostic interface; ``LLMLocalSession``
+runs the model in-process on a local NPU. Remote execution over DDS is
+provided by ``wdndds.LLMRPCSession``, which subclasses the same interface —
+so ``generating=`` / ``tools=`` / ``on_delta=`` are spelled identically
+whichever one you hold.
 
 NPU status / telemetry (memory, temperature, device list, version,
 reset) is exposed via :class:`wdnai.RknnSmi`, a ctypes shim over
@@ -57,8 +64,8 @@ from ._librknnsmi import (
 from .attachment import Attachment, AudioAttachment, ImageAttachment, TextAttachment
 from .lm_output import LMOutput
 from .model import ModelSpec, SystemLanguageModel
-from .prompt import LocatePrompt, Prompt
-from .session import LLMSession
+from .prompt import LocatePrompt, Prompt, build_chatml_prompt
+from .session import LLMLocalSession, LLMSession
 from .backends.locate_anything import LocateAnythingBackend
 
 __all__ = [
@@ -75,7 +82,9 @@ __all__ = [
     "SystemLanguageModel",
     "Prompt",
     "LocatePrompt",
+    "build_chatml_prompt",
     "LLMSession",
+    "LLMLocalSession",
     "LocateAnythingBackend",
     "RknnSmi",
     "RknnSmiCallError",

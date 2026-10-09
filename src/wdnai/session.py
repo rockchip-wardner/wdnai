@@ -1,12 +1,36 @@
 """LLM / VLM / TTS session: routes a list of :class:`Attachment` objects
 (:class:`TextAttachment` / :class:`ImageAttachment` / :class:`AudioAttachment`)
 and supports structured output (``LMOutput`` subclasses + plain
-``@Generable`` classes alike)."""
+``@Generable`` classes alike).
+
+The session surface is transport-agnostic. :class:`LLMSession` owns every
+piece of logic that must behave *identically* on both sides of a process
+boundary — prompt assembly, tool-call parsing, schema validation — and
+delegates only the raw ``(prompt, attachments) → (text, attachments_out)``
+round trip to an abstract ``_dispatch``.
+
+- :class:`LLMLocalSession` (this package) runs the model in-process.
+- ``wdndds.LLMRPCSession`` subclasses the same base and forwards
+  ``_dispatch`` to a remote worker over DDS.
+
+Because prompt assembly and output parsing live in the base class, the two
+implementations are byte-identical by construction: ``generating`` and
+``tools`` never cross the wire, so the worker only ever sees a prompt
+string and a list of attachments, and the caller parses the raw reply
+against the classes it already holds.
+"""
 from __future__ import annotations
 
+import asyncio
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
+import warnings
+from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial as _partial
+from typing import (
+    Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union,
+)
 
 import numpy as np
 
@@ -32,7 +56,7 @@ from .utils import extract_json, strip_thinking_blocks
 T = TypeVar("T", bound=BaseModel)
 
 
-class LLMSession:
+class LLMSession(ABC):
     """Session with a single RKNN model.
 
     Usage::
@@ -72,6 +96,23 @@ class LLMSession:
     process.
     """
 
+    def __new__(cls, *args: Any, **kwargs: Any) -> "LLMSession":
+        # Deprecation shim, to be dropped one release after the interface
+        # split. ``LLMSession(model=...)`` used to construct the local
+        # implementation directly; it now builds an ``LLMLocalSession``.
+        # Returning the subclass keeps ``isinstance(x, LLMSession)`` true
+        # for both implementations, which is the property callers rely on.
+        if cls is LLMSession:
+            warnings.warn(
+                "LLMSession(model=...) no longer picks an implementation; "
+                "use LLMLocalSession(model=...) for in-process inference "
+                "(or wdndds.LLMRPCSession for the DDS RPC transport).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return super().__new__(LLMLocalSession)
+        return super().__new__(cls)
+
     def __init__(
         self,
         model: ModelSpec,
@@ -87,7 +128,96 @@ class LLMSession:
         self.spec = model
         self.npu = npu
         self.device_id = device_id
-        self._backend = build_backend(model, npu=npu, device_id=device_id)
+        self._options = options
+        # Only the local implementation builds a backend; RPC subclasses
+        # leave this None and hold a transport client instead.
+        self._backend: Any = None
+
+    # ------------------------------------------------------------------ #
+    # Transport seam
+    # ------------------------------------------------------------------ #
+    @property
+    def _suppress_generating_in_prompt(self) -> bool:
+        """Whether ``generating=``'s schema hint must be kept OUT of the
+        prompt.
+
+        TTS backends consume the prompt as the *text to speak*, so the
+        JSON-schema hint (a Qwen-VLM/LLM concept) would otherwise be read
+        aloud as part of the audio. Resolved from the session's
+        ``ModelSpec`` — which both implementations hold — rather than from
+        the backend, so the decision is made identically on both sides of
+        the wire.
+        """
+        kind = getattr(self.spec, "kind", None)
+        if kind is None:
+            kind = getattr(getattr(self._backend, "spec", None), "kind", None)
+        return kind == "tts"
+
+    @abstractmethod
+    async def _dispatch(
+        self,
+        prompt: str,
+        attachments: List[Attachment],
+        *,
+        on_delta: Optional[Callable[[str], None]] = None,
+        **overrides: Any,
+    ) -> Tuple[str, List[Attachment]]:
+        """Send ``prompt`` + attachments to the model and return
+        ``(text, attachments_out)``.
+
+        The *only* method a transport must implement. Everything
+        transport-independent — prompt assembly, tool-call parsing, schema
+        validation — happens in :meth:`respond` around this call, which is
+        what makes the local and RPC paths byte-identical.
+
+        ``on_delta`` is the caller's incremental-streaming hook. It may be
+        ``None``. Implementations must invoke it from whatever thread owns
+        the stream (never the event loop) and must guarantee that every
+        delta has been delivered by the time this coroutine returns.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def reset(self) -> None:
+        """Clear the model's KV cache / conversation state."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def close(self) -> None:
+        """Release the model / transport resources."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def embed_text(self, text: str) -> np.ndarray:
+        """Return a normalized embedding vector for a text query."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def embed_video(self, frames: List[np.ndarray], prompt: str = "") -> np.ndarray:
+        """Return a normalized embedding vector for a list of BGR frames."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def run_prompt(
+        self,
+        prompt: str,
+        attachment: Union[None, Attachment, List[Attachment]] = None,
+        *,
+        on_delta: Optional[Callable[[str], None]] = None,
+        **overrides: Any,
+    ) -> Tuple[str, List[Attachment]]:
+        """Run an already-assembled prompt; see :meth:`LLMSession.run_prompt`."""
+        raise NotImplementedError
+
+    def stop(self) -> None:
+        """Request cancellation of an in-flight :meth:`respond`.
+
+        Default implementation is a no-op: a local session runs inference
+        synchronously and cannot be interrupted mid-``session_run``. RPC
+        implementations override this — and they must publish the request
+        out-of-band rather than through the RPC replier, which is busy
+        running the very inference being cancelled.
+        """
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -120,6 +250,8 @@ class LLMSession:
         debug: bool = False,
         tools: Optional[List[Any]] = None,
         perf: bool = False,
+        on_delta: Optional[Callable[[str], None]] = None,
+        history: Optional[List[Dict[str, Any]]] = None,
         **overrides: Any,
     ) -> Any:
         """Fire one request and return the result.
@@ -155,6 +287,37 @@ class LLMSession:
           structured payload — in that case the parsed ``generating=``
           instance is returned. The caller picks the branch via
           ``isinstance``.
+        - ``on_delta`` — optional ``callable(delta: str)`` invoked with the
+          model's incremental text output as it is produced. **The return
+          value of ``respond`` is unchanged by this parameter** — it is a
+          side channel, not a different result shape. Omitting ``on_delta``
+          keeps exactly today's behaviour.
+
+          Three caveats:
+
+          1. Deltas are the model's *raw* text, not a parsed result. With
+             ``generating=`` set they are partial JSON fragments, so pass
+             ``on_delta`` only for plain-text generation.
+          2. The granularity is "one token callback", not one character: a
+             delta may be several characters or empty. Under RPC it also
+             crosses a DDS topic and may be coalesced. So the only safe
+             assertion is that concatenating the deltas reproduces the
+             final text — never that the delta count matches a token
+             count.
+          3. The callback runs on the *stream* thread (locally: the
+             inference thread; over RPC: a cshim daemon thread), never the
+             event loop, so it must be short and non-blocking.
+
+          All deltas are delivered before ``respond`` returns. If inference
+          fails midway you get the deltas emitted so far followed by an
+          exception.
+        - ``history`` — optional list of ``{"role": "user"|"assistant",
+          "content": str}`` turns for multi-turn chat. When given, the
+          prompt is assembled as a full ChatML transcript instead of the
+          single-message section join, and ``prompt`` becomes the current
+          user turn. History turns are rendered verbatim into the prompt
+          (see :func:`wdnai.prompt.build_chatml_prompt`); trimming them to
+          the model's context window is the caller's job, as it always was.
         """
         attachments = self._coerce_attachments(attachment)
 
@@ -172,16 +335,19 @@ class LLMSession:
         # audio. Strip it from the prompt but keep ``generating=`` for
         # the output-side ``LMOutput`` wrapping below.
         prompt_generating = generating
-        backend_kind = getattr(getattr(self._backend, "spec", None), "kind", None)
-        if backend_kind == "tts":
+        if self._suppress_generating_in_prompt:
             prompt_generating = None
-        full_prompt = self._compose_prompt(prompt, prompt_generating, tool_specs)
+        full_prompt = self._compose_prompt(
+            prompt, prompt_generating, tool_specs, history,
+        )
         if debug:
             print(f"[wdnai.debug] prompt      = {prompt!r}")
             print(f"[wdnai.debug] full_prompt = {full_prompt!r}")
             print(f"[wdnai.debug] attachments={[a.to_payload() for a in attachments]}")
             print(f"[wdnai.debug] tools  = {tool_specs}")
-        text, attachments_out = self._dispatch(full_prompt, attachments, **overrides)
+        text, attachments_out = await self._dispatch(
+            full_prompt, attachments, on_delta=on_delta, **overrides,
+        )
 
         if debug:
             print(f"[wdnai.debug] raw    = {text!r}")
@@ -262,86 +428,48 @@ class LLMSession:
         return result
 
 # ------------------------------------------------------------------ #
-    def _dispatch(
+    # JSON prompt injection
+    # ------------------------------------------------------------------ #
+    # Already-assembled prompt entry point
+    # ------------------------------------------------------------------ #
+    async def run_prompt(
         self,
         prompt: str,
-        attachments: List[Attachment],
+        attachment: Union[None, Attachment, List[Attachment]] = None,
+        *,
+        on_delta: Optional[Callable[[str], None]] = None,
         **overrides: Any,
     ) -> Tuple[str, List[Attachment]]:
-        """Route ``prompt`` + a list of attachments to the right backend
-        method. Returns ``(text, attachments_out)`` — ``attachments_out``
-        is populated by backends that produce binary outputs (e.g. TTS
-        audio bytes); today it is always empty for the VLM backend.
+        """Run an **already-assembled** prompt, bypassing composition.
+
+        :meth:`respond` is the caller-facing API: it takes ``generating=``
+        / ``tools=`` / ``history=``, assembles the final prompt from them,
+        then dispatches. That assembly is *the caller's job* because the
+        schema classes and ``@Callable`` classes only exist in the
+        caller's process — a worker on the other side of an RPC boundary
+        cannot do it.
+
+        A worker therefore receives a finished prompt and needs exactly
+        this: send it as-is. Returning ``(text, attachments_out)``
+        *unparsed* is deliberate — the caller runs ``_parse_output`` in
+        ``respond()``, so schema validation stays on the side that owns
+        the schema classes.
+
+        Do not call this from application code; use :meth:`respond`. It
+        exists for transport adapters.
         """
-        if not attachments:
-            run = getattr(self._backend, "run_text", None) or self._backend.run
-            return run(prompt, **overrides), []
+        attachments = self._coerce_attachments(attachment)
+        return await self._dispatch(
+            prompt, attachments, on_delta=on_delta, **overrides,
+        )
 
-        # Split attachments by channel via ``isinstance`` dispatch. Audio
-        # is routed to ``backend.run_audio`` when the backend exposes one
-        # (ASR); image frames go to ``run_images`` (multi-frame replaces
-        # the legacy ``kind="video"`` path); text-prefixes join the
-        # prompt. Unknown attachment subclasses fall through to
-        # ``run_text``.
-        images: List = []
-        text_prefixes: List[str] = []
-        audio_payloads: List[AudioAttachment] = []
-        other: List[Attachment] = []
-
-        for att in attachments:
-            if isinstance(att, ImageAttachment):
-                images.extend(att.images)
-            elif isinstance(att, TextAttachment):
-                text_prefixes.append(att.text or "")
-            elif isinstance(att, AudioAttachment):
-                audio_payloads.append(att)
-            else:
-                other.append(att)
-
-        full_prompt = prompt or ""
-        if text_prefixes:
-            joined = "\n".join(p for p in text_prefixes if p)
-            full_prompt = (joined + ("\n" + full_prompt if full_prompt else "")).strip()
-
-        if audio_payloads and hasattr(self._backend, "run_audio"):
-            pcm = b"".join(att.data for att in audio_payloads)
-            sample_rate = int(overrides.pop("sample_rate", 16000))
-            n_channels = int(overrides.pop("n_channels", 1))
-            sample_width = int(overrides.pop("sample_width", 2))
-            text = self._backend.run_audio(
-                pcm,
-                sample_rate=sample_rate,
-                n_channels=n_channels,
-                sample_width=sample_width,
-                prompt=full_prompt,
-                **overrides,
-            )
-            return text, []
-
-        if images:
-            text = self._backend.run_images(full_prompt, images, **overrides)
-            return text, []
-        if other:
-            # Pass-through to run_text for now (TTS-style backends will
-            # pick the audio attachments up via a future hook).
-            result = self._backend.run_text(full_prompt, **overrides)
-        else:
-            result = self._backend.run_text(full_prompt, **overrides)
-        # TTS-style backends return ``(text, [attachment, ...])``; legacy
-        # text-only backends return just ``text``. Unpack accordingly.
-        if isinstance(result, tuple) and len(result) == 2:
-            text, atts = result
-            return text, list(atts or [])
-        return result, []
-
-    # ------------------------------------------------------------------ #
-    # JSON prompt injection
     # ------------------------------------------------------------------ #
     @staticmethod
     def _compose_prompt(
         prompt: Optional[str],
         generating: Optional[Type[T]],
         tool_specs: List[Dict[str, Any]],
+        history: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Build the final prompt from the user message, the optional
         ``generating=`` schema hint, and the optional tool block.
@@ -350,7 +478,30 @@ class LLMSession:
         model is told to pick exactly one: either call a tool OR emit
         the structured payload. The output-classification step in
         ``respond()`` decides which one the model picked.
+
+        When ``history=`` is supplied the output is a full ChatML
+        transcript (see :func:`wdnai.prompt.build_chatml_prompt`) instead
+        of the single-message section join below. The two shapes are kept
+        deliberately separate: the section join is what every
+        schema-constrained VLM detection prompt was tuned against, so it
+        stays byte-identical when no history is given.
         """
+        if history:
+            # Lazy import: prompt.py is cheap but _callable/_common are not.
+            from .prompt import build_chatml_prompt
+
+            chatml = build_chatml_prompt(history, prompt or "", tool_specs)
+            # A structured-output turn on top of a conversation: keep the
+            # transcript intact and append the schema hint as a trailing
+            # section rather than inventing a new ChatML ordering.
+            if generating is not None:
+                hint = LLMSession._schema_hint_section(
+                    generating, has_user_prompt=True,
+                )
+                if hint:
+                    chatml = f"{chatml}\n\n{hint}"
+            return chatml
+
         base = (prompt or "").rstrip()
         has_user_prompt = bool(base)
         sections: List[str] = [base] if base else []
@@ -550,49 +701,9 @@ class LLMSession:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         self.close()
 
-    def close(self) -> None:
-        if self._backend is not None:
-            self._backend.close()
-            self._backend = None
-
-    # ------------------------------------------------------------------ #
-    # Embedding passthroughs (kind="embedding" backend only)
-    # ------------------------------------------------------------------ #
-    def embed_text(self, text: str) -> np.ndarray:
-        """Return a normalized embedding vector for a text query."""
-        return self._backend.embed_text(text)
-
-    def embed_video(self, frames: List[np.ndarray], prompt: str = "") -> np.ndarray:
-        """Return a normalized embedding vector for a list of BGR video frames."""
-        return self._backend.embed_video_chunk(frames, text=prompt)
-
     # ------------------------------------------------------------------ #
     # Stability helpers
     # ------------------------------------------------------------------ #
-
-    def reset(self) -> None:
-        """Clear the C library's KV cache / internal state.
-
-        Call this between loop iterations to force the model to start from a
-        clean state — trades a bit of speed for determinism.
-
-        Backend RKNN3Lite handles are named inconsistently across backends:
-        ``TextBackend`` stores ``self.rknn`` while ASR / Embedding / Omni /
-        LocateAnything store ``self.rknn_llm``. Probing both keeps ``reset()``
-        effective everywhere — with only ``rknn_llm`` it was a silent no-op
-        for text chat, letting KV history accumulate across agent-loop
-        rounds (the model then re-emitted the previous round's output and
-        generated raw ``<|im_start|>`` markers).
-        """
-        for attr in ("rknn_llm", "rknn"):
-            rknn_llm = getattr(self._backend, attr, None)
-            if rknn_llm is not None and hasattr(rknn_llm, "clear_kvcache"):
-                try:
-                    rknn_llm.clear_kvcache()
-                except Exception:
-                    pass
-                return
-
     def majority_vote(self, k: int, **kwargs: Any) -> Any:
         """Run the current ``prompt`` + attachment ``k`` times synchronously and return the most common result.
 
@@ -618,6 +729,229 @@ class LLMSession:
             if repr(r) == top:
                 return r
         return results[0]
+
+
+class LLMLocalSession(LLMSession):
+    """In-process :class:`LLMSession` — the model runs on this host's NPU.
+
+    Constructing the session builds the backend, which resolves the RKNN3
+    device (``npu=`` / ``device_id=``) and loads the model. Everything
+    inherited from :class:`LLMSession` — prompt assembly, tool-call
+    parsing, schema validation — is shared verbatim with RPC
+    implementations; only :meth:`_dispatch` differs.
+    """
+
+    def __init__(
+        self,
+        model: ModelSpec,
+        *,
+        npu: Optional[int] = None,
+        device_id: Optional[Union[bytes, str]] = None,
+        **options: Any,
+    ) -> None:
+        super().__init__(model, npu=npu, device_id=device_id, **options)
+        self._backend = build_backend(model, npu=npu, device_id=device_id)
+        # rknn3 is a synchronous C API: ``session_run`` blocks for the whole
+        # decode. Run it on a dedicated worker thread so ``respond`` stays a
+        # true coroutine and concurrent callers on the event loop are not
+        # head-of-line blocked. Serialised on purpose — one model handle is
+        # not re-entrant, and the RPC implementation serialises identically.
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="wdnai-llm-local",
+        )
+        self._closed = False
+
+    # ------------------------------------------------------------------ #
+    async def _dispatch(
+        self,
+        prompt: str,
+        attachments: List[Attachment],
+        *,
+        on_delta: Optional[Callable[[str], None]] = None,
+        **overrides: Any,
+    ) -> Tuple[str, List[Attachment]]:
+        if self._closed or self._backend is None:
+            raise RuntimeError("session is closed")
+
+        sink = getattr(self._backend, "sink", None)
+        if on_delta is not None and sink is not None:
+            sink.add_observer(on_delta)
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                self._executor,
+                _partial(self._dispatch_sync, prompt, attachments, overrides),
+            )
+        finally:
+            # Unregister even if inference raised: a leaked observer would
+            # fire on the next call and double-render the stream.
+            if on_delta is not None and sink is not None:
+                sink.remove_observer(on_delta)
+
+    @staticmethod
+    def _normalize_backend_result(result: Any) -> Tuple[str, List[Attachment]]:
+        """Force a backend's return value into ``(text, attachments_out)``.
+
+        Backends disagree about what "the answer" is, and every caller of
+        ``_dispatch`` — :meth:`respond`, and the ``run_prompt`` that RPC
+        transports use — promises the outside world a **text** result. So
+        the disagreement has to be absorbed here rather than at each call
+        site. Three shapes in the wild:
+
+        * ``str`` — almost every backend.
+        * ``(text, attachments)`` — TTS-style backends that produce audio.
+        * an object carrying ``.text`` — the grounding backend, whose
+          ``run_images`` returns a ``GroundingResult``. Its ``.text`` is
+          the raw model output (with the ``<ref>``/``<box>`` markers the
+          caller re-parses), which is exactly what a transport should put
+          on the wire: the caller owns the structured schema, the worker
+          does not.
+
+        Anything else falls back to ``str()`` so a surprise becomes
+        readable text instead of a ``TypeError`` inside a worker whose
+        only visible symptom is a timed-out RPC.
+        """
+        if isinstance(result, tuple) and len(result) == 2:
+            text, atts = result
+            return (text if isinstance(text, str) else str(text or ""),
+                    list(atts or []))
+        if isinstance(result, str):
+            return result, []
+        text = getattr(result, "text", None)
+        if isinstance(text, str):
+            return text, []
+        return ("" if result is None else str(result)), []
+
+    def _dispatch_sync(
+        self,
+        prompt: str,
+        attachments: List[Attachment],
+        overrides: Dict[str, Any],
+    ) -> Tuple[str, List[Attachment]]:
+        """Route ``prompt`` + attachments to the right backend method.
+
+        Returns ``(text, attachments_out)`` — ``attachments_out`` is
+        populated by backends that produce binary outputs (e.g. TTS audio
+        bytes); it is always empty for the VLM backend.
+        """
+        backend = self._backend
+        if not attachments:
+            run = getattr(backend, "run_text", None) or backend.run
+            return self._normalize_backend_result(run(prompt, **overrides))
+
+        # Split attachments by channel via ``isinstance`` dispatch. Audio
+        # is routed to ``backend.run_audio`` when the backend exposes one
+        # (ASR); image frames go to ``run_images`` (multi-frame replaces
+        # the legacy ``kind="video"`` path); text-prefixes join the
+        # prompt. Unknown attachment subclasses fall through to
+        # ``run_text``.
+        images: List = []
+        text_prefixes: List[str] = []
+        audio_payloads: List[AudioAttachment] = []
+        other: List[Attachment] = []
+
+        for att in attachments:
+            if isinstance(att, ImageAttachment):
+                images.extend(att.images)
+            elif isinstance(att, TextAttachment):
+                text_prefixes.append(att.text or "")
+            elif isinstance(att, AudioAttachment):
+                audio_payloads.append(att)
+            else:
+                other.append(att)
+
+        full_prompt = prompt or ""
+        if text_prefixes:
+            joined = "\n".join(p for p in text_prefixes if p)
+            full_prompt = (joined + ("\n" + full_prompt if full_prompt else "")).strip()
+
+        if audio_payloads and hasattr(backend, "run_audio"):
+            pcm = b"".join(att.data for att in audio_payloads)
+            sample_rate = int(overrides.pop("sample_rate", 16000))
+            n_channels = int(overrides.pop("n_channels", 1))
+            sample_width = int(overrides.pop("sample_width", 2))
+            return self._normalize_backend_result(backend.run_audio(
+                pcm,
+                sample_rate=sample_rate,
+                n_channels=n_channels,
+                sample_width=sample_width,
+                prompt=full_prompt,
+                **overrides,
+            ))
+
+        if images:
+            # Grounding returns a ``GroundingResult`` here, not text —
+            # normalised so the wire carries the raw model output and the
+            # caller does its own structured parsing.
+            return self._normalize_backend_result(
+                backend.run_images(full_prompt, images, **overrides))
+        # ``other`` (unknown attachment subclasses) and the plain-text case
+        # both fall through to run_text — TTS-style backends pick up the
+        # audio attachments via their own hook.
+        return self._normalize_backend_result(
+            backend.run_text(full_prompt, **overrides))
+
+    # ------------------------------------------------------------------ #
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
+        if self._backend is not None:
+            self._backend.close()
+            self._backend = None
+
+    # ------------------------------------------------------------------ #
+    async def run_prompt(
+        self,
+        prompt: str,
+        attachment: Union[None, Attachment, List[Attachment]] = None,
+        *,
+        on_delta: Optional[Callable[[str], None]] = None,
+        **overrides: Any,
+    ) -> Tuple[str, List[Attachment]]:
+        return await LLMSession.run_prompt(
+            self, prompt, attachment, on_delta=on_delta, **overrides,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Embedding passthroughs (kind="embedding" backend only)
+    # ------------------------------------------------------------------ #
+    def embed_text(self, text: str) -> np.ndarray:
+        """Return a normalized embedding vector for a text query."""
+        return self._backend.embed_text(text)
+
+    def embed_video(self, frames: List[np.ndarray], prompt: str = "") -> np.ndarray:
+        """Return a normalized embedding vector for a list of BGR video frames."""
+        return self._backend.embed_video_chunk(frames, text=prompt)
+
+    # ------------------------------------------------------------------ #
+    def reset(self) -> None:
+        """Clear the C library's KV cache / internal state.
+
+        Call this between loop iterations to force the model to start from a
+        clean state — trades a bit of speed for determinism.
+
+        Backend RKNN3Lite handles are named inconsistently across backends:
+        ``TextBackend`` stores ``self.rknn`` while ASR / Embedding / Omni /
+        LocateAnything store ``self.rknn_llm``. Probing both keeps ``reset()``
+        effective everywhere — with only ``rknn_llm`` it was a silent no-op
+        for text chat, letting KV history accumulate across agent-loop
+        rounds (the model then re-emitted the previous round's output and
+        generated raw ``<|im_start|>`` markers).
+        """
+        if self._backend is None:
+            return
+        for attr in ("rknn_llm", "rknn"):
+            rknn_llm = getattr(self._backend, attr, None)
+            if rknn_llm is not None and hasattr(rknn_llm, "clear_kvcache"):
+                try:
+                    rknn_llm.clear_kvcache()
+                except Exception:  # noqa: BLE001 — best effort
+                    pass
+                return
 
 
 # --------------------------------------------------------------------------- #
