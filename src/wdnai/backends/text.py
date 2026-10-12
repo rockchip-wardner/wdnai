@@ -12,6 +12,7 @@ from ._common import (
     load_embed_table,
     load_tokenizer,
     printf_perf,
+    raise_for_session_run,
     resolve_device_id,
 )
 
@@ -74,8 +75,7 @@ class TextBackend:
             if k in overrides and overrides[k] is not None:
                 kwargs[k] = overrides[k]
         ret, stats = self.rknn.session_run(**kwargs)
-        if ret != 0:
-            raise RuntimeError(f"session_run failed: ret={ret}")
+        raise_for_session_run(ret, self.sink, "session")
         n_decode, n_prefill, llm_start, llm_end = stats
         if self.sink.first_token_time is not None:
             self.sink.perf.update({

@@ -68,6 +68,7 @@ from ._common import (
     load_embed_table,
     load_tokenizer,
     printf_perf,
+    raise_for_session_run,
     resolve_device_id,
 )
 
@@ -642,8 +643,7 @@ class VLMBackend:
         # in long-running video loops.
         if inputs is not None:
             self._vision_embed_pin.clear()
-        if ret != 0:
-            raise RuntimeError(f"llm session_run failed: ret={ret}")
+        raise_for_session_run(ret, self.sink, "llm")
         n_decode, n_prefill, llm_start, llm_end = stats
         if self.sink.first_token_time is not None:
             self.sink.perf.update({

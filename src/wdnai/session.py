@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import warnings
 from abc import ABC, abstractmethod
@@ -52,6 +53,8 @@ from .backends import build_backend
 from .lm_output import LMOutput
 from .model import ModelSpec
 from .utils import extract_json, strip_thinking_blocks
+
+_LOG = logging.getLogger("wdnai.session")
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -787,6 +790,40 @@ class LLMLocalSession(LLMSession):
             # fire on the next call and double-render the stream.
             if on_delta is not None and sink is not None:
                 sink.remove_observer(on_delta)
+
+    def stop(self) -> None:
+        """Abort the run currently in flight.
+
+        Both halves are needed. ``StreamSink.stop()`` cuts the stream; only
+        ``rknn3_session_stop()`` frees the NPU — a non-zero ``result_cb``
+        return alone leaves ``session_run`` decoding to ``max_new_tokens``
+        (measured on qwen3.5-vl-4b, stopping 6 s into a ~25 s run: 21.9 s
+        with the sink event only, 6.0 s once the session is stopped). Same
+        call the TTS backend uses on its talker.
+
+        Safe from any thread; a no-op when nothing is running.
+        :meth:`was_stopped` reports whether it took effect.
+        """
+        backend = getattr(self, "_backend", None)
+        sink = getattr(backend, "sink", None)
+        if sink is not None and hasattr(sink, "stop"):
+            sink.stop()
+        # Backend RKNN3Lite handles are named inconsistently across
+        # backends — same probe order as :meth:`reset`.
+        for attr in ("rknn_llm", "rknn"):
+            rknn = getattr(backend, attr, None)
+            if rknn is not None and hasattr(rknn, "session_stop"):
+                try:
+                    rknn.session_stop()
+                except Exception:  # noqa: BLE001 — best effort
+                    _LOG.debug("session_stop() failed (best-effort)", exc_info=True)
+                return
+
+    def was_stopped(self) -> bool:
+        """True when the last completed run was cut short by :meth:`stop`."""
+        backend = getattr(self, "_backend", None)
+        sink = getattr(backend, "sink", None)
+        return bool(getattr(sink, "stopped", False))
 
     @staticmethod
     def _normalize_backend_result(result: Any) -> Tuple[str, List[Attachment]]:

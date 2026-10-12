@@ -37,6 +37,7 @@ from ._common import (
     load_embed_table,
     load_tokenizer,
     printf_perf,
+    raise_for_session_run,
     resolve_device_id,
 )
 from .asr import (  # noqa: F401  — reused (identical mel formula)
@@ -300,8 +301,7 @@ class OmniBackend:
             kwargs["max_new_tokens"] = overrides["max_new_tokens"]
 
         ret, stats = self.rknn_llm.session_run(**kwargs)
-        if ret != 0:
-            raise RuntimeError(f"llm session_run failed: ret={ret}")
+        raise_for_session_run(ret, self.sink, "llm")
         n_decode, n_prefill, llm_start, llm_end = stats
 
         if self.sink.first_token_time is not None:

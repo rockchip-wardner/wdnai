@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -77,6 +78,19 @@ class StreamSink:
     finished: bool = False
     error: Optional[str] = None
     perf: Dict[str, float] = field(default_factory=dict)
+    # Cooperative cancellation, polled by the result callback once per
+    # decode step. This stops the *stream*: the pending token is dropped and
+    # no further deltas are emitted. It does **not** release the NPU — on
+    # this librknn3 a non-zero callback return leaves ``session_run``
+    # decoding to ``max_new_tokens`` (measured 21.9 s vs 24.7 s). The NPU
+    # side is ``rknn3_session_stop()``, called by ``LLMLocalSession.stop``.
+    # Excluded from repr/eq for the same reason as ``_observers``.
+    stop_event: threading.Event = field(
+        default_factory=threading.Event, repr=False, compare=False
+    )
+    # Set on the token where the stop was observed, so callers can tell
+    # "user stopped" apart from "session_run returned != 0".
+    stopped: bool = field(default=False, repr=False, compare=False)
     # Observer registry. Excluded from repr/eq so the dataclass' printed
     # form and equality are unchanged by the streaming support.
     _observers: List[Callable[[str], None]] = field(
@@ -105,6 +119,15 @@ class StreamSink:
             except Exception:  # noqa: BLE001 — see class docstring
                 pass
 
+    def stop(self) -> None:
+        """Request cancellation of the run currently in flight.
+
+        Stops the stream within one token (see :meth:`_ResultCallbackAdapter.__call__`).
+        Releasing the NPU is ``LLMLocalSession.stop()``'s job. Safe from any
+        thread; a no-op when nothing is running.
+        """
+        self.stop_event.set()
+
     def reset(self) -> None:
         self.tokens.clear()
         self.text = ""
@@ -112,6 +135,8 @@ class StreamSink:
         self.finished = False
         self.error = None
         self.perf.clear()
+        self.stop_event.clear()
+        self.stopped = False
         # ``_observers`` deliberately survives reset(): observers are bound
         # to the session lifetime (or to one respond() call registered by
         # LLMLocalSession), not to a single inference run.
@@ -151,6 +176,15 @@ class _ResultCallbackAdapter:
     def __call__(self, _userdata, new_tokens, state):
         sink = self.sink
         s = int(state)
+        # Stop the stream: drop the pending token and report a non-zero return so
+        # the callback stops emitting. Checked on NORMAL only — WAITING /
+        # FINISH are bookkeeping callbacks, and aborting from one of those
+        # would turn an already-finished run into an error. Note this does
+        # not by itself free the NPU; see ``StreamSink.stop_event``.
+        if s == _STATE_NORMAL and sink.stop_event.is_set():
+            sink.stopped = True
+            sink.finished = True
+            return 1
         if s == _STATE_ERROR:
             sink.error = "inference error"
             return 0
@@ -230,6 +264,18 @@ def load_embed_table(path: str, vocab_size: int) -> np.ndarray:
     # copies), so ``mode='r'`` is safe.
     arr = np.memmap(path, dtype=np.float16, mode='r')
     return arr.reshape(vocab_size, -1)
+
+
+def raise_for_session_run(ret: int, sink: StreamSink, what: str) -> None:
+    """Turn a non-zero ``session_run`` into an error — unless we stopped it.
+
+    A stopped run returns early with a non-clean status; keying off
+    ``sink.stopped`` (set by the callback, not the caller) keeps "user
+    pressed stop" from being reported as an inference failure.
+    """
+    if ret == 0 or sink.stopped:
+        return
+    raise RuntimeError(f"{what} session_run failed: ret={ret}")
 
 
 # --------------------------------------------------------------------------- #
