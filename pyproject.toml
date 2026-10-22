@@ -13,6 +13,15 @@ authors = [{ name = "pyrk-sdk" }]
 dependencies = [
     "numpy>=1.23",
     "transformers>=4.40",
+    # 直接使用，不只是 transformers 的传递依赖：gguf_tokenizer.load_tokenizer_from_gguf
+    # 要 from tokenizers import Tokenizer / models.BPE / pre_tokenizers.ByteLevel /
+    # decoders.ByteLevel，而 backends/_common.load_tokenizer() 对 *.tokenizer.gguf
+    # （RKNN 模型自带的 tokenizer 正是这个形态）会走到那条分支 —— 也就是**每次
+    # 模型加载**都要它。靠 transformers 传递依赖满足纯属侥幸：换 transformers
+    # 版本改了它的 tokenizers 上限、或 --no-deps 安装，都会在模型加载时才炸，
+    # 报错点离原因很远。下界取 0.15（上述 API 自该版本起稳定），不设上界，
+    # 免得和 transformers 自己的 pin 打架。
+    "tokenizers>=0.15",
     "pydantic>=1.10",
     "opencv-python>=4.5",
     "gguf>=0.6",
