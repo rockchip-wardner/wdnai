@@ -62,6 +62,14 @@ from ._librknnsmi import (
     WorkMode,
 )
 from .attachment import Attachment, AudioAttachment, ImageAttachment, TextAttachment
+from .capability import (
+    LEGACY_ALIASES,
+    RETIRED_CAPABILITIES,
+    RetiredCapabilityError,
+    SoftwareCapability,
+    known_values,
+    migrate_legacy,
+)
 from .lm_output import LMOutput
 from .model import ModelSpec, SystemLanguageModel
 from .prompt import LocatePrompt, Prompt, build_chatml_prompt
@@ -77,6 +85,12 @@ __all__ = [
     "TextAttachment",
     "ImageAttachment",
     "AudioAttachment",
+    "SoftwareCapability",
+    "RetiredCapabilityError",
+    "migrate_legacy",
+    "known_values",
+    "LEGACY_ALIASES",
+    "RETIRED_CAPABILITIES",
     "LMOutput",
     "ModelSpec",
     "SystemLanguageModel",
@@ -98,4 +112,4 @@ __all__ = [
     "PrefillMode",
 ]
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"

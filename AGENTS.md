@@ -72,7 +72,7 @@ name `wdnai`, distribution name `wdnai`.
   text-out with 0–1000 normalised bbox coords; binds to
   `/userdata/models/LocateAnything/`, override via
   `WDNAI_LOCATE_ANYTHING_DIR`; raises `FileNotFoundError` listing
-  missing files; capability key `swcap_grounding`).
+  missing files; capability key `swcap_vision_grounding`).
 - `src/wdnai/grounding.py` — `@Generable` schemas for the
   LocateAnything backend: `BoundingBox` (single `<box>` region with
   `label` + 0–1000 normalised `x1`/`y1`/`x2`/`y2`) and

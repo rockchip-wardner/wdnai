@@ -32,7 +32,7 @@ No network access is performed at any point; place the model files manually.
 │   # ``mrope_section=[11, 11, 10]``) baked into the graph for image
 │   # position encoding; with no vision tokens attached MRoPE reduces
 │   # to standard positional encoding, so a single RKNN powers both
-│   # ``swcap_text_chat`` and ``swcap_video_describe`` capabilities
+│   # ``swcap_text_chat`` and ``swcap_vision_chat`` capabilities
 │   # in ``MODEL_PRESETS["qwen3-5-vl-4b"]``.
 │
 ├── Qwen3-TTS/                         # pyrkaiweb's text-to-speech back end
@@ -99,7 +99,7 @@ pure-text inference** — the VLM-mode LLM is a regular LLM with
 `mrope_type='Qwen3.5'` / `mrope_section=[11, 11, 10]` baked into the
 graph for image position encoding; with no vision tokens attached
 MRoPE reduces to standard positional encoding, so a single RKNN
-powers both the `swcap_text_chat` and `swcap_video_describe`
+powers both the `swcap_text_chat` and `swcap_vision_chat`
 capabilities declared by `MODEL_PRESETS["qwen3-5-vl-4b"]`.
 `SystemLanguageModel.qwen3_5_vl_4b` points to
 `/userdata/models/Qwen3.5-4B/` by default (override via

@@ -765,10 +765,10 @@ class SystemLanguageModel:
                                     (default ``/userdata/models/Qwen3.5-4B``;
                                     override the root via ``WDNAI_MODELS_DIR``
                                     or pin a custom path via
-                                    ``WDNAI_QWEN3_5_4B_VL_DIR``). Powers both
-                                    ``swcap_text_chat`` and
-                                    ``swcap_video_describe`` capabilities from
-                                    a single RKNN.
+                                    ``WDNAI_QWEN3_5_4B_VL_DIR``). Powers
+                                    ``SoftwareCapability.TEXT_CHAT``,
+                                    ``VISION_CHAT`` and ``TOOL_CALL``
+                                    capabilities from a single RKNN.
     - ``qwen3_tts()``            — Qwen3-TTS bound to ``/userdata/models/Qwen3-TTS``;
                                     the 4 ``.1828.rknn`` files are looked up inside
                                     that directory.
