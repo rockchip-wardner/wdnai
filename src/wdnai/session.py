@@ -24,7 +24,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import sys
 import warnings
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
@@ -144,17 +146,78 @@ class LLMSession(ABC):
         """Whether ``generating=``'s schema hint must be kept OUT of the
         prompt.
 
-        TTS backends consume the prompt as the *text to speak*, so the
-        JSON-schema hint (a Qwen-VLM/LLM concept) would otherwise be read
-        aloud as part of the audio. Resolved from the session's
-        ``ModelSpec`` — which both implementations hold — rather than from
-        the backend, so the decision is made identically on both sides of
-        the wire.
+        Two model families must not see the JSON-schema hint:
+
+        * **TTS** backends consume the prompt as the *text to speak*, so the
+          JSON-schema hint (a Qwen-VLM/LLM concept) would otherwise be read
+          aloud as part of the audio.
+        * **grounding** backends consume the prompt as *the thing to locate*.
+          LocateAnything emits ``<ref>label</ref><box>(x1,y1,x2,y2)</box>``
+          natively — it can neither produce JSON nor read a JSON schema.
+          Worse, the hint is **actively harmful**: the schema's field names
+          and descriptions ("ROI 左上角 x，0–1000 归一化。", "description",
+          "类别 + 0–1000 归一化的左上/右下坐标。" …) are noun phrases
+          sitting in the prompt, and a grounding model grounds *every* phrase
+          it is handed. So the model answers with a few dozen bogus boxes
+          around the schema text instead of the user's target — the
+          "定位到 41 个目标" symptom (labels like ``description`` /
+          ``ROI 左上角 x，0–1000 归一化。``).
+          The **output** side is unaffected: ``generating=`` still carries the
+          raw text back to the caller, which parses the ``<box>`` spans
+          (``_parse_locate_output``).
+
+        Resolved from the session's ``ModelSpec`` — which both implementations
+        hold — rather than from the backend, so the decision is made
+        identically on both sides of the wire.
         """
-        kind = getattr(self.spec, "kind", None)
+        kind = self._model_kind()
+        return kind in ("tts", "grounding")
+
+    def _model_kind(self) -> Optional[str]:
+        """Best-effort model family: ``"tts"`` / ``"grounding"`` / ``"vlm"`` …
+
+        The family decides whether the JSON-schema hint may go into the
+        prompt, so a **missed** resolution is a silent correctness bug:
+        the schema leaks into a grounding prompt and the model grounds
+        the schema's field names instead of the user's target (the
+        "定位到 41 个目标" symptom).
+
+        That is not hypothetical — it is exactly how this was found: the
+        webui handed ``LLMRPCSession`` a **plain dict** (the worker
+        manifest's preset view) where a ``ModelSpec`` was expected, so
+        ``getattr(spec, "kind", None)`` was ``None``, the suppression
+        silently turned itself off, and a 2 KB JSON Schema rode along
+        into every grounding prompt.
+
+        So this helper is deliberately forgiving about the *shape* and
+        loud about a *miss*:
+
+        * ``ModelSpec`` → ``spec.kind``;
+        * plain dict → ``spec["kind"]`` (manifest-preset shape);
+        * otherwise → the backend's own spec.
+
+        When nothing resolves it warns **once** instead of failing
+        silently — the caller cannot fix it from here, but an operator
+        reading the log can.
+        """
+        spec = self.spec
+        kind = getattr(spec, "kind", None)
+        if kind is None and isinstance(spec, dict):
+            kind = spec.get("kind")
         if kind is None:
             kind = getattr(getattr(self._backend, "spec", None), "kind", None)
-        return kind == "tts"
+        if kind is None:
+            if not getattr(self, "_warned_unknown_kind", False):
+                self._warned_unknown_kind = True
+                logging.getLogger(__name__).warning(
+                    "wdnai: cannot resolve the model kind from %r — the "
+                    "JSON-schema hint will be added to the prompt as usual. "
+                    "For TTS / grounding models that is wrong (the schema "
+                    "must stay out of the prompt). Pass a real ModelSpec "
+                    "(or a dict carrying 'kind') as the session's model.",
+                    type(spec).__name__,
+                )
+        return kind
 
     @abstractmethod
     async def _dispatch(
@@ -343,6 +406,25 @@ class LLMSession(ABC):
         full_prompt = self._compose_prompt(
             prompt, prompt_generating, tool_specs, history,
         )
+        if os.environ.get("WDNAI_TRACE_PROMPT"):
+            # Diagnostic switch: print the **exact** string handed to the
+            # model.  Off by default (one env lookup per inference is
+            # free next to a 0.5-2 s decode), and the single most useful
+            # tool when a model "misbehaves" — because the first
+            # question is always "what did we actually send it?".
+            #
+            # This is how the grounding bug was pinned down: the trace
+            # showed a 2035-char prompt (user query + the full JSON
+            # Schema of ``LocatorDoc``) being sent to LocateAnything,
+            # whose output was then littered with the schema's own
+            # field names ("description", "ROI 右下角 y，0–1000 归一化。")
+            # because a grounding model grounds every phrase it is
+            # handed.  See ``_suppress_generating_in_prompt``.
+            print(
+                f"[wdnai.trace] kind={getattr(self.spec, 'kind', None)} "
+                f"len={len(full_prompt)} :: {full_prompt[:260]!r}",
+                file=sys.stderr, flush=True,
+            )
         if debug:
             print(f"[wdnai.debug] prompt      = {prompt!r}")
             print(f"[wdnai.debug] full_prompt = {full_prompt!r}")

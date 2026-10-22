@@ -520,6 +520,38 @@ LocateAnything 是一个 grounding 模型（视觉定位）：单张图输入 �
 `@Generable` 协议时只有 `boxes` 进入 schema，因为 `GroundingResult`
 刻意只声明了 `boxes` / `text` / `level` 三个字段，不污染坐标语义）。
 
+> **grounding 链路绝不能把 JSON Schema 塞进 prompt。**
+> `LLMSession._suppress_generating_in_prompt` 对 `kind == "grounding"`
+> 返回 `True`（和 `kind == "tts"` 一样）——`generating=` 仍然承载输出
+> 侧的解析，但 prompt 里只有用户查询。
+>
+> 为什么这么严（2026-10-22 真机实测，RK3588）：
+>
+> * LocateAnything 是 grounding 模型，它把 prompt 里的**每个名词短语**
+>   都当成「要定位的目标」。JSON Schema 里的字段名 / 字段描述
+>   （`description`、`ROI 左上角 x，0–1000 归一化。`、
+>   `单个 ``<box>`` 区域：类别 + 0–1000 归一化的左上/右下坐标。` …）
+>   全是名词短语，于是被逐个 ground 出来 —— 症状是「定位到 41 个
+>   目标」，标签是 schema 的字段名，不是模型能力问题。
+> * 同一批真实帧的 A/B 实测（广州地铁人流素材 + 查询「穿黄色衣服的人」）：
+>   带 schema 时每帧目标数 `[1, 0, 144, 5, 2, 1]`、最慢一帧 **13.7 s**；
+>   干净 prompt 时 `[1, 0, 1, 1, 1, 1]`、稳定 ~0.5 s。
+>   **「污染」是逐帧随机的** —— 某些帧看着正常，某些帧直接炸成上百个
+>   框，所以「12 条事件里 8 条干净」不代表那 8 条真的干净。
+> * 症状看起来像「模型输出质量波动」，但**证据在输入侧**：schema 是
+>   调用方拼进去的。排查这类问题先看真正发出去的 prompt ——
+>   `WDNAI_TRACE_PROMPT=1` 会把每次推理实际发出的 prompt 打到 stderr
+>   （带 `kind=` 和长度）。
+>
+> **判定必须落在 `spec.kind` 上 —— 所以调用方必须传真正的 `ModelSpec`。**
+> wdnwebui 的主进程曾经把 worker manifest 的 preset dict（UI 用的
+> `Dict[str, Any]`，**没有 `kind`**）当 model 传给 `LLMRPCSession`，
+> 于是 `spec.kind` 解析成 `None`、抑制静默失效、schema 照旧进 prompt，
+> 只改 wdnai **一点效果都没有**。现在 `LLMSession._model_kind()` 兼容
+> 两种形状（`ModelSpec` 走属性、dict 走 `["kind"]`），解析不到时
+> **打一条 warning** 而不是静默 —— 这类"判定依据解析不出来"的坑
+> 必须吵，否则它会以「模型输出质量」的形式回来找你。
+
 ```python
 import cv2
 from wdnai import Attachment, LLMSession, SystemLanguageModel
