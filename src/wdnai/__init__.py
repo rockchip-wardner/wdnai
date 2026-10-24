@@ -41,6 +41,9 @@ without shelling out to a subprocess:
     smi = RknnSmi()
     for dev in smi.get_device_list():
         print(dev["index"], dev["mode"], smi.get_device_temperature(dev["index"]))
+
+``get_device_temperature()`` 返回 °C；设备级命令在部分 EP 固件上没人应答
+（RK1828），此时自动回退到 chip 级读取，调用方无须关心两级差异。
 """
 from __future__ import annotations
 

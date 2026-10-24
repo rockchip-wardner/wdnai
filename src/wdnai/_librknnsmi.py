@@ -39,7 +39,7 @@ from ctypes import (
     c_void_p,
 )
 from enum import IntEnum
-from typing import List, Optional
+from typing import List, Optional, Set
 
 # =============================================================================
 # 1. Library load
@@ -478,6 +478,12 @@ class RknnSmi:
     _init_done = False
     _init_failed: Optional[BaseException] = None
 
+    #: 设备级温度命令（cmd 12）在某些 EP 固件上没人应答（RK1828 实测）。
+    #: 这些卡改走 chip 级；记住下来，后续不再去触发注定失败的 PCIe 命令
+    #: （每次触发 C 层都会打一行 "Receive error, command: 12"）。
+    #: 进程级共享 —— RknnSmi 的 init 本身就是进程单例。
+    _temp_device_unsupported: Set[int] = set()
+
     def __init__(self) -> None:
         self._lib = load_library()
         with RknnSmi._init_lock:
@@ -698,26 +704,66 @@ class RknnSmi:
         return int(out.value)
 
     def get_device_temperature(self, device_id: int = 0) -> float:
-        """Return device temperature in °C (milli-°C resolution).
+        """Return device temperature in °C.
 
-        The SO returns the value as a millidegree int (×1000); we
-        return it as float °C so it matches what ``rknn-smi info``
-        prints in the table.
+        The device-level SMI command (cmd 12) has to be answered by the EP
+        firmware over PCIe. Some RK1828 firmwares **don't** answer it — the
+        call then fails with ``GENERIC (-1)`` and the C layer logs
+        ``[nsmi_pcie.c:651] Receive error, command: 12`` on every attempt.
+
+        In that case fall back to the chip-level command, which the very
+        same firmware *does* answer, and remember that the device level is
+        unsupported for this device — so later calls go straight to the chip
+        level instead of re-triggering the failing PCIe command (each
+        attempt costs one C-level error line).
+
+        The two levels report in different units (device level in milli-°C,
+        chip level in whole °C), so each path converts on its own.
         """
+        if device_id in RknnSmi._temp_device_unsupported:
+            return self.get_chip_temperature(device_id, 0)
         out = c_int32(0)
         ret = self._lib.rknnsmi_get_device_temperature(
             _u16(device_id), ctypes.byref(out)
         )
-        _raise_if_error(ret, "get_device_temperature")
+        if ret != 0:
+            fallback = self._try_chip_temperature(device_id)
+            if fallback is None:
+                _raise_if_error(ret, "get_device_temperature")
+                raise AssertionError("unreachable")  # pragma: no cover
+            RknnSmi._temp_device_unsupported.add(device_id)
+            return fallback
         return int(out.value) / 1000.0
 
+    def _try_chip_temperature(self, device_id: int) -> Optional[float]:
+        """Chip-level temperature, or ``None`` when that path fails too."""
+        try:
+            return self.get_chip_temperature(device_id, 0)
+        except RknnSmiCallError:
+            return None
+
     def get_chip_temperature(self, device_id: int = 0, chip_id: int = 0) -> float:
+        """Return chip temperature in °C.
+
+        The chip-level API reports **whole degrees** — e.g. ``43`` for a
+        chip sitting at 43 °C, the very number ``rknn-smi info`` prints in
+        its ``Temp(C)`` column (measured on a 2×RK1828 board: raw 43 / 45
+        vs. the CLI's 40 / 42 for the same cards).
+
+        Dividing this by 1000 (as if it were milli-°C like the device-level
+        API) reported **0.043 °C for a 43 °C chip** — a silently wrong
+        number, which also defeats every threshold check (e.g. "> 85 °C"
+        never fires).
+
+        Note the unit differs from :meth:`get_device_temperature`, which
+        reports milli-°C; each path converts on its own.
+        """
         out = c_int32(0)
         ret = self._lib.rknnsmi_get_chip_temperature(
             _u16(device_id), _u16(chip_id), ctypes.byref(out)
         )
         _raise_if_error(ret, "get_chip_temperature")
-        return int(out.value) / 1000.0
+        return float(int(out.value))
 
     def get_chip_health(
         self, device_id: int = 0, chip_id: int = 0
