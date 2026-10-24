@@ -169,8 +169,18 @@ def migrate_legacy(value: Any) -> Tuple[SoftwareCapability, bool]:
         return value, False
     if not isinstance(value, str):
         raise ValueError("软件能力必须是字符串，得到 {!r}".format(type(value).__name__))
-    if value in SoftwareCapability:
+    # **不要用 `value in SoftwareCapability`** —— Enum.__contains__ 的语义
+    # 在 Python 版本间变过：3.11 对「非枚举成员」抛 TypeError（连合法的
+    # 能力串也是普通 str，不是枚举实例 → 一律 TypeError），3.12 才改成
+    # 按值返回 True/False。``requires-python = ">=3.9"`` 意味着这个包要在
+    # 3.9~3.11 上跑 —— 旧写法会让本函数对**任何**输入都抛 TypeError，
+    # 而不是期望的 ValueError（3.11 上实测：合法能力串也炸）。
+    # 用「按值查表 + 捕获 ValueError」，语义与 3.12 的 `in` 一致，且与
+    # 本类 ``coerce()`` 的写法保持一致。
+    try:
         return SoftwareCapability(value), False
+    except ValueError:
+        pass
     reason = RETIRED_CAPABILITIES.get(value)
     if reason is not None:
         raise RetiredCapabilityError("软件能力 {!r} 已下线：{}".format(value, reason))
