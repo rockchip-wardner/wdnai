@@ -18,6 +18,11 @@ name `wdnai`, distribution name `wdnai`.
 
 ## Repo map (one-line each)
 
+- `README.md` — 面向**使用者**的说明：安装（内网 Git editable）、文本/视觉/
+  结构化输出/工具调用的快速上手、能力词表、`RknnSmi` 遥测、`ModelSpec`
+  字段与 preset 速查、模型文件布局与环境变量、已知限制。
+  `pyproject.toml` 的 `readme = "README.md"` 指向的就是它 —— **别删**，
+  删了打包会退化成「声明了 markdown 长描述但正文为空」。
 - `pyproject.toml` — package metadata (name=wdnai, version=0.4.0);
   deps: `numpy>=1.23`, `transformers>=4.40`, `pydantic>=1.10`,
   `opencv-python>=4.5`, `gguf>=0.6`. Optional: `[lite]`
@@ -73,6 +78,21 @@ name `wdnai`, distribution name `wdnai`.
   `/userdata/models/LocateAnything/`, override via
   `WDNAI_LOCATE_ANYTHING_DIR`; raises `FileNotFoundError` listing
   missing files; capability key `swcap_vision_grounding`).
+- `src/wdnai/_librknnsmi.py` — ctypes shim over `/usr/lib/librknnsmi.so`
+  (the C ABI behind the `rknn-smi` CLI): device list, device/chip info,
+  PCIe info, **temperature**, power/voltage/current, NPU util, memory,
+  chip health, version, reset. `RknnSmi` is the only public entry.
+  Two traps worth knowing before touching it:
+  - **温度的单位两级不一样**：设备级 `get_device_temperature()` 返**毫度**
+    （×1000，43000 → 43.0 °C），chip 级 `get_chip_temperature()` 返**整度**
+    （43 → 43.0 °C）。当成同一套单位处理 → chip 级被多除 1000 → 43 °C 变成
+    **0.043 °C**（静默错值，阈值判断全部失效）。
+  - **设备级温度命令在 RK1828 EP 固件上没人应答**（cmd 12 走 PCIe，无应答
+    → ret=-1，C 层打 `[nsmi_pcie.c:651] Receive error, command: 12`）。
+    `get_device_temperature()` 因此**自动回退到 chip 级**，并记住该卡设备级
+    不通（`_temp_device_unsupported`）→ 后续不再触发注定失败的命令。
+    调用方（wdnwebui 的 system-monitor）只管调一次即可，不必自己实现
+    「设备级 / chip 级」这层平台语义。
 - `src/wdnai/grounding.py` — `@Generable` schemas for the
   LocateAnything backend: `BoundingBox` (single `<box>` region with
   `label` + 0–1000 normalised `x1`/`y1`/`x2`/`y2`) and
@@ -304,12 +324,20 @@ name `wdnai`, distribution name `wdnai`.
   Qwen3-VL-4B / Qwen3-TTS file tables. The directory itself ships
   empty in-tree; weights are user-placed (or installed via the
   rknn3_model_zoo flow).
-- `tests/test_mock_e2e.py` — the only test file. Monkey-patches
+- `tests/test_mock_e2e.py` — Monkey-patches
   `rknn3lite.api.RKNN3Lite` + transformers + the result-callback +
   `build_llm_callback` so the full SDK runs without hardware. Covers
   Qwen3 / Qwen2.5 text, Qwen3-VL / Qwen2.5-VL image, override
   pass-through, and the full `respond()` path (JSON hint injection
   + pydantic parse).
+- `tests/test_capability.py` — `SoftwareCapability` 词表：成员与裸字符串
+  相等且 hash 一致、`json.dumps` 出裸字符串、`__str__` 还原裸值、
+  严格校验与老配置迁移语义分离。
+- `tests/test_rknnsmi_temperature.py` — `RknnSmi` 温度读取的**单位**与
+  **回退**：chip 级返整度（raw 43 → 43.0 °C，不是 0.043）；设备级失败
+  （ret=-1）→ 回退 chip 级并记住该卡设备级不通（第二次不再触发注定
+  失败的 PCIe 命令）；两级都失败仍抛 `RknnSmiCallError` 且**不**记缓存。
+  用假 lib 驱动，不碰硬件。
 - `examples/` — runnable demos, no `test_` prefix. End-to-end
   consumers; `detect_image.py` (10-round structured-output loop),
   `detect_video.py` (`wdnav.VideoCapture` + per-N-frames VLM), the
