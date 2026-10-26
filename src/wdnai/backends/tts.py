@@ -527,6 +527,56 @@ def _resolve_tts_model_dir(spec) -> Path:
 
 
 # --------------------------------------------------------------------------- #
+# 内置音色(config speaker)可用性探测
+# --------------------------------------------------------------------------- #
+_CONFIG_SPEAKER_CACHE: dict = {}
+
+
+def available_config_speakers(model_dir) -> dict:
+    """本模型**真正可用**的内置音色 → ``{名字: input_embed 行号}``。
+
+    ``SPK_ID`` 的 9 个内置音色只在 **CustomVoice** 权重里训练过;部署
+    **Base**(声音克隆)权重时那些行是没训练的占位噪声(实测 norm
+    0.022~0.023,而训练过的行是 0.056~1.64,girl_base 是 17)—— 塞进
+    talker 等于没给音色条件,模型每次生成都自由发挥。
+
+    所以按行内容**实测有效性**:norm 要高出「表内噪声地板」一个数量级。
+    不是按名字白名单 —— 换成 CustomVoice 转换的模型,这里自动放行。
+    任何异常退化成 ``{}``:宁可少给选项,不能给「选了却不生效」的假选项。
+    """
+    path = Path(model_dir) / "talker_input_embed.fp16.bin"
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    hit = _CONFIG_SPEAKER_CACHE.get(key)
+    if hit is not None:
+        return dict(hit)
+
+    try:
+        emb = np.fromfile(path, dtype=np.float16).reshape(
+            TALKER_VOCAB_SIZE, QWEN3_TTS_EMBED_DIM)
+        norms = np.linalg.norm(emb.astype(np.float32), axis=1)
+        # 噪声地板 = 表内最低 5% 的典型量级(比 min 稳,万一有几行
+        # 恰好是 0)。实测 Base 模型:地板 0.022,门槛 0.176。
+        floor = float(np.percentile(norms, 5))
+        threshold = 8.0 * floor
+        out = {
+            name: int(row)
+            for name, row in SPK_ID.items()
+            if 0 <= int(row) < TALKER_VOCAB_SIZE
+            and float(norms[int(row)]) >= threshold
+        }
+    except Exception as e:  # noqa: BLE001
+        LOG.warning("available_config_speakers failed for %s: %s", path, e)
+        return {}
+
+    _CONFIG_SPEAKER_CACHE[key] = dict(out)
+    return dict(out)
+
+
+# --------------------------------------------------------------------------- #
 # RKNN3 driver — vendored from qwen3_tts_demo.py
 # --------------------------------------------------------------------------- #
 class Qwen3TTSDriver:
