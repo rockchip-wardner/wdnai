@@ -31,7 +31,7 @@ bytes）全部封装在 SDK 的 ``TTSBackend`` 里（参见
 执行：
 
     .venv/bin/python .venv/src/wdnai/examples/text_to_speech.py \\
-        --text "你好世界" --ref-speaker girl_base
+        --text "你好世界" --ref-speaker news_female
 """
 from __future__ import annotations
 
@@ -52,6 +52,7 @@ from wdnai import (
     SystemLanguageModel,
     TextAttachment,
 )
+from wdnai.backends.tts import DEFAULT_REF_SPEAKER
 
 LOG = logging.getLogger("text_to_speech")
 
@@ -84,8 +85,9 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
                    help="语言 (auto / chinese / english / japanese / ...)")
     p.add_argument("--speaker", default="",
                    help="内置 SPK_ID（serena/vivian/ryan/...），与 --ref-speaker 互斥")
-    p.add_argument("--ref-speaker", default="girl_base",
-                   help="qwen3tts_speaker_embed.h 里的 voice-clone speaker (girl_base / ahu)")
+    p.add_argument("--ref-speaker", default=DEFAULT_REF_SPEAKER,
+                   help="内嵌的 voice-clone 参考音色（news_female / baby_girl / "
+                        "lovely_girl / cool_lady / male_announcer / uncle_bass）")
     p.add_argument("--instruct", default="",
                    help="可选 CustomVoice instruct")
     p.add_argument("--volume", type=float, default=0.1,

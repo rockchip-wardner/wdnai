@@ -296,7 +296,7 @@ name `wdnai`, distribution name `wdnai`.
   1..3) into `RKNN3AuxTensorWrapper`s with the chosen variant's
   vision output's `aligned_size`.
 - `src/wdnai/backends/tts.py` — `TTSBackend` + vendored
-  `Qwen3TTSDriver` (1542 lines, originally in
+  `Qwen3TTSDriver` (1893 lines, originally in
   `rknn3-toolkit-lite/examples/Qwen3-TTS/qwen3_tts_demo.py` and
   imported via `sys.path` injection; now in-tree so
   `import wdnai.backends.tts` is self-contained). Pipeline:
@@ -304,7 +304,7 @@ name `wdnai`, distribution name `wdnai`.
   code_predictor (8 cores, AR, offline) → speech_decoder
   (sliding window 25/50) → 24 kHz mono 32-bit IEEE float WAV`.
   `AudioPlayer` (sounddevice → aplay → no-op fallback). VoiceClone
-  speaker embeddings (`girl_base` / `ahu`) are zlib+base64-inlined
+  reference embeddings (6 真人参考音色) are zlib+base64-inlined
   in `_BUNDLED_SPEAKER_EMBEDDINGS_B64` so no external
   `qwen3tts_speaker_embed.h` is required. `run_text()` returns
   `(prompt_str, [Attachment])`; the SDK unpacks the tuple and
@@ -319,6 +319,13 @@ name `wdnai`, distribution name `wdnai`.
   trampolines. `_LLM_RUN_NORMAL` / `_LLM_RUN_FINISH` etc. are
   inlined as integer constants — we don't expose the shim's
   IntEnum to keep this module independent.
+- `src/wdnai/backends/speaker_encode.py` — `SpeakerEncoder`: RKNN 版
+  ECAPA-TDNN，把一段参考音频变成 2048 维 x-vector（用户音色的**现场提取**，
+  参考音色是同一份向量的离线版本）。纯 numpy 前处理（mel 滤波器组是
+  随模型发布的 `speaker_encoder_mel.npy`），固定输入 468 帧 = 5 秒
+  （长音频截前 5 秒，短音频尾部补零）。走 `wdnai._librknn` shim，
+  `RKNN3Lite` 只在 `open_context()` 里 import —— native driver 绝不能在
+  模块 import 阶段打开。
 - `src/wdnai/models/README.md` — model file layout
   (`/userdata/models/<name>/`), `.1828.rknn` naming convention, the
   Qwen3-VL-4B / Qwen3-TTS file tables. The directory itself ships
@@ -345,7 +352,7 @@ name `wdnai`, distribution name `wdnai`.
   `--majority-vote K` / background `asyncio.Task` for non-blocking
   display), `function_call.py` (multi-tool dispatch with
   `isinstance`), `text_to_speech.py` (TTS CLI with `--ref-speaker
-  girl_base` / `--volume` / `--no-play`). External dataset dirs
+  news_female` / `--volume` / `--no-play`). External dataset dirs
   `光厂_*` hold plate frames + `.txt` ground truth.
 
 
@@ -397,11 +404,12 @@ name `wdnai`, distribution name `wdnai`.
   否则 ByteLevel pre-tokenizer 会把它们切碎成 ~7 个普通 token，`rknn3`
   `session_run` 找不到期望的 ID，整个推理直接挂掉。这条对任何用 RKNN3
   的多模态模型通用。
-- **TTS 的 VoiceClone speaker 不读盘**：两个 fp16 2048-d 参考向量
+- **TTS 的 VoiceClone 参考音色不读盘**：6 个 fp16 2048-d 参考向量
   zlib+base64 编码内联在 `tts.py:_BUNDLED_SPEAKER_EMBEDDINGS_B64`，
   启动时惰性解一次。`_load_speaker_embeddings()` 不再 walk 文件系统，
-  所以 `ref_speaker="girl_base"` / `"ahu"` 在没有 rknn3 dev 树的干净
-  board 上仍然能正确工作。
+  所以 `ref_speaker="news_female"` 在没有 rknn3 dev 树的干净 board 上
+  仍然能正确工作。**用户音色**（现场提取）另走一条路：app 写盘，
+  worker 启动时从 `WDNAI_TTS_USER_VOICES_DIR` 读回来。
 - **`.1828.rknn` 是 RK1828 NPU 量化版本后缀**：`TTSDriver._resolve_model_paths`
   先尝试 `<role>.1828.rknn`，找不到就 fallback 到 `<role>.rknn`。新增模型
   变体请沿用同一约定。
@@ -501,7 +509,7 @@ async with LLMSession(model=model, npu=0) as sess:    # 多卡场景选第 1 张
     result = await sess.respond(
         attachment=[Attachment("你好世界", kind="text")],
         generating=TTSResult,
-        ref_speaker="girl_base",             # 内嵌 fp16，无需外部 header
+        ref_speaker="news_female",          # 内嵌 fp16，无需外部 header
         language="auto",
         volume=0.1,                          # 0.0~1.0 线性缩放 live PCM
         no_play=False,                       # True 时只产 WAV bytes 不出声
