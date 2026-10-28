@@ -256,7 +256,7 @@ class _CoreMemSize(Structure):
         ("core_id", c_int32),
         ("weight_size", c_uint64),
         ("internal_size", c_uint64),
-        ("reserved", c_uint8 * 32),
+        ("reserved", c_uint8 * 424),
     ]
 
 
@@ -768,7 +768,7 @@ def _result_trampoline(user_cb: Callable[..., int]):
     return _cb
 
 
-def _tokenizer_trampoline_for_hf_tokenizer(tokenizer) -> Tuple[Any, c_void_p]:
+def _tokenizer_trampoline_for_hf_tokenizer(tokenizer) -> Tuple[Any, c_void_p, Any]:
     """Build a C tokenizer callback that wraps a HuggingFace tokenizer.
 
     Mirrors rknn3lite's default behaviour: text → ``tokenizer(text)``
@@ -789,10 +789,10 @@ def _tokenizer_trampoline_for_hf_tokenizer(tokenizer) -> Tuple[Any, c_void_p]:
 
     holder = ctypes.py_object(tokenizer)
     ud = ctypes_cast(pointer(holder), c_void_p)
-    return _cb, ud
+    return _cb, ud, holder
 
 
-def _embed_trampoline_for_table(embeds: np.ndarray) -> Tuple[Any, c_void_p]:
+def _embed_trampoline_for_table(embeds: np.ndarray) -> Tuple[Any, c_void_p, Any]:
     """Build a C embed callback that looks up fp16 token embeddings."""
 
     @_EMBED_CB
@@ -811,7 +811,7 @@ def _embed_trampoline_for_table(embeds: np.ndarray) -> Tuple[Any, c_void_p]:
 
     holder = ctypes.py_object(embeds)
     ud = ctypes_cast(pointer(holder), c_void_p)
-    return _cb, ud
+    return _cb, ud, holder
 
 
 def build_llm_callback(
@@ -876,11 +876,11 @@ def build_llm_callback(
 
     # ---- tokenizer ------------------------------------------------- #
     if tokenizer is not None:
-        tramp, ud = _tokenizer_trampoline_for_hf_tokenizer(tokenizer)
+        tramp, ud, holder = _tokenizer_trampoline_for_hf_tokenizer(tokenizer)
         bundle.struct.tokenizer_callback = tramp
         bundle.struct.tokenizer_userdata = ud
         bundle._trampolines.append(tramp)
-        bundle.pins.append(ud)            # keep the py_object anchor alive
+        bundle.pins.append(holder)        # keep the py_object anchor alive
 
     # ---- embed ------------------------------------------------------ #
     if embeds_data is not None and embed_callback is not None:
@@ -888,11 +888,11 @@ def build_llm_callback(
     if embeds_data is not None:
         if not isinstance(embeds_data, np.ndarray) or embeds_data.dtype != np.float16:
             raise TypeError("embeds_data must be a float16 ndarray")
-        tramp, ud = _embed_trampoline_for_table(embeds_data)
+        tramp, ud, holder = _embed_trampoline_for_table(embeds_data)
         bundle.struct.embed_callback = tramp
         bundle.struct.embed_userdata = ud
         bundle._trampolines.append(tramp)
-        bundle.pins.append(ud)
+        bundle.pins.append(holder)
     elif embed_callback is not None:
         target = getattr(embed_callback, "__self__", embed_callback)
 
@@ -1009,6 +1009,7 @@ class _Runtime:
         # rknn3_init
         ctx = c_uint64(0)
         ext = _InitExtend()
+        self._init_ext = ext
         ext_p = ctypes_cast(pointer(ext), c_void_p) if device_id is not None else None
         if device_id is not None:
             ext.device_id = device_id        # bytes → c_char_p
@@ -1041,6 +1042,7 @@ class _Runtime:
         self._tensor_mem_pointers: List[int] = []
         # Per-runtime user data (used for context-lifetime-bound data).
         self._created = True
+        self._model_initialized = False
 
     # ------------------------------------------------------------------ #
     def _check_alive(self) -> None:
@@ -1050,8 +1052,10 @@ class _Runtime:
     # ------------------------------------------------------------------ #
     def load_model(self, model_path: str, weight_path: str) -> None:
         self._check_alive()
+        self._model_path_bytes = model_path.encode("utf-8")
+        self._weight_path_bytes = weight_path.encode("utf-8")
         ret = self.lib.rknn3_load_model_from_path(
-            self.context, model_path.encode("utf-8"), weight_path.encode("utf-8"),
+            self.context, self._model_path_bytes, self._weight_path_bytes,
         )
         if ret != 0:
             raise RuntimeError(f"rknn3_load_model_from_path failed: ret={ret}")
@@ -1059,9 +1063,12 @@ class _Runtime:
     # ------------------------------------------------------------------ #
     def model_init(self) -> None:
         self._check_alive()
+        if self._model_initialized:
+            return
         ret = self.lib.rknn3_model_init(self.context, pointer(self.config))
         if ret != 0:
             raise RuntimeError(f"rknn3_model_init failed: ret={ret}")
+        self._model_initialized = True
 
     # ------------------------------------------------------------------ #
     def create_tensor(self) -> None:
@@ -1275,9 +1282,13 @@ class _Runtime:
             self._query_into(int(_QueryCmd.CORE_NUMBER), n, ctypes.sizeof(n))
             if n.value <= 0:
                 return []
-            arr = (_CoreMemSize * n.value)()
-            self._query_into(ec, arr, ctypes.sizeof(arr))
-            return list(arr)
+            out = []
+            for core_id in range(int(n.value)):
+                info = _CoreMemSize()
+                info.core_id = core_id
+                self._query_into(ec, info, ctypes.sizeof(info))
+                out.append(info)
+            return out
         if ec == int(_QueryCmd.DEVICE_MEM_INFO):
             out = _DevMemInfo()
             self._query_into(ec, out, ctypes.sizeof(out))
@@ -1415,9 +1426,11 @@ class _LLMSession:
                 raise RuntimeError("rknn3_session_set_callback failed")
 
     def set_chat_template(self, system: str, prefix: str, postfix: str) -> int:
-        return self.lib.rknn3_session_set_chat_template(
-            self._session,
+        self._chat_template_bytes = (
             system.encode("utf-8"), prefix.encode("utf-8"), postfix.encode("utf-8"),
+        )
+        return self.lib.rknn3_session_set_chat_template(
+            self._session, *self._chat_template_bytes,
         )
 
     def clear_kvcache(self, clear_policy: int = 0) -> int:
@@ -1878,6 +1891,7 @@ def _pack_llm_params(
         logits_anchor = arg_logits.encode("utf-8")
         p = _LLMParam()
         p.logits_name = c_char_p(logits_anchor)
+        p._logits_anchor = logits_anchor
         p.max_context_len = c_int32(int(d.get("max_context_len", 4096)))
         sp = _SamplingParams()
         sp.top_k = c_int32(int(d.get("top_k", 1)))
