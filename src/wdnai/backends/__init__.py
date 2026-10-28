@@ -1,7 +1,7 @@
 """Backend factory: build the right Backend from a ModelSpec."""
 from __future__ import annotations
 
-from typing import Dict, Optional, Type, Union
+from typing import Dict, Optional, Sequence, Type, Union
 
 from ..model import ModelSpec
 from ._common import resolve_device_id
@@ -25,6 +25,7 @@ def build_backend(
     *,
     npu: Optional[int] = None,
     device_id: Optional[Union[bytes, str]] = None,
+    npu_indices: Optional[Sequence[int]] = None,
 ):
     """Pick the backend implementation based on ``spec.kind``.
 
@@ -46,6 +47,14 @@ def build_backend(
     if spec.kind == "omni":
         from .omni import OmniBackend  # type: ignore  # noqa: WPS433
         return OmniBackend(spec, npu=npu, device_id=device_id)
+    if spec.kind == "vlm_multicard":
+        from .vlm_multicard_rknn3lite import (  # type: ignore  # noqa: WPS433
+            Rknn3LiteMultiCardVLMBackend,
+        )
+        return Rknn3LiteMultiCardVLMBackend(
+            spec, npu_indices=npu_indices,
+            npu=npu, device_id=device_id,
+        )
     cls = _REGISTRY.get(spec.kind)
     if cls is None:
         raise ValueError(
@@ -55,8 +64,8 @@ def build_backend(
 
 
 __all__ = [
-    "TextBackend", "VLMBackend", "TTSBackend", "EmbeddingBackend",
-    "LocateAnythingBackend",
+    "TextBackend", "VLMBackend", "Rknn3LiteMultiCardVLMBackend",
+    "TTSBackend", "EmbeddingBackend", "LocateAnythingBackend",
     "OmniBackend", "ASRBackend",
     "build_backend", "resolve_device_id",
 ]

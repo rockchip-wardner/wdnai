@@ -54,6 +54,18 @@ class ModelSpec:
     embed_path: str = ""
     tokenizer_path: str = ""
 
+    # ---- Multi-stage / multi-card exports (Qwen3.5-VL-9B) ----
+    # ``stage_count > 1`` means the LLM is split across that many RKNN
+    # files, one per card. ``llm_seg_paths`` / ``weight_seg_paths`` hold
+    # the per-stage paths in stage order; ``rknn_llm_path`` /
+    # ``weight_llm_path`` remain the stage-0 aliases so single-stage code
+    # and probes keep working. ``requires_cards`` is consumed by the
+    # compute layer; the backend itself only needs the device-id list.
+    stage_count: int = 1
+    llm_seg_paths: List[str] = field(default_factory=list)
+    weight_seg_paths: List[str] = field(default_factory=list)
+    requires_cards: int = 1
+
     # ---- Model hyperparameters ----
     vocab_size: int = 151936
     special_eos_id: int = 151645
@@ -301,6 +313,57 @@ def _qwen3_5_vl_spec(**overrides) -> ModelSpec:
             "repeat_penalty": 1.0,
             "frequency_penalty": 0.0,
             "presence_penalty": 1.5,   # Qwen3.5 demo default — see main.cc
+            "enable_thinking": False,
+        },
+    )
+    base.update(overrides)
+    return ModelSpec(**base)
+
+
+def _qwen3_5_vl_9b_spec(**overrides) -> ModelSpec:
+    """Qwen3.5-VL-9B multi-stage / multi-card spec.
+
+    Unlike the 4B export (one LLM RKNN on one card), the 9B export is
+    split into ``seg0`` / ``seg1``: each stage lives on its own RK182x
+    card and the two are chained by
+    :class:`Rknn3LiteMultiCardVLMBackend`.
+    Vision stays on stage 0's card. ``requires_cards=2`` is consumed by
+    the compute layer (a single-card board cannot run this model).
+
+    File layout::
+
+        Qwen3.5-9B-llm_seg0.1828.rknn + .weight   (stage 0, card 0)
+        Qwen3.5-9B-llm_seg1.1828.rknn + .weight   (stage 1, card 1)
+        Qwen3.5-9B-vision.1828.rknn    + .weight  (vision, card 0)
+        Qwen3.5-9B-llm.embed.bin                  fp16 (vocab × 4096)
+        Qwen3.5-9B-llm.tokenizer.gguf             Qwen3.5 BPE
+
+    Sampling follows the 9B example (``temperature=1.0``): this export
+    is used for free-form chat, not schema-constrained bbox output.
+    ``max_new_tokens`` is ``max_context_len // 8`` per the model owner's
+    recommendation (106496 // 8 = 13312), keeping generation bounded
+    while still allowing long answers.
+    """
+    base = dict(
+        name="qwen3.5-9b-vl",
+        kind="vlm_multicard",
+        variant="qwen3.5",
+        vocab_size=248320,
+        special_eos_id=248046,
+        max_context_len=106496,
+        image_size=384,
+        use_prune=True,
+        target="rk1828",
+        stage_count=2,
+        requires_cards=2,
+        options={
+            "max_new_tokens": 13312,
+            "top_k": 1,
+            "top_p": 0.9,
+            "temperature": 0.8,
+            "repeat_penalty": 1.5,
+            "frequency_penalty": 1,
+            "presence_penalty": 1,
             "enable_thinking": False,
         },
     )
@@ -564,6 +627,60 @@ def _verify_qwen3_5_4b_vl_files() -> None:
         raise FileNotFoundError(
             f"Qwen3.5-VL-4B files missing under {d}: {missing}. "
             f"Place the files there or set WDNAI_QWEN3_5_4B_VL_DIR to point at a custom path."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Qwen3.5-VL-9B: two-stage LLM export, one stage per RK182x card.
+# --------------------------------------------------------------------------- #
+_QWEN3_5_9B_VL_REQUIRED = (
+    "Qwen3.5-9B-llm_seg0.1828.rknn",
+    "Qwen3.5-9B-llm_seg0.weight",
+    "Qwen3.5-9B-llm_seg1.1828.rknn",
+    "Qwen3.5-9B-llm_seg1.weight",
+    "Qwen3.5-9B-vision.1828.rknn",
+    "Qwen3.5-9B-vision.weight",
+    "Qwen3.5-9B-llm.embed.bin",
+    "Qwen3.5-9B-llm.tokenizer.gguf",
+)
+
+
+def _qwen3_5_9b_vl_dir() -> Path:
+    """Resolve the Qwen3.5-VL-9B model directory.
+
+    Override via ``WDNAI_QWEN3_5_VL_9B_DIR`` (full path); fallback
+    ``$WDNAI_MODELS_DIR/Qwen3.5-VL-9B`` (``/userdata/models/Qwen3.5-VL-9B``
+    when the root is unset).
+    """
+    override = _os.environ.get("WDNAI_QWEN3_5_VL_9B_DIR")
+    return Path(override) if override else _models_root() / "Qwen3.5-VL-9B"
+
+
+def _default_qwen3_5_9b_vl_paths() -> dict:
+    d = _qwen3_5_9b_vl_dir()
+    seg0 = d / "Qwen3.5-9B-llm_seg0.1828.rknn"
+    seg1 = d / "Qwen3.5-9B-llm_seg1.1828.rknn"
+    seg0_w = d / "Qwen3.5-9B-llm_seg0.weight"
+    seg1_w = d / "Qwen3.5-9B-llm_seg1.weight"
+    return {
+        "rknn_llm_path": str(seg0),
+        "weight_llm_path": str(seg0_w),
+        "rknn_vision_path": str(d / "Qwen3.5-9B-vision.1828.rknn"),
+        "weight_vision_path": str(d / "Qwen3.5-9B-vision.weight"),
+        "llm_seg_paths": [str(seg0), str(seg1)],
+        "weight_seg_paths": [str(seg0_w), str(seg1_w)],
+        "tokenizer_path": str(d / "Qwen3.5-9B-llm.tokenizer.gguf"),
+        "embed_path": str(d / "Qwen3.5-9B-llm.embed.bin"),
+    }
+
+
+def _verify_qwen3_5_9b_vl_files() -> None:
+    d = _qwen3_5_9b_vl_dir()
+    missing = [f for f in _QWEN3_5_9B_VL_REQUIRED if not (d / f).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Qwen3.5-VL-9B files missing under {d}: {missing}. "
+            f"Place the files there or set WDNAI_QWEN3_5_VL_9B_DIR to point at a custom path."
         )
 
 
@@ -835,6 +952,21 @@ class SystemLanguageModel:
         """
         _verify_qwen3_5_4b_vl_files()
         return _qwen3_5_vl_spec().with_paths(**_default_qwen3_5_4b_vl_paths())
+
+    @classmethod
+    def qwen3_5_vl_9b(cls) -> ModelSpec:
+        """Return a :class:`ModelSpec` pre-bound to the Qwen3.5-VL-9B
+        two-stage export.
+
+        Both LLM stages and the vision encoder are placed under
+        ``$WDNAI_MODELS_DIR/Qwen3.5-VL-9B/`` (override via
+        ``WDNAI_QWEN3_5_VL_9B_DIR``). The model **requires two RK182x
+        cards** (``requires_cards=2``); stage 0 + vision run on the
+        first, stage 1 on the second. Missing files raise
+        :class:`FileNotFoundError` listing them.
+        """
+        _verify_qwen3_5_9b_vl_files()
+        return _qwen3_5_vl_9b_spec().with_paths(**_default_qwen3_5_9b_vl_paths())
 
     # ---- Vision LLM ----------------------------------------------------
     @classmethod

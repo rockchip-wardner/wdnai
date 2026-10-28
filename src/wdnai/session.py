@@ -32,7 +32,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial as _partial
 from typing import (
-    Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union,
+    Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, TypeVar, Union,
 )
 
 import numpy as np
@@ -124,14 +124,24 @@ class LLMSession(ABC):
         *,
         npu: Optional[int] = None,
         device_id: Optional[Union[bytes, str]] = None,
+        npu_indices: Optional[Sequence[int]] = None,
         **options: Any,
     ) -> None:
         if npu is not None and device_id is not None:
             raise ValueError("npu= and device_id= are mutually exclusive")
+        if npu_indices is not None:
+            if npu is not None or device_id is not None:
+                raise ValueError(
+                    "npu_indices= is mutually exclusive with npu= / device_id="
+                )
+            npu_indices = tuple(int(x) for x in npu_indices)
+            if not npu_indices:
+                raise ValueError("npu_indices= must not be empty")
         if isinstance(device_id, str):
             device_id = device_id.encode("utf-8")
         self.spec = model
         self.npu = npu
+        self.npu_indices = npu_indices
         self.device_id = device_id
         self._options = options
         # Only the local implementation builds a backend; RPC subclasses
@@ -832,10 +842,17 @@ class LLMLocalSession(LLMSession):
         *,
         npu: Optional[int] = None,
         device_id: Optional[Union[bytes, str]] = None,
+        npu_indices: Optional[Sequence[int]] = None,
         **options: Any,
     ) -> None:
-        super().__init__(model, npu=npu, device_id=device_id, **options)
-        self._backend = build_backend(model, npu=npu, device_id=device_id)
+        super().__init__(
+            model, npu=npu, device_id=device_id,
+            npu_indices=npu_indices, **options,
+        )
+        self._backend = build_backend(
+            model, npu=npu, device_id=device_id,
+            npu_indices=getattr(self, "npu_indices", None),
+        )
         # rknn3 is a synchronous C API: ``session_run`` blocks for the whole
         # decode. Run it on a dedicated worker thread so ``respond`` stays a
         # true coroutine and concurrent callers on the event loop are not

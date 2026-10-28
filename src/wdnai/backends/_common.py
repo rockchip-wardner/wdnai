@@ -97,6 +97,20 @@ class StreamSink:
         default_factory=list, repr=False, compare=False
     )
 
+    def emit(self, delta: str) -> None:
+        """Append one decoded text delta and fan it out to observers.
+
+        Used by backends that decode tokens themselves (the multi-stage
+        9B pipeline) instead of going through ``_ResultCallbackAdapter``
+        (which owns the same job for single-stage backends).
+        """
+        if not delta:
+            return
+        self.text += delta
+        if self.first_token_time is None:
+            self.first_token_time = time.perf_counter()
+        self._notify(delta)
+
     def add_observer(self, cb: Callable[[str], None]) -> None:
         """Register ``cb(delta)``. No-op for ``None``; ignores duplicates."""
         if cb is not None and cb not in self._observers:
