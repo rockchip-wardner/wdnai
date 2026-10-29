@@ -20,10 +20,13 @@ import os
 # RKNN logger before rknn3lite / librknn3 is loaded.
 os.environ["RKNN_LOG_LEVEL"] = "0"
 
+import json
+import re
 import threading
 from typing import Any, List, Optional, Sequence
 
 import numpy as np
+from jinja2 import Environment
 
 from . import _qwen35_vl_9b_vendor as V
 from ._common import StreamSink
@@ -72,6 +75,17 @@ class Rknn3LiteMultiCardVLMBackend:
         self.tokenizer = V.GGUFBPETokenizer(spec.tokenizer_path)
         V.tokenizer = self.tokenizer
         self.sink.tokenizer = self.tokenizer
+        self._chat_env = Environment(keep_trailing_newline=True)
+        self._chat_env.filters["tojson"] = lambda value: json.dumps(
+            value, ensure_ascii=False,
+        )
+        self._chat_env.globals["raise_exception"] = (
+            lambda message: (_ for _ in ()).throw(ValueError(message))
+        )
+        self._chat_template = (
+            self._chat_env.from_string(self.tokenizer.chat_template)
+            if getattr(self.tokenizer, "chat_template", None) else None
+        )
         self._embeds = np.memmap(
             spec.embed_path, dtype=np.float16, mode="r",
         ).reshape(spec.vocab_size, -1)
@@ -164,14 +178,64 @@ class Rknn3LiteMultiCardVLMBackend:
         self.rknn_llm = _StageHandle(self)
 
     # ------------------------------------------------------------------ #
+    def _messages_from_prompt(self, prompt: str) -> list[dict]:
+        """Convert LLMSession's bare ChatML transcript into messages.
+
+        ``LLMSession._compose_prompt`` uses bare ``system\\n`` / ``user\\n``
+        / ``assistant\\n`` line prefixes for multi-turn prompts. The 9B
+        GGUF tokenizer has the authoritative Qwen3.5 chat template, so use
+        it instead of wrapping the whole transcript inside one user message.
+        """
+        text = prompt or ""
+        matches = list(re.finditer(r"(?m)^(system|user|assistant)\n", text))
+        if not matches or matches[0].start() != 0:
+            return [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": text},
+            ]
+        messages = []
+        for i, match in enumerate(matches):
+            role = match.group(1)
+            start = match.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            content = text[start:end].rstrip("\n")
+            if role == "assistant" and not content.strip():
+                continue
+            messages.append({"role": role, "content": content})
+        if not messages or messages[0]["role"] != "system":
+            messages.insert(0, {
+                "role": "system", "content": "You are a helpful assistant.",
+            })
+        return messages
+
     def _build_prompt(self, prompt: str, enable_thinking: bool) -> str:
-        if "<|im_start|>" in prompt:
-            full = prompt
-            tail = "<think>\n" if enable_thinking else "<think>\n\n\n\n"
-            if tail not in full[-16:]:
-                full += tail
-            return full
-        return V.build_prompt(prompt, 0, enable_thinking)
+        if self._chat_template is not None:
+            return self._chat_template.render(
+                messages=self._messages_from_prompt(prompt),
+                add_generation_prompt=True,
+                enable_thinking=bool(enable_thinking),
+            )
+        body = V.PROMPT_PREFIX + prompt + V.PROMPT_POSTFIX
+        return body + (
+            "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+        )
+
+    def _build_image_prompt(self, prompt: str, n_images: int) -> str:
+        placeholders = prompt.count(V.IMAGE_TOKEN_TEXT)
+        if n_images <= 0:
+            if placeholders:
+                raise ValueError(
+                    "prompt contains <image> placeholders but no image was given"
+                )
+            return prompt
+        if placeholders == 0:
+            return V.IMAGE_TOKEN_TEXT * n_images + prompt
+        if placeholders == n_images:
+            return prompt
+        raise ValueError(
+            f"prompt contains {placeholders} <image> placeholders "
+            f"but {n_images} images were given"
+        )
 
     def _flush(self) -> None:
         with V.LAST_RESULT.lock:
@@ -214,12 +278,10 @@ class Rknn3LiteMultiCardVLMBackend:
             image_input, _packed, _vlat, _ntok = V.run_vision(
                 self.vision, list(images), False,
             )
-            full_prompt = (
-                prompt if "<|im_start|>" in prompt
-                else V.build_prompt(prompt, len(images), bool(enable_thinking))
+            full_prompt = self._build_prompt(
+                self._build_image_prompt(prompt, len(images)),
+                bool(enable_thinking),
             )
-            if "<|im_start|>" in full_prompt and "<image>" not in full_prompt:
-                full_prompt = "<image>" * len(images) + full_prompt
         else:
             full_prompt = self._build_prompt(prompt, bool(enable_thinking))
 
