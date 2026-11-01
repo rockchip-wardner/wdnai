@@ -187,6 +187,20 @@ name `wdnai`, distribution name `wdnai`.
   Required paths: `rknn_path` + `weight_path` + `rknn_vision_path`
   + `weight_vision_path` + `tokenizer_path` + `embed_path`; vision
   `image_size` must be a multiple of 14.
+- `src/wdnai/backends/depth_anything.py` — `DepthAnythingBackend`
+  (kind="depth"): Depth Anything V3 单目深度估计 — **三段** RKNN
+  （`local` 逐图 token → `global` 跨 view 融合 → `head` 出深度/置信度），
+  镜像 `rknn3-model-zoo/examples/depth_anything_v3/cpp/main.cpp`。
+  三段**共享**一份按 NPU 核分配的内部显存（C++ 的
+  `da3_init_internal_mem_share`，约 1.6 GB）：少了 `user_mem_internal=1`
+  + `set_internal_mem` 这一步，`rknn3_model_init` 直接
+  `MODEL_SETUP fail`。view 数（10）是**烤进导出**的（`global` 输入
+  `[V,L,1,D]`），不是运行期参数 —— 送图张数必须与之一致。
+  像素侧全部按 C++ 的**实际行为**对齐，三处不对齐就会让深度图差一两个
+  fp16 ULP：① resize 被 GCC 融合成 FMA（见 `preprocess_image_rgb`）；
+  ② fp16→fp32 用 C++ 的 `fp16_to_fp32`（**不处理 fp16 非规格化数**，
+  见 `_fp16_to_fp32`）；③ 统计均值用 float64 累加（C++ 是 `double`）。
+  回归防线：`python -m scripts.verify_da3_parity`（在 wdnwebui 仓）。
 - `src/wdnai/backends/_common.py` — shared RKNN plumbing:
   `StreamSink` (collects tokens / text / perf from streaming
   callback), `build_llm_callback` (wraps the shim's
@@ -354,6 +368,11 @@ name `wdnai`, distribution name `wdnai`.
   `isinstance`), `text_to_speech.py` (TTS CLI with `--ref-speaker
   news_female` / `--volume` / `--no-play`). External dataset dirs
   `光厂_*` hold plate frames + `.txt` ground truth.
+  **`examples/README.md` 是 sample 的对外文档**：新增 sample 必须在
+  该 README 里加一节，固定 4 个小节 —— **怎么跑 / 输入 / 输出 /
+  容易踩的坑**，外加「素材目录约定」（素材放 `examples/<sample 同名>/`，
+  清单用裸文件名相对自身目录解析）。当前只有 `depth_anything_v3` 一节
+  已按此记录，其余 sample 逐个补齐。
 
 
 ## 接口设计
@@ -681,6 +700,19 @@ grounding 链路定义在 `src/wdnai/grounding.py`（独立模块，**不**耦�
 - **`npu` 与 `device_id` 互斥**：同时传 `LLMSession(..., npu=K, device_id=b"...")`
   直接抛 `ValueError`；`npu` 越界（>= `len(get_devices_id())`）抛
   `IndexError` 并把可用设备列表写进消息里（方便排查板上卡数变化）。
+- **`rknn3_query(CORE_MEM_SIZE)` 必须一次查整个数组**：`rknn3_api.h` 的
+  `rknn3_core_mem_size` 里 `reserved` 是 **32** 字节，shim 的 `_CoreMemSize`
+  必须逐字节对齐（曾经写成 424，导致 runtime 按 `size/56` 算出"要填 8 项"
+  而调用方只准备 1 项 —— 更糟的是按 core 逐个查时**每次都拿到 core 0 的
+  数值**，于是共享显存的每核大小全错，`rknn3_run` 直接挂死不返回）。
+  C++ demo 的写法是 `rknn3_query(ctx, RKNN3_QUERY_CORE_MEM_SIZE, array,
+  sizeof(rknn3_core_mem_size) * core_num)` —— **一次查完**。
+  实测（用真头文件编译的 C 探针 vs Python shim，同一模型逐行比对）：
+  `sizeof(rknn3_core_mem_size)=56`，每核尺寸**确实不同**（DA3 `local`：
+  core0=8.70 MB、core1-3=3.11 MB、core4-7=3.42 MB）—— 所以"每核取 max"
+  不是可选项，C++ 的 `max_size_by_core[core_id]` 必须照抄。
+  **别把它改回 424 / 逐核查询**：上游 commit `851707b` 正是这么改的，
+  与 `rknn3_api.h` 不符（头文件里写死 `reserved[32]`）。
 
 ## Known limits
 

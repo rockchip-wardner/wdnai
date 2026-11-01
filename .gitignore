@@ -70,6 +70,11 @@ R-C.png
 # examples/locate_image.py; not a source artifact).
 examples/locate_anything_vis.jpg
 
+# Depth Anything V3 demo runtime output — the sample's default --output-dir
+# is "depth_vis" **relative to cwd**, so running it from inside examples/
+# drops the heatmaps here. Regenerated on every run; not a source artifact.
+examples/depth_vis/
+
 # ============================================================================ #
 # Test / coverage artifacts
 # ============================================================================ #

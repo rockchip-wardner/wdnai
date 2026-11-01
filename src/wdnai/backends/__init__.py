@@ -5,6 +5,7 @@ from typing import Dict, Optional, Sequence, Type, Union
 
 from ..model import ModelSpec
 from ._common import resolve_device_id
+from .depth_anything import DepthAnythingBackend
 from .embedding import EmbeddingBackend
 from .locate_anything import LocateAnythingBackend
 from .text import TextBackend
@@ -17,6 +18,7 @@ _REGISTRY: Dict[str, Type] = {
     "tts": TTSBackend,
     "embedding": EmbeddingBackend,
     "grounding": LocateAnythingBackend,
+    "depth": DepthAnythingBackend,
 }
 
 
@@ -58,7 +60,7 @@ def build_backend(
     cls = _REGISTRY.get(spec.kind)
     if cls is None:
         raise ValueError(
-            f"Unknown kind: {spec.kind!r} (expected 'llm' / 'vlm' / 'tts' / 'omni' / 'asr' / 'embedding')"
+            f"Unknown kind: {spec.kind!r} (expected 'llm' / 'vlm' / 'tts' / 'omni' / 'asr' / 'embedding' / 'grounding' / 'depth')"
         )
     return cls(spec, npu=npu, device_id=device_id)
 
@@ -66,6 +68,6 @@ def build_backend(
 __all__ = [
     "TextBackend", "VLMBackend", "Rknn3LiteMultiCardVLMBackend",
     "TTSBackend", "EmbeddingBackend", "LocateAnythingBackend",
-    "OmniBackend", "ASRBackend",
+    "OmniBackend", "ASRBackend", "DepthAnythingBackend",
     "build_backend", "resolve_device_id",
 ]

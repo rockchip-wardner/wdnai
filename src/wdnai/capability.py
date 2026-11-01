@@ -63,6 +63,10 @@ class SoftwareCapability(str, Enum):
     AUDIO_CHAT = "swcap_audio_chat"
     #: 图像 → 向量。供向量检索 / 相似度反查。
     VISION_EMBEDDING = "swcap_vision_embedding"
+    #: 图像 → 逐像素深度图 + 置信度。需专用 depth encoder
+    #: （Depth Anything V3 的 local/global/head 三段式 RKNN），不是
+    #: 「VLM 加个 prompt」就能替代的 —— 输出是张量而不是文本。
+    VISION_DEPTH = "swcap_vision_depth"
     #: 文本 → 语音。
     TEXT_TO_SPEECH = "swcap_text_to_speech"
     #: → **可执行动作 / 工具调用**，超越自由文本输出。两种实现都算：

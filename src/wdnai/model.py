@@ -54,6 +54,17 @@ class ModelSpec:
     embed_path: str = ""
     tokenizer_path: str = ""
 
+    # ---- Depth Anything V3: three-stage (local → global → head) export ----
+    # DA3 is not one RKNN but three: ``local`` turns每张图 into tokens,
+    # ``global`` fuses the concatenated multi-view tokens, ``head`` turns
+    # the fused features into the per-view depth + confidence maps. Each
+    # stage has its own ``.rknn`` + ``.weight`` pair; the weight path is
+    # derived from the rknn path (``.rknn`` → ``.weight``), exactly like
+    # the C++ demo's ``make_weight_path``.
+    depth_local_path: str = ""
+    depth_global_path: str = ""
+    depth_head_path: str = ""
+
     # ---- Multi-stage / multi-card exports (Qwen3.5-VL-9B) ----
     # ``stage_count > 1`` means the LLM is split across that many RKNN
     # files, one per card. ``llm_seg_paths`` / ``weight_seg_paths`` hold
@@ -397,6 +408,26 @@ def _locate_anything_spec(**overrides) -> ModelSpec:
             "repeat_penalty": 1.05,
             "enable_thinking": False,
         },
+    )
+    base.update(overrides)
+    return ModelSpec(**base)
+
+
+def _depth_anything_v3_spec(**overrides) -> ModelSpec:
+    """Depth Anything V3: monocular depth estimation (image-in, depth-out).
+
+    Unlike the LLM-family presets this one carries **no sampling
+    parameters** — the model is not a text generator. ``image_size`` is
+    left at the dataclass default because the real input resolution is
+    read off the ``local`` stage's input tensor at load time (the export
+    bakes it in); the field is only a hint for callers that want to know
+    the nominal size before loading.
+    """
+    base = dict(
+        name="DepthAnythingV3",
+        kind="depth",
+        variant="depth-anything-v3",
+        options={},
     )
     base.update(overrides)
     return ModelSpec(**base)
@@ -857,6 +888,75 @@ def _verify_locate_anything_files() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Depth Anything V3: monocular depth estimation (image-in, depth-map-out).
+# File layout — **three** RKNN stages, each with its own ``.weight``::
+#
+#     da3_base_local.rknn  + .weight    (image  [1,H,W,3] uint8 → tokens [1,L,D])
+#     da3_base_global.rknn + .weight    (tokens [V,L,1,D] → 4 feature maps)
+#     da3_base_head.rknn   + .weight    (features → depth/conf [1,V,H,W])
+#
+# The number of views (``V``) is **baked into the export**: ``global``'s
+# input shape is ``[V,L,1,D]`` and ``head``'s is ``[V,F,G]``, so a model
+# exported with ``--views 10`` only ever accepts 10 images. The backend
+# reads ``V`` off the model itself instead of taking it as a parameter.
+# --------------------------------------------------------------------------- #
+_DEPTH_ANYTHING_V3_REQUIRED = (
+    "da3_base_local.rknn",
+    "da3_base_local.weight",
+    "da3_base_global.rknn",
+    "da3_base_global.weight",
+    "da3_base_head.rknn",
+    "da3_base_head.weight",
+)
+
+
+def _depth_anything_v3_dir() -> Path:
+    """Resolve the Depth Anything V3 model directory.
+
+    Override via the ``WDNAI_DEPTH_ANYTHING_V3_DIR`` env var (full path);
+    fallback ``$WDNAI_MODELS_DIR/Depth-Anything-V3`` (which itself defaults
+    to ``/userdata/models/Depth-Anything-V3`` when ``WDNAI_MODELS_DIR`` is
+    unset). Mirrors ``_locate_anything_dir`` so every model dir honors the
+    same ``WDNAI_MODELS_DIR`` root.
+    """
+    override = _os.environ.get("WDNAI_DEPTH_ANYTHING_V3_DIR")
+    return Path(override) if override else _models_root() / "Depth-Anything-V3"
+
+
+def _default_depth_anything_v3_paths() -> dict:
+    """Return absolute paths to the three DA3 RKNN stages."""
+    d = _depth_anything_v3_dir()
+    return {
+        "depth_local_path":  str(d / "da3_base_local.rknn"),
+        "depth_global_path": str(d / "da3_base_global.rknn"),
+        "depth_head_path":   str(d / "da3_base_head.rknn"),
+    }
+
+
+def _verify_depth_anything_v3_files() -> None:
+    """Raise :class:`FileNotFoundError` listing any missing DA3 files.
+
+    Required files (must be present): see ``_DEPTH_ANYTHING_V3_REQUIRED``.
+    Path resolution is wrapped in ``try/except OSError`` so a malformed
+    ``WDNAI_DEPTH_ANYTHING_V3_DIR`` surfaces as a single descriptive
+    ``FileNotFoundError`` rather than an obscure ``OSError`` from
+    ``pathlib`` — same treatment as ``_verify_locate_anything_files``.
+    """
+    try:
+        d = _depth_anything_v3_dir()
+    except OSError as e:
+        raise FileNotFoundError(
+            f"Depth Anything V3 directory resolution failed: {e}"
+        )
+    missing = [f for f in _DEPTH_ANYTHING_V3_REQUIRED if not (d / f).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Depth Anything V3 files missing under {d}: {missing}. "
+            "Place the files there or set WDNAI_DEPTH_ANYTHING_V3_DIR to point at a custom path."
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Public catalog
 # --------------------------------------------------------------------------- #
 class SystemLanguageModel:
@@ -1151,3 +1251,25 @@ class SystemLanguageModel:
         """
         _verify_locate_anything_files()
         return _locate_anything_spec().with_paths(**_default_locate_anything_paths())
+
+    # ---- Depth estimation -----------------------------------------------
+    @classmethod
+    def depth_anything_v3(cls) -> ModelSpec:
+        """Return a :class:`ModelSpec` pre-bound to the Depth Anything V3 files.
+
+        Monocular depth-estimation model (image-in, depth-map-out). The
+        export is split into three RKNN stages — ``local`` (per-image
+        tokens), ``global`` (cross-view fusion) and ``head`` (depth +
+        confidence) — and all three are expected at
+        ``$WDNAI_MODELS_DIR/Depth-Anything-V3/`` (default
+        ``/userdata/models/Depth-Anything-V3/`` when ``WDNAI_MODELS_DIR`` is
+        unset; override the root with ``WDNAI_MODELS_DIR`` or pin a custom
+        path with ``WDNAI_DEPTH_ANYTHING_V3_DIR``). If any expected file is
+        missing a :class:`FileNotFoundError` is raised listing them.
+
+        The ``.weight`` file of each stage sits next to its ``.rknn`` with
+        the same stem — the backend derives it by replacing the ``.rknn``
+        suffix, mirroring the C++ demo's ``make_weight_path``.
+        """
+        _verify_depth_anything_v3_files()
+        return _depth_anything_v3_spec().with_paths(**_default_depth_anything_v3_paths())
