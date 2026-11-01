@@ -1,5 +1,9 @@
 """Depth Anything V3 demo —— output matches the C++ demo line-for-line.
 
+**⚠️ 当前限制**：本 sample 只覆盖 **10-view（多视图融合）** 导出 ——
+``global`` 段在 10 张图之间做融合，送图张数必须正好是 10。
+**单路（单图）深度估计尚未实现**（需要一份 V=1 的导出），后续版本补齐。
+
 The C++ demo at ``rknn3-model-zoo/examples/depth_anything_v3/cpp/main.cpp``
 drives the three-stage DA3-BASE RKNN export (``local`` → ``global`` →
 ``head``) and produces a specific sequence of stdout lines: per-view

@@ -454,6 +454,12 @@ class DepthAnythingBackend:
 
     Owns the three RKNN stages and drives them as the C++ demo does:
     ``local`` once per view, ``global`` once over all views, ``head`` once.
+
+    **当前限制**：只支持 **10-view（多视图融合）** 导出 —— ``global`` 段在
+    10 张图之间做融合，view 数烤进了它的输入形状，不是运行期参数。
+    **单路（单图）深度估计尚未实现**：那需要一份 V=1 的导出
+    （``global`` 输入形状 ``[1, L, 1, D]``），换模型后本 backend 的
+    per-core 共享显存逻辑无需改动，但 ``global`` 段的 token 拼装要改。
     """
 
     def __init__(

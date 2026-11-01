@@ -196,6 +196,10 @@ name `wdnai`, distribution name `wdnai`.
   + `set_internal_mem` 这一步，`rknn3_model_init` 直接
   `MODEL_SETUP fail`。view 数（10）是**烤进导出**的（`global` 输入
   `[V,L,1,D]`），不是运行期参数 —— 送图张数必须与之一致。
+  **当前限制**：只完成基础的 **10-view（多视图融合）** 版本；
+  **单路（单图）深度估计尚未实现** —— 需要一份 V=1 的导出（`global`
+  输入 `[1,L,1,D]`），届时共享显存逻辑不用改，但 `global` 段的 token
+  拼装要改。
   像素侧全部按 C++ 的**实际行为**对齐，三处不对齐就会让深度图差一两个
   fp16 ULP：① resize 被 GCC 融合成 FMA（见 `preprocess_image_rgb`）；
   ② fp16→fp32 用 C++ 的 `fp16_to_fp32`（**不处理 fp16 非规格化数**，

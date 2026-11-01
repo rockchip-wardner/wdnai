@@ -94,6 +94,12 @@ examples/
 > （`rknn3-model-zoo/examples/depth_anything_v3/cpp/main.cpp`），
 > 所以两边可以直接并排 diff。
 
+> **⚠️ 当前限制**：本版本**只完成基础的 10-view（多视图融合）**。
+> `global` 段在 10 张图之间做融合，送图张数必须正好是 10。
+> **单路（单图）深度估计尚未实现** —— 需要重新导出 V=1 的 RKNN 模型
+> （`global` 输入形状 `[V,L,1,D]` 的 V=1），后续版本补齐。
+> 详见本节「容易踩的坑」第 1 条。
+
 ### 怎么跑
 
 前置条件：模型文件已在 `/userdata/models/Depth-Anything-V3/`（见「坑」第 6 条）。
