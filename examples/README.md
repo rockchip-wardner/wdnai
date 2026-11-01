@@ -129,8 +129,10 @@ cd /userdata/wdnwebui
 .venv/bin/python .venv/src/wdnai/examples/depth_anything_v3.py --model-dir /path/to/models
 ```
 
-- **耗时**：单次约 20 秒（RK3588 实测：`global` ≈ 670 ms，`head` ≈ 400 ms，
-  其余是 10 张图逐张过 `local` 段 + 模型加载）。
+- **耗时**：**稳态推理 ≈ 1.4 s**（local 10 帧 0.29 s + global 0.69 s + head 0.40 s，
+  RK3588 实测）。**首次约 20 s** —— 那 18 s 多几乎全是**模型加载**
+  （三段 RKNN 载入 + 按核分配约 1.6 GB 共享显存），不是推理。
+  跑一次样例时看到的 `[time] total` 是**含加载**的，别误当成推理耗时。
 - **占 NPU**：是。同一时刻别再跑别的 sample，否则会抢卡。
 - **默认 `--output-dir` 是 `depth_vis`，相对当前工作目录**（对齐 C++ demo）。
   在 `examples/` 目录里直接跑会把热力图落在源码目录 —— 已在 `.gitignore`
