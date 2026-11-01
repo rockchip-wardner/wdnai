@@ -252,11 +252,18 @@ class _SDKVersion(Structure):
 
 
 class _CoreMemSize(Structure):
+    # Mirrors ``rknn3_core_mem_size`` in rknn3_api.h **byte for byte**:
+    #   int32_t core_id; uint64_t weight_size; uint64_t internal_size;
+    #   uint8_t reserved[32];
+    # The reserved array size matters: ``rknn3_query(CORE_MEM_SIZE, buf,
+    # size)`` fills ``size / sizeof(rknn3_core_mem_size)`` entries, so a
+    # wrong struct size makes the runtime write more (or fewer) entries
+    # than the caller expects.
     _fields_ = [
         ("core_id", c_int32),
         ("weight_size", c_uint64),
         ("internal_size", c_uint64),
-        ("reserved", c_uint8 * 424),
+        ("reserved", c_uint8 * 32),
     ]
 
 
@@ -1179,6 +1186,23 @@ class _Runtime:
         # is the actual owner.
         self._user_mem_blocks.extend(int(p) for p in mem_blocks)
 
+    # ------------------------------------------------------------------ #
+    def destroy_user_mem(self, mem_ptr: int) -> None:
+        """Free a block allocated via :meth:`create_mem`.
+
+        The shared internal-memory arena handed to several runtimes
+        (:meth:`set_internal_mem`) is **not** owned by any of them, so
+        nothing would ever free it. The Depth Anything V3 backend — which
+        shares one arena per NPU core across its three stages — calls
+        this when it tears the stages down.
+        """
+        if not mem_ptr:
+            return
+        try:
+            self.lib.rknn3_destroy_mem(self.context, c_void_p(int(mem_ptr)))
+        except Exception:  # noqa: BLE001
+            pass
+
     def set_shape(self, shape_id: int) -> None:
         self._check_alive()
         ret = self.lib.rknn3_set_shape(self.context, c_int32(int(shape_id)))
@@ -1282,13 +1306,21 @@ class _Runtime:
             self._query_into(int(_QueryCmd.CORE_NUMBER), n, ctypes.sizeof(n))
             if n.value <= 0:
                 return []
-            out = []
-            for core_id in range(int(n.value)):
-                info = _CoreMemSize()
-                info.core_id = core_id
-                self._query_into(ec, info, ctypes.sizeof(info))
-                out.append(info)
-            return out
+            # **One** query for the whole array — the runtime fills
+            # ``size / sizeof(rknn3_core_mem_size)`` entries starting at
+            # core 0, so asking for a single entry per call would always
+            # hand back core 0's numbers. (The C++ demos do it this way:
+            # ``rknn3_query(ctx, RKNN3_QUERY_CORE_MEM_SIZE, array,
+            # sizeof(rknn3_core_mem_size) * core_num)``.)
+            arr = (_CoreMemSize * int(n.value))()
+            ret = self.lib.rknn3_query(
+                self.context, c_int(int(_QueryCmd.CORE_MEM_SIZE)),
+                ctypes_cast(pointer(arr), c_void_p),
+                c_uint64(ctypes.sizeof(arr)),
+            )
+            if ret != 0:
+                raise RuntimeError(f"rknn3_query(CORE_MEM_SIZE) failed: ret={ret}")
+            return list(arr)
         if ec == int(_QueryCmd.DEVICE_MEM_INFO):
             out = _DevMemInfo()
             self._query_into(ec, out, ctypes.sizeof(out))
@@ -2096,6 +2128,22 @@ class RKNN3Lite:
             print(f"[shim debug] run() returned {rc}", flush=True)
             return None
         return [self.rknn_runtime.get_output(i) for i in range(self.rknn_runtime.n_outputs)]
+
+    # ------------------------------------------------------------------ #
+    def destroy_user_mem(self, mem_ptr: int) -> None:
+        """Free a block allocated via :meth:`create_mem` (see
+        :meth:`_Runtime.destroy_user_mem`)."""
+        if not isinstance(self.rknn_runtime, _Runtime):
+            return
+        self.rknn_runtime.destroy_user_mem(mem_ptr)
+
+    # ------------------------------------------------------------------ #
+    def set_internal_mem(self, mem_blocks: Sequence[int]) -> None:
+        """Hand pre-allocated blocks to this runtime (see
+        :meth:`_Runtime.set_internal_mem`)."""
+        if not isinstance(self.rknn_runtime, _Runtime):
+            raise RuntimeError("set_internal_mem needs a plain (non-LLM) runtime")
+        self.rknn_runtime.set_internal_mem(mem_blocks)
 
     # ------------------------------------------------------------------ #
     def _do_session_run(
