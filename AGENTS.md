@@ -344,6 +344,22 @@ name `wdnai`, distribution name `wdnai`.
   （长音频截前 5 秒，短音频尾部补零）。走 `wdnai._librknn` shim，
   `RKNN3Lite` 只在 `open_context()` 里 import —— native driver 绝不能在
   模块 import 阶段打开。
+- `src/wdnai/backends/image.py` — `ImageBackend`（kind=`image`，文生图
+  Qwen-Image-2.1 / RKNN3 rk1820，512×512）。**不 import librknn3**：
+  它驱动模型包自带的 C++ 运行时 `qwen_image_rknn`（子进程），因此在
+  非 RK 机器上 import 也是安全的。流水线三段：TE（text encoder，
+  单独进程占满卡池，跑完释放）→ DiT（4 × 8-block 段，**双卡各 2 段**，
+  常驻 ⇒ 生成过程零 load / 零 model_init）→ VAE（4 段链，**必须
+  `--vae-stream`**，否则第 2 段 `MODEL_SETUP fail`）。三条硬约束写在
+  `backends/image.py` 的注释里：`QI_SPREAD_IO=0`（输出 IO 绝不能分散）、
+  `QI_SPREAD_IO_IN=1`（只分散输入 IO，否则 VAE 第 3 段 `create_mem`
+  失败）、`--vae-release-dit`（TE 已退出，VAE 可接管 DiT 的池）。
+  `run_text()` 返回 `(prompt_str, [ImageAttachment])`；图片是 **BGR
+  uint8**，由 SDK 自己从 `img01_vae_image.bin`（NCHW `[1,4,512,512]`
+  fp16）解码，PNG 由 SDK 用纯标准库写 —— 与运行时那份
+  `scripts/fp16_to_png.py` **逐位相同**（有单测守着）。
+  模型包默认 `/home/rockchip/models/qwenimage21`（`WDNAI_QWEN_IMAGE_21_DIR`
+  / `QI_MODEL_DIR` 可覆盖），运行时在包内 `runtime/qwen_image_rknn`。
 - `src/wdnai/models/README.md` — model file layout
   (`/userdata/models/<name>/`), `.1828.rknn` naming convention, the
   Qwen3-VL-4B / Qwen3-TTS file tables. The directory itself ships
@@ -370,13 +386,19 @@ name `wdnai`, distribution name `wdnai`.
   `--majority-vote K` / background `asyncio.Task` for non-blocking
   display), `function_call.py` (multi-tool dispatch with
   `isinstance`), `text_to_speech.py` (TTS CLI with `--ref-speaker
-  news_female` / `--volume` / `--no-play`). External dataset dirs
+  news_female` / `--volume` / `--no-play`), `qwen_image_21.py`
+  (Qwen-Image-2.1 文生图 CLI —— `--prompt` / `--steps` / `--output`，
+  走 `session.generate_image()`). External dataset dirs
   `光厂_*` hold plate frames + `.txt` ground truth.
   **`examples/README.md` 是 sample 的对外文档**：新增 sample 必须在
   该 README 里加一节，固定 4 个小节 —— **怎么跑 / 输入 / 输出 /
   容易踩的坑**，外加「素材目录约定」（素材放 `examples/<sample 同名>/`，
   清单用裸文件名相对自身目录解析）。当前只有 `depth_anything_v3` 一节
   已按此记录，其余 sample 逐个补齐。
+- `samples/` — 命令行入口（与 `examples/` 的 `.py` demo 平行）。目前只有
+  `qwenimage21.sh`：不写 Python 也能出图，参数与板端 `test.sh` 一致
+  （`bash samples/qwenimage21.sh "提示词" [步数] [--out 目录] [--fixed]`），
+  产物与各阶段耗时见 `samples/README.md`。
 
 
 ## 接口设计
@@ -717,6 +739,19 @@ grounding 链路定义在 `src/wdnai/grounding.py`（独立模块，**不**耦�
   不是可选项，C++ 的 `max_size_by_core[core_id]` 必须照抄。
   **别把它改回 424 / 逐核查询**：上游 commit `851707b` 正是这么改的，
   与 `rknn3_api.h` 不符（头文件里写死 `reserved[32]`）。
+- **文生图（kind=`image`）的 JSON schema 提示绝不能进 prompt**：
+  扩散模型会把提示词里的每个字**画进图里**，所以 `image` 和 `tts` /
+  `grounding` 一样在 `_suppress_generating_in_prompt` 里被排除。改这个
+  判定时要连带看 `backends/image.py`。
+- **文生图的产物是「附件」不是「文本」**：`respond()` 不带 `generating=`
+  时只返回文本、图片会丢（`respond` 的契约就是给调用方一个文本结果）。
+  要图用 `session.generate_image(prompt)`（最短）、`session.run_prompt()`
+  （返回 `(text, attachments)`）或 `session.respond(generating=LMOutput)`
+  （`.attachment` 自动填充）。给文生图传自定义 `generating=` schema 会
+  抛 `ValidationError` —— 扩散模型不产 JSON，这是预期行为。
+- **不要在 `backends/image.py` 里手写 ctypes 调 librknn3**：文生图的
+  三段编排（DiT 分段 / VAE 分段链 / 每段 IO 落位）都是实机量出来的规则，
+  已经固化在 C++ 运行时里，用子进程驱动它，别在 Python 里重写一遍。
 
 ## Known limits
 

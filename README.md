@@ -133,6 +133,54 @@ await session.embed_text("要检索的文本")          # embedding 模型
 
 ---
 
+### 文生图（Qwen-Image-2.1）
+
+`kind="image"` 的模型走 `wdnai.backends.image.ImageBackend`：文本 → 512×512
+图像。**输出是图像不是文本**，所以要用能带附件的入口拿图。
+
+```python
+from wdnai import LLMLocalSession, SystemLanguageModel
+
+session = LLMLocalSession(model=SystemLanguageModel.qwen_image_21_512())
+
+# ① 最短路径：直接拿 BGR 像素
+img = await session.generate_image("a cute cat sitting on a wooden chair")
+# img.shape == (512, 512, 3)，dtype uint8（BGR，可直接 cv2.imshow）
+
+# ② run_prompt：返回 (text, attachments)
+text, atts = await session.run_prompt("a cute cat")
+bgr = atts[0].images[0]
+
+# ③ respond + LMOutput：结构化外壳（attachment 自动填充）
+out = await session.respond("a cute cat", generating=LMOutput)
+bgr = out.attachment[0].images[0]
+```
+
+⚠️ `respond()` **不带** `generating=` 时只返回文本，图片会丢 —— 那是
+`respond` 的契约（它承诺给调用方一个**文本**结果），要图就用上面三条之一。
+
+运行时参数（可写进 `spec.options` 或逐次传）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `steps` | `8` | flow-match 步数。8 步 ≈ 94 s；20 步更清晰 ≈ 125 s；40 步 = 上游默认 |
+| `fm_mu` | `0.5387096774` | 512 路线的调度系数（**不能**用 1024 路的 0.6935483871） |
+| `noise_fresh` | `True` | 每次换随机初始噪声；`False` ⇒ 固定噪声（可复现 / 可与金标准对拍） |
+| `keep_artifacts` | `False` | 保留中间产物（潜变量 / VAE 原始张量） |
+| `work_dir` | 临时目录 | 指定工作目录（产物落在这里） |
+
+⏱ 板端实测（RK3588 + 2×RK1828）：TE 37 s + DiT 常驻 init 23 s + flow-match
+21 s + VAE 10 s ≈ **94 s/张**。TE 的权重本身就占 486 MiB/核，与 DiT **物理无法
+共卡**，所以每次换提示词都要重跑 TE —— 这是架构天花板，不是 bug。
+
+命令行等价物（不写 Python 也能出图）：
+
+```bash
+bash samples/qwenimage21.sh "a cute cat sitting on a wooden chair"   # 8 步
+```
+
+---
+
 ## 能力词表 `SoftwareCapability`
 
 `swcap_*` 描述的是「**这个模型实例在本机实际能做什么**」，不是「哪个业务用它」。
@@ -146,6 +194,7 @@ await session.embed_text("要检索的文本")          # embedding 模型
 | `swcap_vision_embedding` | 图像/视频 → 检索向量 |
 | `swcap_audio_chat` | 音频 → 文本 |
 | `swcap_text_to_speech` | 文本 → 语音 |
+| `swcap_text_to_image` | 文本 → 图像（Qwen-Image-2.1，512×512） |
 | `swcap_tool_call` | 函数 / 工具调用 |
 
 ```python
@@ -226,6 +275,7 @@ spec = spec.with_options(temperature=0.2, top_p=0.9)
 | `qwen3_asr` | `Qwen3-ASR/` | 语音 → 文本 |
 | `qwen3_vl_embedding` | `Qwen3-VL-Embedding-2B/` | 检索向量 |
 | `locate_anything` | `LocateAnything-3B/` | 目标定位（bbox） |
+| `qwen_image_21_512` | `qwenimage21/` | 文生图（512×512） |
 
 preset 会在**构造时**检查文件是否齐全，缺文件抛 `FileNotFoundError` 并列出
 缺哪些 —— 不会等到推理时才炸。
@@ -256,6 +306,8 @@ preset 会在**构造时**检查文件是否齐全，缺文件抛 `FileNotFoundE
 |---|---|
 | `WDNAI_MODELS_DIR` | 模型根目录（默认 `/userdata/models`） |
 | `WDNAI_QWEN3_VL_4B_DIR` / `WDNAI_QWEN3_4B_DIR` / `WDNAI_QWEN3_5_4B_VL_DIR` / `WDNAI_QWEN_2_5_OMNI_3B_DIR` / `WDNAI_LOCATE_ANYTHING_DIR` | 单个模型的目录覆盖 |
+| `WDNAI_QWEN_IMAGE_21_DIR` / `QI_MODEL_DIR` | Qwen-Image-2.1 模型包目录（默认 `$WDNAI_MODELS_DIR/qwenimage21`，板上实际在 `/home/rockchip/models/qwenimage21`） |
+| `WDNAI_QWEN_IMAGE_BIN` / `WDNAI_QWEN_IMAGE_ROOT` | Qwen-Image-2.1 运行时（`qwen_image_rknn`）位置；默认用模型包里的 `runtime/`，再退回 `$WDNAI_QWEN_IMAGE_ROOT/bin/` |
 | `WDNAI_LIBRKNN3_API` | `librknn3_api.so` 路径 |
 | `WDNAI_LIBRKNNSMI` | `librknnsmi.so` 路径 |
 | `WDNAI_TRACE_PROMPT` | 打印每次推理实际发出的 prompt（排查 prompt 污染用） |

@@ -35,13 +35,15 @@ class ModelSpec:
     """All static configuration + dynamic paths needed for a single model."""
 
     name: str
-    kind: str                                # "llm" | "vlm" | "tts" | "omni" | "asr" | "embedding"
-    variant: str                             # "qwen2.5" | "qwen3" | "qwen2.5-vl" | "qwen3-vl" | "qwen2.5-omni" | "qwen3-tts" | "qwen3-asr" | "qwen3-vl-embedding"
+    kind: str                                # "llm" | "vlm" | "tts" | "omni" | "asr" | "embedding" | "grounding" | "image"
+    variant: str                             # "qwen2.5" | "qwen3" | "qwen2.5-vl" | "qwen3-vl" | "qwen2.5-omni" | "qwen3-tts" | "qwen3-asr" | "qwen3-vl-embedding" | "qwen-image-2.1"
 
     # ---- LLM / VLM / TTS / Omni / ASR resources ----
     # kind=llm uses rknn_path / weight_path; kind=vlm uses rknn_llm_path / rknn_vision_path;
     # kind=tts uses tts_model_dir; kind=omni uses omni_model_dir (audio + llm derived from it);
-    # kind=asr uses asr_model_dir (encoder + llm derived from it).
+    # kind=asr uses asr_model_dir (encoder + llm derived from it);
+    # kind=image uses image_model_dir (a whole multi-part model package:
+    # TE + DiT segments + VAE segments + the C++ runtime).
     rknn_path: str = ""
     weight_path: str = ""
     rknn_llm_path: str = ""
@@ -51,6 +53,7 @@ class ModelSpec:
     tts_model_dir: str = ""
     omni_model_dir: str = ""
     asr_model_dir: str = ""
+    image_model_dir: str = ""
     embed_path: str = ""
     tokenizer_path: str = ""
 
@@ -957,6 +960,83 @@ def _verify_depth_anything_v3_files() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Qwen-Image-2.1: text-to-image (RKNN3 / rk1820). One model package holding
+# all three parts of the diffusion pipeline plus the C++ runtime that drives
+# them. File layout::
+#
+#     llm_qwenimage21-te.1828.rknn + .weight       text encoder (prompt → ehs)
+#     qwenimage21-te.embed.bin + .tokenizer.gguf   tokenizer / embedding table
+#     dit_qwenimage21-512.seg{0..3}.1828.rknn + .weight   DiT, 4 × 8 blocks
+#     vae_qwenimage21-512.seg{0..3}.1828.rknn + .weight   VAE decoder, 4 segments
+#     reference_512/hidden_states.bin               初始噪声
+#     runtime/qwen_image_rknn (+ runtime/lib/aarch64)      C++ 运行时
+#
+# The package lives in one flat directory (the ``/mnt/oem/models/`` layout);
+# the per-part file names keep the ``<part>_<Model>.<variant>.1828.rknn``
+# convention.
+# --------------------------------------------------------------------------- #
+_QWEN_IMAGE_21_REQUIRED = [
+    "llm_qwenimage21-te.1828.rknn",
+    "llm_qwenimage21-te.weight",
+    "qwenimage21-te.embed.bin",
+    "qwenimage21-te.tokenizer.gguf",
+    "reference_512/hidden_states.bin",
+] + [
+    f"{part}_qwenimage21-512.seg{i}.{ext}"
+    for part in ("dit", "vae")
+    for i in range(4)
+    for ext in ("1828.rknn", "weight")
+]
+
+
+def _qwen_image_21_dir() -> Path:
+    """Resolve the Qwen-Image-2.1 model-package directory.
+
+    Override via the ``WDNAI_QWEN_IMAGE_21_DIR`` env var (full path) or
+    ``QI_MODEL_DIR`` (same name the deploy-side ``test.sh`` uses);
+    otherwise ``$WDNAI_MODELS_DIR/qwenimage21`` (which itself defaults to
+    ``/userdata/models/qwenimage21``) and finally the board location
+    ``/home/rockchip/models/qwenimage21``.
+
+    The first **existing** candidate wins, so a board that keeps the
+    package under ``/home/rockchip/models`` works without any env var.
+    """
+    candidates = []
+    for env_key in ("WDNAI_QWEN_IMAGE_21_DIR", "QI_MODEL_DIR"):
+        value = _os.environ.get(env_key)
+        if value:
+            candidates.append(Path(value))
+    root = _os.environ.get("WDNAI_MODELS_DIR")
+    if root:
+        candidates.append(Path(root) / "qwenimage21")
+    candidates.append(Path("/home/rockchip/models/qwenimage21"))
+    candidates.append(_models_root() / "qwenimage21")
+    for cand in candidates:
+        try:
+            if cand.is_dir():
+                return cand
+        except OSError:
+            continue
+    return candidates[-1]
+
+
+def _verify_qwen_image_21_files() -> None:
+    """Raise :class:`FileNotFoundError` listing any missing package file."""
+    try:
+        d = _qwen_image_21_dir()
+    except OSError as e:
+        raise FileNotFoundError(
+            f"Qwen-Image-2.1 directory resolution failed: {e}"
+        )
+    missing = [f for f in _QWEN_IMAGE_21_REQUIRED if not (d / f).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Qwen-Image-2.1 files missing under {d}: {missing}. "
+            f"Place the files there or set WDNAI_QWEN_IMAGE_21_DIR to point at a custom path."
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Public catalog
 # --------------------------------------------------------------------------- #
 class SystemLanguageModel:
@@ -1000,6 +1080,11 @@ class SystemLanguageModel:
                                     ``/userdata/models/LocateAnything-3B``; override the
                                     root via ``WDNAI_MODELS_DIR`` or pin a custom path
                                     via ``WDNAI_LOCATE_ANYTHING_DIR``).
+    - ``qwen_image_21_512()``   — Qwen-Image-2.1 (text→image, 512×512) bound to
+                                    ``$WDNAI_MODELS_DIR/qwenimage21`` (default
+                                    ``/userdata/models/qwenimage21``; also picked up
+                                    from ``/home/rockchip/models/qwenimage21``;
+                                    override via ``WDNAI_QWEN_IMAGE_21_DIR``).
     """
 
     #: Default placeholder (no paths; for the ``model=default`` syntax in demo_vlm)
@@ -1273,3 +1358,59 @@ class SystemLanguageModel:
         """
         _verify_depth_anything_v3_files()
         return _depth_anything_v3_spec().with_paths(**_default_depth_anything_v3_paths())
+    # ---- Text-to-image (Qwen-Image-2.1) ---------------------------------
+    @classmethod
+    def qwen_image_21_512(cls) -> ModelSpec:
+        """Return a :class:`ModelSpec` pre-bound to the Qwen-Image-2.1 package.
+
+        Text-to-image model (prompt-in, 512×512 image-out) for RKNN3 /
+        rk1820. The package is expected at
+        ``$WDNAI_MODELS_DIR/qwenimage21`` (default
+        ``/userdata/models/qwenimage21``; also picked up automatically
+        from ``/home/rockchip/models/qwenimage21``). Override with
+        ``WDNAI_QWEN_IMAGE_21_DIR`` (or ``QI_MODEL_DIR``). Missing files
+        raise :class:`FileNotFoundError` listing them.
+
+        The whole pipeline is driven by the packaged C++ runtime
+        (``runtime/qwen_image_rknn``): the text encoder produces
+        ``encoder_hidden_states``, four resident DiT segments run the
+        flow-match loop (generation does **zero** load / model_init), and
+        four streaming VAE segments decode the latents.
+
+        Usage::
+
+            from wdnai import LLMLocalSession, SystemLanguageModel
+
+            session = LLMLocalSession(model=SystemLanguageModel.qwen_image_21_512())
+            text, attachments = await session.run_prompt("a cute cat")
+            bgr = attachments[0].images[0]
+
+        ``options`` carries the runtime knobs:
+
+        ``steps``
+            flow-match steps (default 8 — ~31 s per image after the
+            one-off initialisation; 20 is noticeably cleaner, 40 is the
+            upstream default).
+        ``fm_mu``
+            the scheduler's ``mu`` for the 512 route — **0.5387096774**,
+            not the 1024 route's 0.6935483871.
+        ``noise_fresh``
+            use a fresh random initial noise per image (default ``True``).
+            Set to ``False`` to get bit-reproducible output for a fixed
+            prompt.
+        """
+        _verify_qwen_image_21_files()
+        return ModelSpec(
+            name="qwen-image-2.1-512",
+            kind="image",
+            variant="qwen-image-2.1",
+            target="rk1820",
+            core_mask=0xFF,
+            image_model_dir=str(_qwen_image_21_dir()),
+            options={
+                "steps": 8,
+                "fm_mu": "0.5387096774",
+                "noise_fresh": True,
+                "noise_seed": 0,
+            },
+        )

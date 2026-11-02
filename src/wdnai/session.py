@@ -161,6 +161,10 @@ class LLMSession(ABC):
         * **TTS** backends consume the prompt as the *text to speak*, so the
           JSON-schema hint (a Qwen-VLM/LLM concept) would otherwise be read
           aloud as part of the audio.
+        * **text-to-image** backends consume the prompt as *the thing to
+          draw*. A JSON-schema hint is not merely noise there — it gets
+          **painted into the picture** (a diffusion model renders every
+          word it is handed). It must never reach the prompt.
         * **grounding** backends consume the prompt as *the thing to locate*.
           LocateAnything emits ``<ref>label</ref><box>(x1,y1,x2,y2)</box>``
           natively — it can neither produce JSON nor read a JSON schema.
@@ -181,7 +185,7 @@ class LLMSession(ABC):
         identically on both sides of the wire.
         """
         kind = self._model_kind()
-        return kind in ("tts", "grounding")
+        return kind in ("tts", "grounding", "image")
 
     def _model_kind(self) -> Optional[str]:
         """Best-effort model family: ``"tts"`` / ``"grounding"`` / ``"vlm"`` …
@@ -1062,6 +1066,42 @@ class LLMLocalSession(LLMSession):
     def embed_video(self, frames: List[np.ndarray], prompt: str = "") -> np.ndarray:
         """Return a normalized embedding vector for a list of BGR video frames."""
         return self._backend.embed_video_chunk(frames, text=prompt)
+
+    # ------------------------------------------------------------------ #
+    # Text-to-image passthrough (kind="image" backend only)
+    # ------------------------------------------------------------------ #
+    async def generate_image(self, prompt: str, **overrides: Any) -> np.ndarray:
+        """Generate one image from ``prompt``; return it as a BGR ndarray.
+
+        Only valid for a ``kind="image"`` model — e.g.
+        :meth:`wdnai.SystemLanguageModel.qwen_image_21_512`. The image
+        backend produces the picture as an
+        :class:`~wdnai.attachment.ImageAttachment`; this helper unwraps it.
+
+        Why not :meth:`respond`? ``respond`` promises a **text** result to
+        its caller, so the attachment is only reachable through the
+        ``generating=LMOutput`` path::
+
+            out = await session.respond(prompt, generating=LMOutput)
+            bgr = out.attachment[0].images[0]
+
+        :meth:`run_prompt` is the other attachment-preserving entry point
+        (``(text, attachments)``). Use whichever fits the call site; this
+        method is the shortest path to the pixels.
+
+        Runtime knobs are forwarded to the backend (``steps=``, ``noise_fresh=``,
+        ``keep_artifacts=``, …) — see
+        :meth:`wdnai.SystemLanguageModel.qwen_image_21_512`.
+        """
+        _text, attachments = await self.run_prompt(prompt, None, **overrides)
+        for att in attachments:
+            images = getattr(att, "images", None)
+            if images:
+                return images[0]
+        raise RuntimeError(
+            f"图像后端没有返回图片（{self.spec.kind!r} backend，"
+            f"attachments={attachments!r}）"
+        )
 
     # ------------------------------------------------------------------ #
     def reset(self) -> None:

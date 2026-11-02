@@ -25,6 +25,7 @@
 | [`locate_image.py`](locate_image.py) | LocateAnything 目标定位 | 待补 |
 | [`qwen3_5_vl_image.py`](qwen3_5_vl_image.py) | Qwen3.5-VL-4B 图像描述 | 待补 |
 | [`qwen35_vl_9b_multicard.py`](qwen35_vl_9b_multicard.py) | Qwen3.5-VL-9B 双卡 | 待补 |
+| [`qwen_image_21.py`](qwen_image_21.py) | Qwen-Image-2.1 文生图（512×512） | ✅ 已记录 |
 | [`summarize_text.py`](summarize_text.py) | Qwen3-4B 纯文本总结 | 待补 |
 | [`test_three_models_one_npu.py`](test_three_models_one_npu.py) | 单卡多模型共存 | 待补 |
 | [`text_to_speech.py`](text_to_speech.py) | Qwen3-TTS 语音合成 | 待补 |
@@ -332,3 +333,105 @@ shared inverse-depth visualization range: [0.730385, 2.169492]
     `model_init` 9.8 s + 共享显存 0.7 s），真正的推理只有 **1.34 s**。
     想知道推理有多快，看 `[time] global run` / `[time] head run`，或者直接看
     「性能实测」那张表 —— 拿 `total` 去评估实时流吞吐会算错一个数量级。
+
+---
+
+## qwen_image_21 —— Qwen-Image-2.1 文生图（512×512）
+
+> 文生图**不是**文本生成：文本进，**一张 512×512 图像**出。
+> 输出走 `ImageAttachment`（BGR uint8 ndarray），不是字符串。
+> 这个 sample 的产物与板端 `test.sh` 出的图**逐位一致**（同一份噪声时）。
+
+### 怎么跑
+
+前置条件：模型包已在 `/home/rockchip/models/qwenimage21/`（见「坑」第 3 条）。
+
+```bash
+cd /home/rockchip/wdnwebui
+
+# 默认：一只猫坐在木椅上，8 步，输出到 ./output.png
+.venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
+    --prompt "a cute cat sitting on a wooden chair"
+
+# 20 步（更清晰，耗时更长）
+.venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
+    --prompt "一只戴眼镜的猫" --steps 20 --output /tmp/qi21_cn.png
+
+# 固定初始噪声（可复现 / 可与 PyTorch 金标准对拍）
+.venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
+    --prompt "a cute cat" --fixed-noise --seed 0
+
+# 不写 Python 的等价入口
+bash .venv/src/wdnai/samples/qwenimage21.sh "a cute cat" 8 --out /tmp/qi21
+```
+
+- **耗时**：**91~95 s/张**（8 步）。分段实测见下方「输出」表。
+- **占 NPU**：是，占**两张卡**。同一时刻别再跑别的 sample。
+- 输出目录里的中间产物（潜变量 / VAE 原始张量）默认跑完就删；
+  要留就加 `--keep-artifacts`（产物目录会打印出来）。
+
+### 输入
+
+#### 命令行参数
+
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `--prompt` | **必填** | 要画的提示词（中英文都行）。空串会抛 `ValueError` |
+| `--steps` | `8` | flow-match 步数。8 步 ≈ 94 s；20 步 ≈ 125 s；40 步 ≈ 177 s。**纯运行时参数，模型不重建** |
+| `--output` / `-o` | `output.png` | 输出 PNG 路径（父目录自动创建） |
+| `--model-dir` | 自动解析 | 覆盖模型包目录；默认 `$WDNAI_MODELS_DIR/qwenimage21`，板上实际在 `/home/rockchip/models/qwenimage21` |
+| `--seed` | `0` | 初始噪声种子（配合 `--fixed-noise`） |
+| `--fixed-noise` | 关 | 复用模型包里的固定噪声（`reference_512/hidden_states.bin`），可复现 |
+| `--keep-artifacts` | 关 | 保留中间产物（潜变量 / VAE 原始张量 / TE 输出） |
+| `-v` / `--verbose` | 关 | 打开 SDK 的 DEBUG 日志 |
+
+#### 素材目录约定
+
+**不适用** —— 本 sample 的输入是纯文本提示词，没有图片 / 音频素材目录。
+
+### 输出
+
+| 产出 | 含义 |
+|---|---|
+| `<--output>` | 512×512 RGB PNG（8 bit/通道，无 alpha） |
+| stdout `图像 shape=(512, 512, 3) dtype=uint8` | ndarray 形状与类型（BGR，H×W×C） |
+| stdout `elapsed=94.7s` | 端到端墙钟耗时（含 TE 编码 + DiT 生成 + VAE 解码） |
+
+分段耗时（板端实测，RK3588 + 2×RK1828，8 步）：
+
+| 阶段 | 耗时 | 说明 |
+|---|---|---|
+| TE 编码 | ~37 s | **97% 是 `model_init`**（4 GB 权重灌进 NPU），推理本身只要 0.16 s |
+| DiT 常驻 init | ~23 s | 一次性；之后**生成过程零 load / 零 model_init** |
+| flow-match 8 步 | ~21 s | 每步 2.60 s（4 段串行，每段 ~580 ms） |
+| VAE 4 段链 | ~10 s | 流式逐段释放 |
+
+### 容易踩的坑
+
+1. **`respond()` 不带 `generating=` 时图片会丢。**
+   `respond` 的契约是给调用方一个**文本**结果，所以只返回 prompt 回显。
+   要图用 `session.generate_image(prompt)`（最短）、`session.run_prompt()`
+   （返回 `(text, attachments)`）或 `session.respond(prompt, generating=LMOutput)`
+   （`.attachment` 自动填充）。
+
+2. **给文生图传自定义 `generating=` schema 会抛 `ValidationError`。**
+   扩散模型不产 JSON —— 这是预期行为，不是 bug。用 `LMOutput` 本身即可。
+
+3. **模型包必须带 `runtime/qwen_image_rknn`（+ `runtime/lib/aarch64/`）。**
+   缺了它 SDK 会回退去 `/home/rockchip/projects/deploy/bin/` 找；两处都没有就
+   `FileNotFoundError`。可以用 `WDNAI_QWEN_IMAGE_BIN` / `WDNAI_QWEN_IMAGE_ROOT` 指。
+
+4. **`reference_512/hidden_states.bin` 的文件名不能改。**
+   运行时按这个名字读初始噪声；改名 ⇒ `找不到初始噪声` 直接退出。
+
+5. **`fm_mu` 必须用 512 路线的 `0.5387096774`。**
+   1024 路的 `0.6935483871` 用在这里会让出图完全不对（但不会报错）。
+
+6. **TE 与 DiT 物理无法共卡 ⇒ 每次换提示词都要重跑 TE。**
+   TE 权重本身占 486 MiB/核，与常驻的 DiT 抢不下同一张卡。
+   所以「94 s 一张」是**架构天花板**，不是实现问题 ——
+   步数只影响 flow-match 那 21 s。
+
+7. **别在跑图的过程中 reset / rescan / 烧固件 / 重启板子。**
+   这些是把 RK1820 弄坏的真凶（详见 `deploy/debug.md` §69）。
+   本 sample 自己不碰卡的状态：proxy 已在跑就不重启，权重只读不写。

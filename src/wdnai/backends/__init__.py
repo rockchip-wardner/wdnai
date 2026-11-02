@@ -7,6 +7,7 @@ from ..model import ModelSpec
 from ._common import resolve_device_id
 from .depth_anything import DepthAnythingBackend
 from .embedding import EmbeddingBackend
+from .image import ImageBackend
 from .locate_anything import LocateAnythingBackend
 from .text import TextBackend
 from .tts import TTSBackend
@@ -19,6 +20,9 @@ _REGISTRY: Dict[str, Type] = {
     "embedding": EmbeddingBackend,
     "grounding": LocateAnythingBackend,
     "depth": DepthAnythingBackend,
+    # 文生图（Qwen-Image-2.1）。``backends/image.py`` 不 import librknn3 ——
+    # 它驱动 C++ 运行时子进程，因此在非 RK 机器上 import 也是安全的。
+    "image": ImageBackend,
 }
 
 
@@ -60,7 +64,8 @@ def build_backend(
     cls = _REGISTRY.get(spec.kind)
     if cls is None:
         raise ValueError(
-            f"Unknown kind: {spec.kind!r} (expected 'llm' / 'vlm' / 'tts' / 'omni' / 'asr' / 'embedding' / 'grounding' / 'depth')"
+            f"Unknown kind: {spec.kind!r} (expected 'llm' / 'vlm' / 'tts' / 'omni' / "
+            f"'asr' / 'embedding' / 'grounding' / 'depth' / 'image')"
         )
     return cls(spec, npu=npu, device_id=device_id)
 
@@ -68,6 +73,6 @@ def build_backend(
 __all__ = [
     "TextBackend", "VLMBackend", "Rknn3LiteMultiCardVLMBackend",
     "TTSBackend", "EmbeddingBackend", "LocateAnythingBackend",
-    "OmniBackend", "ASRBackend", "DepthAnythingBackend",
+    "OmniBackend", "ASRBackend", "DepthAnythingBackend", "ImageBackend",
     "build_backend", "resolve_device_id",
 ]

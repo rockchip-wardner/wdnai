@@ -77,6 +77,7 @@ from .lm_output import LMOutput
 from .model import ModelSpec, SystemLanguageModel
 from .prompt import LocatePrompt, Prompt, build_chatml_prompt
 from .session import LLMLocalSession, LLMSession
+from .backends.image import ImageBackend
 from .backends.locate_anything import LocateAnythingBackend
 from .backends.depth_anything import DepthAnythingBackend, DepthResult
 
@@ -106,6 +107,7 @@ __all__ = [
     "LocateAnythingBackend",
     "DepthAnythingBackend",
     "DepthResult",
+    "ImageBackend",
     "RknnSmi",
     "RknnSmiCallError",
     "RknnSmiError",

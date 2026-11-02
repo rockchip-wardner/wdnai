@@ -69,6 +69,10 @@ class SoftwareCapability(str, Enum):
     VISION_DEPTH = "swcap_vision_depth"
     #: 文本 → 语音。
     TEXT_TO_SPEECH = "swcap_text_to_speech"
+    #: 文本 → 图像。文生图（Qwen-Image-2.1 / RKNN3 rk1820）：
+    #: 文本 encoder 编码提示词 → DiT flow-match 生成潜变量 → VAE 解码成图。
+    #: 输出是**图像**（走 ``ImageAttachment``），不是文本。
+    TEXT_TO_IMAGE = "swcap_text_to_image"
     #: → **可执行动作 / 工具调用**，超越自由文本输出。两种实现都算：
     #: ``@Generable`` 动作 schema（agent 的 click/type/key…）与 ``@Callable``
     #: 工具调度（副作用在主进程执行）。

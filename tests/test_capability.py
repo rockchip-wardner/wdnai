@@ -31,7 +31,9 @@ EXPECTED = (
     "swcap_vision_grounding",
     "swcap_audio_chat",
     "swcap_vision_embedding",
+    "swcap_vision_depth",
     "swcap_text_to_speech",
+    "swcap_text_to_image",
     "swcap_tool_call",
 )
 
