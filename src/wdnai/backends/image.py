@@ -106,9 +106,16 @@ _FM_MU_512 = "0.5387096774"
 _CARD0 = "0000:01:00.0"
 _CARD1 = "0003:31:00.0"
 
-#: Fallback deployment roots, searched when the model package does not
-#: carry its own ``runtime/`` copy.
-_DEPLOY_ROOTS = ("/home/rockchip/projects/deploy",)
+#: ⚠️ 2026-11-02 第三十五轮：**不再有 deploy 目录兜底**。
+#:
+#: 之前 ``_DEPLOY_ROOTS`` 会在模型包没带 ``runtime/`` 时去
+#: ``/home/rockchip/projects/deploy/bin/`` 找 —— 而那个目录里**曾经**存着
+#: **另一份** ``qwen_image_rknn`` ⇒ 一份更新一份没更新 ⇒ 行为分裂
+#: ⇒ 就是「模型包里的二进制静默过期」那个坑的根源。
+#:
+#: ⇒ 现在**运行时只有一份**（模型包的 ``runtime/``），由 ``deploy/build.sh``
+#: 编译完自动同步 ⇒ 不可能再分叉。
+_DEPLOY_ROOTS: Tuple[str, ...] = ()
 
 #: Candidate model-package directories, in priority order.
 _MODEL_DIR_CANDIDATES = (
@@ -312,59 +319,90 @@ class ImageBackend:
 
         Returns ``(prompt, [ImageAttachment(bgr_ndarray)])``.
         """
-        prompt = (prompt or "").strip()
-        if not prompt:
+        return self.run_texts([prompt], **overrides)[0]
+
+    def run_texts(
+        self, prompts: List[str], **overrides: Any,
+    ) -> List[Tuple[str, List[Attachment]]]:
+        """Generate **N** images from ``prompts`` — **一个进程跑完**。
+
+        ⭐ 2026-11-02 第三十五轮：批量不是「循环调 N 次 run_text」——
+        那样每张图都要重新 init 一次 DiT（39 s）与 TE（37 s），完全白费常驻。
+        真正的批量是：给每个 prompt 一个 te 目录（放 ``prompt.txt``），
+        一次性交给 ``serve --te-dirs d1,d2,...`` ⇒ **TE / DiT / VAE 都只 init 一次**。
+
+        Returns a list of ``(prompt, [ImageAttachment(bgr_ndarray)])``,
+        one entry per prompt, in order.
+        """
+        cleaned = [(p or "").strip() for p in (prompts or [])]
+        if not cleaned or any(not p for p in cleaned):
             raise ValueError("Qwen-Image-2.1 需要一个非空的提示词")
 
         opts = self._options(overrides)
         work = self._make_workdir(opts)
         self._keep_artifacts = bool(opts.get("keep_artifacts"))
-        te_dir = work / "te"
         out_dir = work / "out"
-        te_dir.mkdir(parents=True, exist_ok=True)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         self.sink.reset()
         t_start = time.perf_counter()
         try:
-            # ① TE — 提示词写进 te_dir，由 serve 里的**常驻 TE** 编码
-            #    （TE 与 DiT 的头共卡 0 ⇒ 不再单独起进程、不再付 36.8 s init）
+            # ① TE — 每个 prompt 一个目录（放 prompt.txt），由 serve 里的
+            #    **常驻 TE** 编码（TE 与 DiT 的头共卡 0 ⇒ 不再单独起进程、
+            #    不再每张图付 36.8 s 的 model_init）
             self.sink.emit("[Qwen-Image-2.1] 编码提示词 …")
             t0 = time.perf_counter()
-            self._run_te(prompt, te_dir, opts)
+            te_dirs = self._run_te(cleaned, work, opts)
             te_ms = (time.perf_counter() - t0) * 1000.0
 
             # ② DiT (resident, zero load/init during generation) + ③ VAE
             self.sink.emit("[Qwen-Image-2.1] 生成中 …")
             t0 = time.perf_counter()
-            self._run_serve(te_dir, out_dir, opts)
+            self._run_serve(te_dirs, out_dir, opts)
             gen_ms = (time.perf_counter() - t0) * 1000.0
 
-            bgr, png_path = self._load_image(out_dir)
+            results: List[Tuple[str, List[Attachment]]] = []
+            copy_dir = opts.get("output_dir")
+            first_png: Optional[Path] = None
+            for i, prompt in enumerate(cleaned):
+                bgr, png_path = self._load_image(out_dir, i + 1)
+                if first_png is None:
+                    first_png = png_path
+                results.append((prompt, [ImageAttachment(bgr)]))
+                if copy_dir:
+                    # ⭐ 把**后端自己写的** PNG 复制出去（不是重新编码）
+                    #   ⇒ 与运行时写的那份**逐字节相同**（同一套 zlib/filter 规则）
+                    dst_dir = Path(str(copy_dir))
+                    dst_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(str(png_path), str(dst_dir / png_path.name))
+                if opts.get("verbose", True):
+                    _log("  {} → {}".format(png_path.name, png_path))
             total_ms = (time.perf_counter() - t_start) * 1000.0
             self.sink.perf.update({
                 "te_ms": te_ms,
                 "generate_ms": gen_ms,
                 "total_ms": total_ms,
                 "steps": int(opts["steps"]),
+                "count": len(cleaned),
             })
             self.last_artifacts = {
-                "png": str(png_path),
+                "png": str(first_png or ""),
                 "out_dir": str(out_dir),
-                "te_dir": str(te_dir),
+                "te_dir": str(te_dirs[0]),
             }
             self.sink.emit(
-                "[Qwen-Image-2.1] 完成：{}（{:.1f} s）".format(
-                    png_path.name, total_ms / 1000.0,
+                "[Qwen-Image-2.1] 完成：{} 张（{:.1f} s）".format(
+                    len(cleaned), total_ms / 1000.0,
                 )
             )
             if opts.get("verbose", True):
                 _log(
-                    "完成：{}  TE {:.1f}s  生成 {:.1f}s  总计 {:.1f}s".format(
-                        png_path, te_ms / 1000.0, gen_ms / 1000.0, total_ms / 1000.0,
+                    "完成：{} 张  TE {:.1f}s  生成 {:.1f}s  总计 {:.1f}s".format(
+                        len(cleaned), te_ms / 1000.0, gen_ms / 1000.0,
+                        total_ms / 1000.0,
                     )
                 )
-            return prompt, [ImageAttachment(bgr)]
+            return results
         finally:
             if self._owns_workdir and not opts.get("keep_artifacts"):
                 shutil.rmtree(work, ignore_errors=True)
@@ -399,6 +437,7 @@ class ImageBackend:
             "noise_seed": 0,
             "card0": _CARD0,
             "card1": _CARD1,
+            "output_dir": None,
             "work_dir": None,
             "keep_artifacts": False,
             "verbose": bool(getattr(self.spec, "verbose", True)),
@@ -515,15 +554,25 @@ class ImageBackend:
         return dit, vae
 
     # -- the two runtime invocations ------------------------------------- #
-    def _run_te(self, prompt: str, te_dir: Path, opts: Dict[str, Any]) -> None:
+    def _run_te(
+        self, prompts: List[str], work: Path, opts: Dict[str, Any],
+    ) -> List[Path]:
         # ⭐⭐⭐ 2026-11-02 第三十五轮：**TE 常驻**。
         #   TE 的 model_init 要 36.8 s、真推理只要 0.16 s ⇒ 不再单独起 te-plain 进程，
         #   改成「把 prompt 写进目录，serve 里的常驻 TE 负责编码」。
         #   ⇒ 每张图省掉 37 s（批量 N 张时省 N×37 s）。
-        te_dir.mkdir(parents=True, exist_ok=True)
-        (te_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+        # ⭐ 批量：每个 prompt 一个目录 ⇒ serve 一次跑完 ⇒ TE/DiT/VAE 都只 init 一次。
+        te_dirs: List[Path] = []
+        for i, prompt in enumerate(prompts):
+            te_dir = work / "te{}".format(i + 1)
+            te_dir.mkdir(parents=True, exist_ok=True)
+            (te_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+            te_dirs.append(te_dir)
+        return te_dirs
 
-    def _run_serve(self, te_dir: Path, out_dir: Path, opts: Dict[str, Any]) -> None:
+    def _run_serve(
+        self, te_dirs: List[Path], out_dir: Path, opts: Dict[str, Any],
+    ) -> None:
         d = self.model_dir
         dit_w, vae_w = self._weight_paths()
 
@@ -556,7 +605,7 @@ class ImageBackend:
             "--te-tokenizer", str(d / _TE_TOKENIZER),
             "--te-embed", str(d / _TE_EMBED),
             "--te-device", str(opts["card0"]),
-            "--te-dirs", str(te_dir),
+            "--te-dirs", ",".join(str(td) for td in te_dirs),
             "--input-dir", str(d / _REF_DIR),
             "--output", str(out_dir),
             "--repeat", "1",
@@ -660,17 +709,22 @@ class ImageBackend:
             self._kill(proc)
 
     # -- image decoding ---------------------------------------------------- #
-    def _load_image(self, out_dir: Path) -> Tuple[Any, Path]:
+    def _load_image(self, out_dir: Path, index: int = 1) -> Tuple[Any, Path]:
         """Decode the VAE output into a BGR ndarray and write the PNG.
 
         The runtime writes ``img01_vae_image.bin`` (+ ``.meta``) as
         NCHW ``[1, 4, 512, 512]`` fp16. Channels 0/1/2 are RGB; the 4th
         channel is not part of the visible image.
+
+        ``index`` is 1-based and selects ``img<NN>`` — the runtime numbers
+        its per-image outputs that way, so a batch of N lands as
+        ``img01`` … ``imgNN``.
         """
         import numpy as np
 
-        raw = out_dir / "img01_vae_image.bin"
-        png_path = out_dir / "img01.png"
+        stem = "img{:02d}".format(int(index))
+        raw = out_dir / (stem + "_vae_image.bin")
+        png_path = out_dir / (stem + ".png")
         if raw.is_file():
             dtype_name, shape = _read_meta(raw)
             dtype = _DTYPES.get(dtype_name or "", "float16")

@@ -169,14 +169,19 @@ bgr = out.attachment[0].images[0]
 | `keep_artifacts` | `False` | 保留中间产物（潜变量 / VAE 原始张量） |
 | `work_dir` | 临时目录 | 指定工作目录（产物落在这里） |
 
-⏱ 板端实测（RK3588 + 2×RK1828）：TE 37 s + DiT 常驻 init 23 s + flow-match
-21 s + VAE 10 s ≈ **94 s/张**。TE 的权重本身就占 486 MiB/核，与 DiT **物理无法
-共卡**，所以每次换提示词都要重跑 TE —— 这是架构天花板，不是 bug。
+⏱ 板端实测（RK3588 + 2×RK1828，8 步）：**TE 与 DiT 都常驻**
+（卡 0 = TE + 头，卡 1 = DiT 4 段 → VAE）⇒ 一次性 init ≈ 78 s，
+之后**每张图 ≈ 34 s**（flow-match 21 s + VAE 11 s，TE 编码只要 0.16 s）。
 
 命令行等价物（不写 Python 也能出图）：
 
 ```bash
-bash samples/qwenimage21.sh "a cute cat sitting on a wooden chair"   # 8 步
+.venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
+    "a cute cat sitting on a wooden chair" 8 --out /tmp/qi21
+
+# ⭐ 批量："|" 分隔多个提示词 ⇒ 一个进程跑完 N 张
+.venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
+    "a cute cat sitting on a wooden chair|一只戴眼镜的猫" 8 --out /tmp/qi21
 ```
 
 ---

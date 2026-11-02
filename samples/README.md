@@ -1,8 +1,8 @@
 # samples/
 
-用来放 wdnai 的用法示例。每个示例建议是一个**可独立运行**的文件（`.py`
-或 `.sh`），方便用户直接 `python samples/<name>.py` / `bash samples/<name>.sh`
-看到效果。
+用来放 wdnai 的**命令行入口**。每个示例建议是一个**可独立运行**的文件
+（`.py` 或 `.sh`），方便用户直接 `python samples/<name>.py` /
+`bash samples/<name>.sh` 看到效果。
 
 ## 添加新示例的约定
 
@@ -15,40 +15,49 @@
 
 | 文件 | 演示内容 |
 | --- | --- |
-| `qwenimage21.sh` | Qwen-Image-2.1 → RKNN(rk1820) 512×512 文生图：prompt → PNG，并打印各阶段耗时 |
+| （暂无） | — |
 
-## `qwenimage21.sh` —— 文生图一键脚本
+> ⭐ **2026-11-02 第三十五轮**：`qwenimage21.sh` 已删除。
+>
+> 原因：**文生图只有一个入口就够**，而 shell 版本与 Python 版本**功能重复**
+> （两套参数、两套噪声语义、两套 PNG 转换路径）⇒ 迟早会走偏。
+>
+> 现在统一用 `examples/qwen_image_21.py`（参数与旧 sh 完全对齐，见下）。
+>
+> ```bash
+> cd /home/rockchip/wdnwebui
+> .venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
+>     "a cute cat sitting on a wooden chair" 8 --out /tmp/qi21
+> ```
+
+## `examples/qwen_image_21.py` —— 文生图一键入口
 
 ```bash
-bash samples/qwenimage21.sh "a cute cat sitting on a wooden chair"       # 8 步
-bash samples/qwenimage21.sh "一只戴眼镜的猫" 20                            # 20 步
-bash samples/qwenimage21.sh "一只猫" 8 --out /tmp/myimg                     # 指定输出目录
-bash samples/qwenimage21.sh "一只猫" 8 --fixed                              # 固定噪声（可复现 / 可对拍）
+# 单张
+.venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
+    "a cute cat sitting on a wooden chair" 8 --out /tmp/qi21
+
+# 20 步（更清晰，耗时更长）
+.venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
+    "一只戴眼镜的猫" 20 --out /tmp/qi21
+
+# ⭐ 批量："|" 分隔多个提示词 ⇒ **一个进程跑完 N 张**
+#    （TE / DiT / VAE 都只 model_init 一次 ⇒ 每张图边际 ≈ 34 s）
+.venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
+    "a cute cat sitting on a wooden chair|一只戴眼镜的猫" 8 --out /tmp/qi21
+
+# 固定初始噪声（可复现 / 可与 PyTorch 金标准对拍）
+.venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
+    "a cute cat" 8 --fixed --seed 0 --out /tmp/qi21
 ```
 
 产物（`<out>/`）：
 
 | 文件 | 内容 |
 | --- | --- |
-| `img01.png` | 最终图（512×512 RGB） |
+| `img01.png` | 最终图（512×512 RGB）；批量时依次 `img02.png` / `img03.png` … |
 | `img01_latents.bin` | DiT 潜变量（token 主序 fp16） |
 | `img01_vae_image.bin` | VAE 输出（NCHW `[1,4,512,512]` fp16）+ `.meta` |
-| `te/` | text encoder 的中间产物（`encoder_hidden_states*`） |
-| `test.log` | 完整运行时日志 |
 
-脚本会打印各阶段耗时（环境准备 / TE / DiT+VAE / 总计）。板端实测（RK3588 +
-2×RK1828）：8 步 ≈ **94 s**、20 步 ≈ 125 s、40 步 ≈ 177 s。
-
-模型包默认在 `/home/rockchip/models/qwenimage21`（用 `QI_MODEL_DIR` 或
-`WDNAI_QWEN_IMAGE_21_DIR` 覆盖）。
-
-⚠️ 三条硬性要求（脚本里已经设好，改脚本前先看 `deploy/debug.md` §73）：
-
-- `QI_SPREAD_IO=0` —— **输出** IO 绝不能分散（runtime 只往它自己指定的池写
-  结果，换池 ⇒ 输出恒为全 0）
-- `QI_SPREAD_IO_IN=1` —— 只分散**输入** IO（否则 VAE 第 3 段 `create_mem` 失败）
-- `--vae-stream` —— VAE 分段链必须逐段释放（否则 4 段同时常驻 ⇒
-  `MODEL_SETUP fail`，而且是在 DiT 跑完之后才炸）
-
-> Python 侧的等价入口是 `examples/qwen_image_21.py`（走
-> `LLMLocalSession.generate_image()`），两者跑的是同一套模型与运行时。
+⏱ 板端实测（RK3588 + 2×RK1828，8 步）：**TE 与 DiT 都常驻** ⇒
+一次性 init ≈ 78 s，之后**每张图 ≈ 34 s**（flow-match 21 s + VAE 11 s）。

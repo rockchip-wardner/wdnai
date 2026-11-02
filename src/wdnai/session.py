@@ -1103,6 +1103,44 @@ class LLMLocalSession(LLMSession):
             f"attachments={attachments!r}）"
         )
 
+    async def generate_images(
+        self, prompts: List[str], **overrides: Any,
+    ) -> List[np.ndarray]:
+        """Generate **N** images from ``prompts`` — **一个进程跑完 N 张**。
+
+        Only valid for a ``kind="image"`` model — e.g.
+        :meth:`wdnai.SystemLanguageModel.qwen_image_21_512`.
+
+        ⭐ 2026-11-02 第三十五轮：批量**不是**「循环调 N 次
+        :meth:`generate_image`」—— 那样每张图都要重新 ``model_init`` 一次
+        TE（37 s）与 DiT（39 s），常驻就白费了。真正的批量是给每个 prompt
+        一个目录、一次性交给运行时 ⇒ **TE / DiT / VAE 都只 init 一次**。
+
+        Returns a list of BGR ndarrays, one per prompt, in order.
+        """
+        backend = self._backend
+        run_texts = getattr(backend, "run_texts", None)
+        if run_texts is None:
+            # 后端不支持批量 ⇒ 退化成逐张（每张一个进程，慢但正确）
+            out: List[np.ndarray] = []
+            for p in prompts:
+                out.append(await self.generate_image(p, **overrides))
+            return out
+
+        results = run_texts(list(prompts), **overrides)
+        images: List[np.ndarray] = []
+        for _text, attachments in results:
+            for att in attachments:
+                imgs = getattr(att, "images", None)
+                if imgs:
+                    images.append(imgs[0])
+                    break
+        if len(images) != len(prompts):
+            raise RuntimeError(
+                f"图像后端返回了 {len(images)} 张，期望 {len(prompts)} 张"
+            )
+        return images
+
     # ------------------------------------------------------------------ #
     def reset(self) -> None:
         """Clear the C library's KV cache / internal state.

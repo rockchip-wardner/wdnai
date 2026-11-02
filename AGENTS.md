@@ -410,10 +410,12 @@ name `wdnai`, distribution name `wdnai`.
   **「性能实测」**和**「view 数与实时流」**两节。
   已按此记录的有 `depth_anything_v3` 与 `qwen_image_21` 两节，
   其余 sample 逐个补齐。
-- `samples/` — 命令行入口（与 `examples/` 的 `.py` demo 平行）。目前只有
-  `qwenimage21.sh`：不写 Python 也能出图，参数与板端 `test.sh` 一致
-  （`bash samples/qwenimage21.sh "提示词" [步数] [--out 目录] [--fixed]`），
-  产物与各阶段耗时见 `samples/README.md`。
+- `samples/` — 命令行入口（与 `examples/` 的 `.py` demo 平行）。
+  ⭐ 2026-11-02 第三十五轮：**空目录** —— `qwenimage21.sh` 已删除
+  （与 `examples/qwen_image_21.py` 功能重复，两套参数/噪声语义/PNG 转换迟早走偏）。
+  ⇒ **文生图只有 `examples/qwen_image_21.py` 一个入口**，
+  参数与旧 sh 对齐（`"<提示词>" [步数] [--out 目录] [--fixed|--fresh]`，
+  `|` 分隔多提示词 ⇒ 批量）。
 
 
 ## 接口设计

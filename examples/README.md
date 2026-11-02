@@ -513,17 +513,19 @@ cd /home/rockchip/wdnwebui
 
 # 20 步（更清晰，耗时更长）
 .venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
-    --prompt "一只戴眼镜的猫" --steps 20 --output /tmp/qi21_cn.png
+    "一只戴眼镜的猫" 20 --out /tmp/qi21
 
 # 固定初始噪声（可复现 / 可与 PyTorch 金标准对拍）
 .venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
-    --prompt "a cute cat" --fixed-noise --seed 0
+    "a cute cat" 8 --fixed --seed 0 --out /tmp/qi21
 
-# 不写 Python 的等价入口
-bash .venv/src/wdnai/samples/qwenimage21.sh "a cute cat" 8 --out /tmp/qi21
+# ⭐ 批量："|" 分隔多个提示词 ⇒ 一个进程跑完 N 张（TE/DiT/VAE 只 init 一次）
+.venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
+    "a cute cat sitting on a wooden chair|一只戴眼镜的猫" 8 --out /tmp/qi21
 ```
 
-- **耗时**：**91~95 s/张**（8 步）。分段实测见下方「输出」表。
+- **耗时**：一次性 init ≈ 78 s（TE 37 + DiT 39），之后 **≈ 34 s/张**（8 步）。
+  批量 N 张时，init **只付一次**。分段实测见下方「输出」表。
 - **占 NPU**：是，占**两张卡**。同一时刻别再跑别的 sample。
 - 输出目录里的中间产物（潜变量 / VAE 原始张量）默认跑完就删；
   要留就加 `--keep-artifacts`（产物目录会打印出来）。
