@@ -2,7 +2,13 @@
 
 **⚠️ 当前限制**：本 sample 只覆盖 **10-view（多视图融合）** 导出 ——
 ``global`` 段在 10 张图之间做融合，送图张数必须正好是 10。
-**单路（单图）深度估计尚未实现**（需要一份 V=1 的导出），后续版本补齐。
+**单路（单图）深度估计尚未实现**。
+
+换 view 数**不需要改代码** —— backend 从模型上读 V，只要重新导出三段 RKNN
+（model-zoo 的 ``--views``，已验证范围 1-10）。代价见
+``examples/README.md`` 的「view 数与实时流」一节：
+``--views 5`` 只差 1.58% 且延迟减半（推荐先做），``--views 1`` 差 4.14%。
+多相机几何还需要 model-zoo 导出 **ray** 分支（当前不支持）且换更大的模型。
 
 The C++ demo at ``rknn3-model-zoo/examples/depth_anything_v3/cpp/main.cpp``
 drives the three-stage DA3-BASE RKNN export (``local`` → ``global`` →

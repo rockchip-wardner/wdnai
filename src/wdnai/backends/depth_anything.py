@@ -457,9 +457,19 @@ class DepthAnythingBackend:
 
     **当前限制**：只支持 **10-view（多视图融合）** 导出 —— ``global`` 段在
     10 张图之间做融合，view 数烤进了它的输入形状，不是运行期参数。
-    **单路（单图）深度估计尚未实现**：那需要一份 V=1 的导出
-    （``global`` 输入形状 ``[1, L, 1, D]``），换模型后本 backend 的
-    per-core 共享显存逻辑无需改动，但 ``global`` 段的 token 拼装要改。
+    **单路（单图）深度估计尚未实现**。
+
+    换 view 数**不需要改这个类**：``self.views`` 是从 ``global`` 的输入张量
+    属性上读出来的（见 :meth:`_read_model_geometry`），所以重新导出
+    ``--views N``（model-zoo 已验证 1-10）就能直接用，``estimate()`` 的张数
+    校验与报错文案都会自动跟着变。
+
+    **多相机几何当前走不通**：多相机融合需要相机位姿，而位姿在官方模型里
+    靠 **ray map**（每像素 6 通道的射线原点+方向）隐式表示 —— model-zoo 的
+    导出脚本 (``da3_export/head.py``) 只返回 ``depth`` 与 ``depth_conf``，
+    **没有 ray 导出路径**。要打通需要改 model-zoo 的导出脚本，且换成更大的
+    模型：论文 Tab.2 显示 DA3-Base 的位姿 Auc3 只有 DA3-Giant 的 1/4
+    （HiRoom 19.0 vs 80.3），位姿精度比深度精度更吃模型规模。
     """
 
     def __init__(

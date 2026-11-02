@@ -197,9 +197,22 @@ name `wdnai`, distribution name `wdnai`.
   `MODEL_SETUP fail`。view 数（10）是**烤进导出**的（`global` 输入
   `[V,L,1,D]`），不是运行期参数 —— 送图张数必须与之一致。
   **当前限制**：只完成基础的 **10-view（多视图融合）** 版本；
-  **单路（单图）深度估计尚未实现** —— 需要一份 V=1 的导出（`global`
-  输入 `[1,L,1,D]`），届时共享显存逻辑不用改，但 `global` 段的 token
-  拼装要改。
+  **单路（单图）深度估计尚未实现**。
+  **换 V 不需要改 SDK** —— `self.views` 是从 `global` 的输入张量属性上读
+  出来的，重新导出 `--views N`（model-zoo 已验证 1-10）即可，`estimate()`
+  的张数校验与报错文案自动跟着变。
+  实测（RK3588；用重复帧填充槽位模拟有效 view 数递减，始终比较同一张图
+  的深度）：10→5 偏 **1.58%**、10→3 偏 **2.59%**、10→1 偏 **4.14%**，
+  收益递减但未饱和（5 帧吃到 62% 的收益）；**顺序不重要**（逆序 3.98%，
+  空间相关系数 0.998 —— `global` 是集合式跨 view 注意力，不是时序建模）；
+  **跨场景拼帧是灾难**（偏 62%，深度尺度塌掉，confidence 崩到 1/3）。
+  实时流的 V 帧必须来自同一段连续视频。`confidence` **不能**用来判断
+  view 数好坏（退化输入下它反而最高）。
+  **多相机几何当前走不通**：多相机融合需要相机位姿，而位姿在官方模型里靠
+  **ray map**（每像素 6 通道）隐式表示 —— model-zoo 的
+  `da3_export/head.py` 只返回 `depth` + `depth_conf`，**没有 ray 导出路径**；
+  且论文 Tab.2 显示 DA3-Base 的位姿 Auc3 只有 DA3-Giant 的 1/4
+  （HiRoom 19.0 vs 80.3），**位姿比深度更吃模型规模**。
   像素侧全部按 C++ 的**实际行为**对齐，三处不对齐就会让深度图差一两个
   fp16 ULP：① resize 被 GCC 融合成 FMA（见 `preprocess_image_rgb`）；
   ② fp16→fp32 用 C++ 的 `fp16_to_fp32`（**不处理 fp16 非规格化数**，
@@ -393,8 +406,10 @@ name `wdnai`, distribution name `wdnai`.
   **`examples/README.md` 是 sample 的对外文档**：新增 sample 必须在
   该 README 里加一节，固定 4 个小节 —— **怎么跑 / 输入 / 输出 /
   容易踩的坑**，外加「素材目录约定」（素材放 `examples/<sample 同名>/`，
-  清单用裸文件名相对自身目录解析）。当前只有 `depth_anything_v3` 一节
-  已按此记录，其余 sample 逐个补齐。
+  清单用裸文件名相对自身目录解析）；性能敏感 / any-view 类模型再加
+  **「性能实测」**和**「view 数与实时流」**两节。
+  已按此记录的有 `depth_anything_v3` 与 `qwen_image_21` 两节，
+  其余 sample 逐个补齐。
 - `samples/` — 命令行入口（与 `examples/` 的 `.py` demo 平行）。目前只有
   `qwenimage21.sh`：不写 Python 也能出图，参数与板端 `test.sh` 一致
   （`bash samples/qwenimage21.sh "提示词" [步数] [--out 目录] [--fixed]`），
