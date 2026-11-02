@@ -993,7 +993,8 @@ def _verify_depth_anything_v3_files() -> None:
 #
 #     llm_qwenimage21-te.1828.rknn + .weight       text encoder (prompt → ehs)
 #     qwenimage21-te.embed.bin + .tokenizer.gguf   tokenizer / embedding table
-#     dit_qwenimage21-512.seg{0..3}.1828.rknn + .weight   DiT, 4 × 8 blocks
+#     dit_qwenimage21-512hc.seg{0..3}.1828.rknn + .weight   DiT, 4 × 8 blocks（切头单卡）
+#     dit_qwenimage21-512.head.1828.rknn + .weight            DiT 的「头」（独立卡）
 #     vae_qwenimage21-512.seg{0..3}.1828.rknn + .weight   VAE decoder, 4 segments
 #     reference_512/hidden_states.bin               初始噪声
 #     runtime/qwen_image_rknn (+ runtime/lib/aarch64)      C++ 运行时
@@ -1009,10 +1010,22 @@ _QWEN_IMAGE_21_REQUIRED = [
     "qwenimage21-te.tokenizer.gguf",
     "reference_512/hidden_states.bin",
 ] + [
-    f"{part}_qwenimage21-512.seg{i}.{ext}"
-    for part in ("dit", "vae")
+    f"vae_qwenimage21-512.seg{i}.{ext}"
     for i in range(4)
     for ext in ("1828.rknn", "weight")
+]
+
+#: DiT 拓扑（2026-11-02 第三十五轮：**只剩切头单卡一套**）。
+#:
+#: 老拓扑（4 段各自带头、DiT 占两张卡）已废弃并从模型包中删除。
+#: 现在 DiT = 4 段（段内无头，共享 internal）+ 独立的头模型（另一张卡）。
+_QWEN_IMAGE_21_DIT_FILES = [
+    f"dit_qwenimage21-512hc.seg{i}.{ext}"
+    for i in range(4)
+    for ext in ("1828.rknn", "weight")
+] + [
+    "dit_qwenimage21-512.head.1828.rknn",
+    "dit_qwenimage21-512.head.weight",
 ]
 
 
@@ -1048,7 +1061,12 @@ def _qwen_image_21_dir() -> Path:
 
 
 def _verify_qwen_image_21_files() -> None:
-    """Raise :class:`FileNotFoundError` listing any missing package file."""
+    """Raise :class:`FileNotFoundError` listing any missing package file.
+
+    The DiT part must be the **head-cut single-card** set (2026-11-02 第三十五轮):
+    4 段（段内无头）+ 独立的头模型 ⇒ DiT 只占**一张**卡，另一张卡留给常驻 TE。
+    老的双卡拓扑（``dit_qwenimage21-512.seg*``）已废弃。
+    """
     try:
         d = _qwen_image_21_dir()
     except OSError as e:
@@ -1056,6 +1074,9 @@ def _verify_qwen_image_21_files() -> None:
             f"Qwen-Image-2.1 directory resolution failed: {e}"
         )
     missing = [f for f in _QWEN_IMAGE_21_REQUIRED if not (d / f).is_file()]
+    miss = [f for f in _QWEN_IMAGE_21_DIT_FILES if not (d / f).is_file()]
+    if miss:
+        missing.append("[DiT] " + ", ".join(miss))
     if missing:
         raise FileNotFoundError(
             f"Qwen-Image-2.1 files missing under {d}: {missing}. "
@@ -1431,6 +1452,10 @@ class SystemLanguageModel:
             use a fresh random initial noise per image (default ``True``).
             Set to ``False`` to get bit-reproducible output for a fixed
             prompt.
+        ``card0`` / ``card1``
+            the two RK1828 devices (PCI ids) — card 0 hosts the resident
+            TE + the DiT head, card 1 hosts the 4 DiT segments and then
+            the streaming VAE.
         """
         _verify_qwen_image_21_files()
         return ModelSpec(

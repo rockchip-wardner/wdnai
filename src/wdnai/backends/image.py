@@ -6,7 +6,7 @@ Qwen-Image-2.1 is a three-part diffusion model:
 part         role                              RKNN artefacts
 ===========  =================================  ==================================
 TE           prompt → ``encoder_hidden_states``  ``llm_qwenimage21-te.*``
-DiT          flow-match *N* steps → latents      ``dit_qwenimage21-512.seg{0..3}.*``
+DiT          flow-match *N* steps → latents      ``dit_qwenimage21-512hc.seg{0..3}.*``
 VAE          latents → 512×512 image            ``vae_qwenimage21-512.seg{0..3}.*``
 ===========  =================================  ==================================
 
@@ -16,15 +16,20 @@ The three-part orchestration on rk1820 is **not** a straight port of the
 upstream pipeline. Every one of the rules below was measured on real
 hardware and is encoded in the C++ runtime ``qwen_image_rknn``:
 
-* the DiT is cut into 4 × 8-block segments that must sit **two per card**
-  (four on one card does not fit into the 639.5 MiB/core pool);
+* the DiT is cut into 4 × 8-block segments; each segment used to carry
+  its own copy of the transformer *head* (``timestep_embedder`` +
+  ``modulation``), so the head was **cut out** into a standalone model
+  (zero numerical loss) and the 4 segments then fit on **one** card
+  with ``--share-internal``;
+* the head model **must** live on a different card than the segments;
 * the VAE is a 4-segment chain that must run **streaming** — all four
   segments resident at once dies with ``MODEL_SETUP fail``;
 * the VAE's per-segment IO has to satisfy
   ``core0 internal peak + that segment's IO ≤ 639.5 MiB``, because the
   runtime pins every tensor of a segment to ``slot.attr.core_id``;
-* TE cannot co-reside with DiT: its weights alone are 486 MiB/core, so
-  TE has to run in its own process and release the pool afterwards.
+* TE **can** now co-reside with the head (486.0 + 6.4 = 492.4 MiB/core)
+  ⇒ it stays resident in the same process and encodes every prompt in
+  ~0.16 s instead of paying a 36.8 s ``model_init`` per prompt.
 
 Re-deriving all of that in Python would duplicate a lot of subtle,
 hard-won knowledge for no benefit, so this backend **drives that binary**
@@ -34,11 +39,24 @@ as a subprocess and reads the resulting image back — the same shape as
 The consequence: this module contains **no** ``librknn3`` import at all,
 so importing it on a non-RK host is harmless.
 
+Card layout (2026-11-02 第三十五轮)::
+
+    card 0 : TE 常驻 (486.0 MiB/core) + DiT 头 (6.4 MiB/core) = 492.4
+    card 1 : DiT 4 段 (525.0 MiB/core, --share-internal)
+             → N 张图跑完 → 释放 → VAE 4 段流式 (峰值 516.5)
+
+Weights are read **straight from the model package** (NVMe) — no tmpfs
+staging. Measured: the ``load`` (weight registration) time is identical
+either way; the only cost is ~3.6 s per segment inside ``model_init``
+(a one-off ~14 s for the 4 DiT segments).
+
 Layout of the model package (see ``/home/rockchip/models/qwenimage21``)::
 
     llm_qwenimage21-te.1828.rknn / .weight
     qwenimage21-te.embed.bin / .tokenizer.gguf
-    dit_qwenimage21-512.seg{0..3}.1828.rknn / .weight
+    dit_qwenimage21-512hc.seg{0..3}.1828.rknn / .weight   DiT 4 段（切头）
+    dit_qwenimage21-512.head.1828.rknn / .weight          DiT 的「头」（另一张卡）
+    dit_qwenimage21-512hc.int_ledger                     每核 internal 账本（跳探针）
     vae_qwenimage21-512.seg{0..3}.1828.rknn / .weight
     reference_512/hidden_states.bin      ← 初始噪声
     runtime/qwen_image_rknn               ← C++ 运行时（+ runtime/lib/aarch64）
@@ -71,14 +89,14 @@ _TE_EMBED = "qwenimage21-te.embed.bin"
 _REF_DIR = "reference_512"
 _N_SEG = 4
 
-#: tmpfs cache names for the staged weights. These deliberately reuse the
-#: names the deploy-side ``test.sh`` already staged — the tmpfs only has
-#: ~0.5 GiB free, so re-staging under different names would fail.
-_DIT_CACHE = ("m512a.weight", "m512b.weight", "m512c.weight", "m512d.weight")
-_VAE_CACHE = (
-    "vae512_f0m.weight", "vae512_f1m.weight",
-    "vae512_f2m.weight", "vae512_f3m.weight",
-)
+#: DiT 段模型 / 权重名模板（切头单卡：4 段在同一张卡 + 头在另一张卡）
+_DIT_MODEL_TPL = "dit_qwenimage21-512hc.seg{i}.1828.rknn"
+_DIT_WEIGHT_TPL = "dit_qwenimage21-512hc.seg{i}.weight"
+_HEAD_MODEL = "dit_qwenimage21-512.head.1828.rknn"
+_HEAD_WEIGHT_NAME = "dit_qwenimage21-512.head.weight"
+
+#: 切头变体的每核 internal 账本（跳探针用）。跟这批 .rknn 绑定，换模型必须重测。
+_INT_LEDGER_NAME = "dit_qwenimage21-512hc.int_ledger"
 
 #: 512×512 uses ``mu = 0.5387096774`` (latent sequence length 1024).
 #: The 1024×1024 value (0.6935483871) is **wrong** here.
@@ -87,9 +105,6 @@ _FM_MU_512 = "0.5387096774"
 #: Default board topology (2 × RK1828 behind the RK3588 host).
 _CARD0 = "0000:01:00.0"
 _CARD1 = "0003:31:00.0"
-
-#: Where the weights are staged for fast (RAM-speed) loading.
-_TMPFS_DIR = "/mnt/qi_w"
 
 #: Fallback deployment roots, searched when the model package does not
 #: carry its own ``runtime/`` copy.
@@ -171,33 +186,6 @@ def _write_png(path: Path, rgb: Any) -> None:
     png += chunk(b"IDAT", zlib.compress(raw, 6))
     png += chunk(b"IEND", b"")
     Path(path).write_bytes(png)
-
-
-def _free_bytes(path: Path) -> int:
-    """Free bytes on the filesystem holding ``path`` (0 if unknown)."""
-    try:
-        st = os.statvfs(str(path))
-        return int(st.f_bavail) * int(st.f_frsize)
-    except (OSError, AttributeError):
-        return 0
-
-
-def _is_tmpfs(path: Path) -> bool:
-    """True when ``path`` lives on a tmpfs (RAM) mount."""
-    try:
-        with open("/proc/mounts", "r") as fh:
-            for line in fh:
-                fields = line.split()
-                if len(fields) < 3:
-                    continue
-                mount, fstype = fields[1], fields[2]
-                if fstype != "tmpfs":
-                    continue
-                if str(path) == mount or str(path).startswith(mount.rstrip("/") + "/"):
-                    return True
-    except OSError:
-        pass
-    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -307,10 +295,11 @@ class ImageBackend:
         wanted = [
             _TE_RKNN, _TE_WEIGHT, _TE_TOKENIZER, _TE_EMBED,
             str(Path(_REF_DIR) / "hidden_states.bin"),
+            _HEAD_MODEL, _HEAD_WEIGHT_NAME,
         ]
         for i in range(_N_SEG):
-            wanted.append(f"dit_qwenimage21-512.seg{i}.1828.rknn")
-            wanted.append(f"dit_qwenimage21-512.seg{i}.weight")
+            wanted.append(_DIT_MODEL_TPL.format(i=i))
+            wanted.append(_DIT_WEIGHT_TPL.format(i=i))
             wanted.append(f"vae_qwenimage21-512.seg{i}.1828.rknn")
             wanted.append(f"vae_qwenimage21-512.seg{i}.weight")
         return [w for w in wanted if not (d / w).is_file()]
@@ -338,8 +327,8 @@ class ImageBackend:
         self.sink.reset()
         t_start = time.perf_counter()
         try:
-            # ① TE — must own the card pool alone; the process exits and
-            #    releases it before the DiT is initialised.
+            # ① TE — 提示词写进 te_dir，由 serve 里的**常驻 TE** 编码
+            #    （TE 与 DiT 的头共卡 0 ⇒ 不再单独起进程、不再付 36.8 s init）
             self.sink.emit("[Qwen-Image-2.1] 编码提示词 …")
             t0 = time.perf_counter()
             self._run_te(prompt, te_dir, opts)
@@ -410,7 +399,6 @@ class ImageBackend:
             "noise_seed": 0,
             "card0": _CARD0,
             "card1": _CARD1,
-            "tmpfs_dir": _TMPFS_DIR,
             "work_dir": None,
             "keep_artifacts": False,
             "verbose": bool(getattr(self.spec, "verbose", True)),
@@ -451,6 +439,20 @@ class ImageBackend:
         env["QI_SPREAD_IO"] = "0"
         env["QI_SPREAD_IO_IN"] = "1"
         env.setdefault("RKNN3_NETWORK_SOCKET_FILE", "/tmp/rk-mdns.ini")
+        # ⭐⭐⭐ 切头变体：跳过「探针」。
+        #   --share-internal 必须先探出每段的 internal 需求才能算共享块，
+        #   而**探针 = 又一次完整的 load + model_init**（4 段 ≈ 25.4 s）
+        #   ⇒ 模型被 init 了**两遍** ⇒ 常驻 init 51.0 s。
+        #   喂一份外置账本（QI_INT_PER_CORE）⇒ init 降到 24.9 s，**数值逐字节不变**。
+        #   ⚠️ 账本跟这批 .rknn 绑定（换模型必须重测），偏小会让 runtime 写越界
+        #   ⇒ 只认**随模型包发布**的账本文件，缺失就退回探针（慢但正确）。
+        if not env.get("QI_INT_PER_CORE"):
+            ledger = self.model_dir / _INT_LEDGER_NAME
+            if ledger.is_file():
+                try:
+                    env["QI_INT_PER_CORE"] = ledger.read_text().strip().replace(" ", "")
+                except OSError:
+                    pass
         return env
 
     def _ensure_proxy(self) -> None:
@@ -492,84 +494,68 @@ class ImageBackend:
             return False
         return any(c.startswith("rknn3_transfer_") for c in out.split())
 
-    def _stage_weights(self, opts: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-        """Return the weight paths to hand to the runtime.
+    # -- weight paths ------------------------------------------------------ #
+    def _weight_paths(self) -> Tuple[List[str], List[str]]:
+        """Return the DiT / VAE weight paths to hand to the runtime.
 
-        Prefers a tmpfs copy (RAM-speed load) and falls back to the
-        on-disk model package when the tmpfs is missing or full.
+        ⚠️ 2026-11-02 第三十五轮：**直接用模型包里的 .weight**（不再暂存到 tmpfs）。
+
+        实测（板端）：NVMe 直读与 tmpfs 的 ``load``（权重登记）时间一样
+        （17~40 ms），唯一代价是 ``model_init`` 慢 ~3.6 s/段
+        （DiT 4 段 ≈ +14 s，**一次性**）。
+
+        ⇒ 因此彻底去掉 tmpfs 那一整套（暂存 / 互斥清理 / 大小校验），
+          也顺带消灭了「两套变体同名权重错配」那个雷（变体现在只有一套）。
         """
-        tmpfs = Path(str(opts["tmpfs_dir"]))
-        use_tmpfs = tmpfs.is_dir() and _is_tmpfs(tmpfs)
         dit: List[str] = []
         vae: List[str] = []
-        if not use_tmpfs:
-            _log("tmpfs 不可用 ⇒ 直接从模型包读权重（会慢一些）")
-            for i in range(_N_SEG):
-                dit.append(str(self.model_dir / f"dit_qwenimage21-512.seg{i}.weight"))
-                vae.append(str(self.model_dir / f"vae_qwenimage21-512.seg{i}.weight"))
-            return dit, vae
-
-        free = _free_bytes(tmpfs)
         for i in range(_N_SEG):
-            dit.append(self._stage_one(
-                tmpfs, _DIT_CACHE[i], self.model_dir / f"dit_qwenimage21-512.seg{i}.weight", free,
-            ))
-            vae.append(self._stage_one(
-                tmpfs, _VAE_CACHE[i], self.model_dir / f"vae_qwenimage21-512.seg{i}.weight", free,
-            ))
+            dit.append(str(self.model_dir / _DIT_WEIGHT_TPL.format(i=i)))
+            vae.append(str(self.model_dir / f"vae_qwenimage21-512.seg{i}.weight"))
         return dit, vae
-
-    def _stage_one(self, tmpfs: Path, name: str, src: Path, free: int) -> str:
-        dst = tmpfs / name
-        if dst.is_file():
-            return str(dst)
-        try:
-            size = src.stat().st_size
-        except OSError:
-            return str(src)
-        if free < size + (64 << 20):   # 留 64 MiB 余量
-            _log(f"tmpfs 空间不足（剩 {free >> 20} MiB）⇒ {name} 直接从模型包读")
-            return str(src)
-        _log(f"暂存权重到 tmpfs：{name}")
-        try:
-            shutil.copyfile(str(src), str(dst))
-        except OSError as exc:
-            _log(f"暂存失败（{exc}）⇒ 直接从模型包读")
-            return str(src)
-        return str(dst)
 
     # -- the two runtime invocations ------------------------------------- #
     def _run_te(self, prompt: str, te_dir: Path, opts: Dict[str, Any]) -> None:
-        d = self.model_dir
-        cmd = [
-            str(self.binary), "te-plain",
-            "--model", str(d / _TE_RKNN),
-            "--weight", str(d / _TE_WEIGHT),
-            "--tokenizer", str(d / _TE_TOKENIZER),
-            "--embed", str(d / _TE_EMBED),
-            "--prompt", prompt,
-            "--output", str(te_dir),
-        ]
-        self._ensure_proxy()
-        self._run_cmd(cmd, opts, float(opts["timeout_te"]), "TE")
-        if not (te_dir / "encoder_hidden_states.bin").is_file():
-            raise RuntimeError("TE 没有产出 encoder_hidden_states.bin")
+        # ⭐⭐⭐ 2026-11-02 第三十五轮：**TE 常驻**。
+        #   TE 的 model_init 要 36.8 s、真推理只要 0.16 s ⇒ 不再单独起 te-plain 进程，
+        #   改成「把 prompt 写进目录，serve 里的常驻 TE 负责编码」。
+        #   ⇒ 每张图省掉 37 s（批量 N 张时省 N×37 s）。
+        te_dir.mkdir(parents=True, exist_ok=True)
+        (te_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
     def _run_serve(self, te_dir: Path, out_dir: Path, opts: Dict[str, Any]) -> None:
         d = self.model_dir
-        dit_w, vae_w = self._stage_weights(opts)
+        dit_w, vae_w = self._weight_paths()
 
-        dit_models = [str(d / f"dit_qwenimage21-512.seg{i}.1828.rknn") for i in range(_N_SEG)]
+        dit_models = [str(d / _DIT_MODEL_TPL.format(i=i)) for i in range(_N_SEG)]
         vae_models = [str(d / f"vae_qwenimage21-512.seg{i}.1828.rknn") for i in range(_N_SEG)]
-        device_list = ",".join([
-            opts["card0"], opts["card0"], opts["card1"], opts["card1"],
-        ])
+        # ⭐⭐⭐ 2026-11-02 第三十五轮的新布局：
+        #   卡 0 : TE 常驻（486.0 MiB/核）+ 头模型（6.4 MiB/核）= 492.4 ✅
+        #   卡 1 : DiT 4 段（切头单卡，--share-internal）           = 525.0 ✅
+        #          → N 张图跑完 → 释放 → VAE 4 段流式（峰值 516.5）✅
+        # ⚠️ 头**必须与段不同卡** ⇒ 头在卡 0、段在卡 1。
+        device_list = ",".join([opts["card1"]] * _N_SEG)
 
         cmd = [
             str(self.binary), "serve",
             "--models", ",".join(dit_models),
             "--weights", ",".join(dit_w),
             "--device-list", device_list,
+        ]
+        # ⚠️ --share-internal 是单卡的**必要条件**（不加 ⇒ 第 3 段 MODEL_SETUP fail）
+        # ⚠️ 头模型**必须**放在与段不同的卡上 ⇒ 头在卡 0、段在卡 1
+        cmd += [
+            "--share-internal",
+            "--head-model", str(d / _HEAD_MODEL),
+            "--head-weight", str(d / _HEAD_WEIGHT_NAME),
+            "--head-device", str(opts["card0"]),
+            # ⭐ TE 常驻（与头共卡 0）：每张图只做一次 0.16 s 的推理
+            "--te-resident",
+            "--te-model", str(d / _TE_RKNN),
+            "--te-weight", str(d / _TE_WEIGHT),
+            "--te-tokenizer", str(d / _TE_TOKENIZER),
+            "--te-embed", str(d / _TE_EMBED),
+            "--te-device", str(opts["card0"]),
             "--te-dirs", str(te_dir),
             "--input-dir", str(d / _REF_DIR),
             "--output", str(out_dir),
@@ -775,12 +761,39 @@ def _resolve_binary(model_dir: Path) -> Path:
 
     for cand in candidates:
         if cand.is_file() and os.access(str(cand), os.X_OK):
+            _check_runtime_flags(cand)
             return cand
     raise FileNotFoundError(
         "找不到 qwen_image_rknn 运行时（试过：{}）".format(
             ", ".join(str(c) for c in candidates)
         )
     )
+
+
+#: 运行时必须认识的参数。少一个就说明二进制**过期**了。
+#:
+#: ⛔ 2026-11-02 第三十五轮踩到：模型包 ``runtime/`` 里那份二进制是旧的
+#: （没有 ``--te-resident``）⇒ 它会**默默忽略**新参数 ⇒ 走回「读 te 目录里
+#: 现成的 encoder_hidden_states.bin」的老路 ⇒ 报「TE 目录 xxx 里缺
+#: encoder_hidden_states.bin」，**白等 79 s**。
+_REQUIRED_RUNTIME_FLAGS = ("te-resident", "share-internal", "head-model", "vae-stream")
+
+
+def _check_runtime_flags(binary: Path) -> None:
+    """Raise :class:`RuntimeError` if ``binary`` predates a required flag."""
+    try:
+        blob = binary.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"读不了运行时 {binary}: {exc}") from exc
+    missing = [f for f in _REQUIRED_RUNTIME_FLAGS if f.encode() not in blob]
+    if missing:
+        raise RuntimeError(
+            "运行时太旧：{} 不支持 --{}。"
+            "（模型包 runtime/ 里的副本可能是旧的）"
+            "⇒ 重新 make，并把 bin/qwen_image_rknn 同步到模型包的 runtime/".format(
+                binary, ", ".join(missing),
+            )
+        )
 
 
 def _resolve_lib_dir(binary: Path) -> Path:

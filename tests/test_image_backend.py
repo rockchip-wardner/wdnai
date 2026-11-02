@@ -28,6 +28,7 @@ from wdnai.backends import image as image_mod
 from wdnai.backends.image import (
     ImageBackend,
     _DTYPES,
+    _check_runtime_flags,
     _read_meta,
     _resolve_binary,
     _resolve_model_dir,
@@ -62,23 +63,64 @@ def test_model_dir_falls_back_to_env(tmp_path, monkeypatch):
     assert _resolve_model_dir(spec) == tmp_path
 
 
+def _fake_runtime(path: Path, *, with_flags: bool = True) -> Path:
+    """写一个「像运行时」的假二进制。
+
+    ⚠️ 2026-11-02 第三十五轮：``_resolve_binary`` 现在会做**版本护栏**
+    （老 runtime 会**默默忽略** ``--te-resident`` ⇒ 走回老路 ⇒ 白等 79 s），
+    所以测试用的假二进制必须**带上关键参数的特征串**。
+    """
+    blob = b"\x7fELF" + (b"\x00" * 64)
+    if with_flags:
+        blob += b"te-resident share-internal head-model vae-stream"
+    path.write_bytes(blob)
+    path.chmod(0o755)
+    return path
+
+
 def test_binary_resolution_prefers_packaged_runtime(tmp_path, monkeypatch):
     """模型包自带 runtime/ 时优先用它（模型包自包含）。"""
     pkg = tmp_path / "pkg"
     (pkg / "runtime").mkdir(parents=True)
-    binary = pkg / "runtime" / "qwen_image_rknn"
-    binary.write_bytes(b"x")
-    binary.chmod(0o755)
+    binary = _fake_runtime(pkg / "runtime" / "qwen_image_rknn")
     monkeypatch.delenv("WDNAI_QWEN_IMAGE_BIN", raising=False)
     assert _resolve_binary(pkg) == binary
 
 
 def test_binary_resolution_env_override(tmp_path, monkeypatch):
-    custom = tmp_path / "my_bin"
-    custom.write_bytes(b"x")
-    custom.chmod(0o755)
+    custom = _fake_runtime(tmp_path / "my_bin")
     monkeypatch.setenv("WDNAI_QWEN_IMAGE_BIN", str(custom))
     assert _resolve_binary(tmp_path) == custom
+
+
+def test_stale_runtime_is_rejected(tmp_path, monkeypatch):
+    """⭐ 模型包里的运行时副本**过期** ⇒ 必须**立刻报错**，不能默默跑老路。
+
+    2026-11-02 实测：包里的旧二进制没有 ``--te-resident`` ⇒ 默默忽略 ⇒
+    走回「读 te 目录里现成的 encoder_hidden_states.bin」的老路 ⇒
+    报「TE 目录里缺 encoder_hidden_states.bin」，**白等 79 s**。
+    """
+    pkg = tmp_path / "pkg"
+    (pkg / "runtime").mkdir(parents=True)
+    _fake_runtime(pkg / "runtime" / "qwen_image_rknn", with_flags=False)
+    monkeypatch.delenv("WDNAI_QWEN_IMAGE_BIN", raising=False)
+    with pytest.raises(RuntimeError) as exc:
+        _resolve_binary(pkg)
+    assert "太旧" in str(exc.value)
+    assert "te-resident" in str(exc.value)
+
+
+def test_runtime_flag_check_names_every_missing_flag(tmp_path):
+    """缺的每个参数都要在报错里列出来（否则没法判断该同步哪个版本）。"""
+    bad = tmp_path / "old_runtime"
+    bad.write_bytes(b"\x7fELF te-resident share-internal")
+    bad.chmod(0o755)
+    with pytest.raises(RuntimeError) as exc:
+        _check_runtime_flags(bad)
+    msg = str(exc.value)
+    assert "head-model" in msg
+    assert "vae-stream" in msg
+    assert "te-resident" not in msg
 
 
 # --------------------------------------------------------------------------- #

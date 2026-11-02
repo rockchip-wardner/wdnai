@@ -27,15 +27,17 @@
 
     llm_qwenimage21-te.1828.rknn + .weight       text encoder
     qwenimage21-te.embed.bin + .tokenizer.gguf   tokenizer / embedding
-    dit_qwenimage21-512.seg{0..3}.1828.rknn + .weight   DiT（4 × 8 blocks）
+    dit_qwenimage21-512hc.seg{0..3}.1828.rknn + .weight   DiT（4 × 8 blocks，切头）
+    dit_qwenimage21-512.head.1828.rknn + .weight            DiT 的「头」（独立卡）
+    dit_qwenimage21-512hc.int_ledger                         每核 internal 账本
     vae_qwenimage21-512.seg{0..3}.1828.rknn + .weight   VAE（4 段链）
     reference_512/hidden_states.bin              初始噪声
     runtime/qwen_image_rknn                       C++ 运行时
 
-⏱ 耗时（板端实测，RK3588 + 2×RK1828）：8 步约 **94 s**（TE 37 s + DiT
-init 25 s + flow-match 21 s + VAE 10 s）；步数是纯运行时参数，模型不用
-重建。TE 的权重本身占 486 MiB/核，与 DiT **物理无法共卡**，所以每次换
-提示词都要重跑 TE —— 这是这套架构的天花板，不是 bug。
+⏱ 耗时（板端实测，RK3588 + 2×RK1828，8 步）：**TE 与 DiT 常驻**
+（卡 0 = TE + 头，卡 1 = DiT 4 段 → VAE），一次性 init ≈ 78 s，
+之后**每张图 ≈ 34 s**（flow-match 21 s + VAE 11 s），TE 编码只要 0.16 s。
+步数是纯运行时参数，模型不用重建。
 
 执行::
 
@@ -67,7 +69,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--prompt", required=True, help="要画的提示词")
     p.add_argument("--steps", type=int, default=8,
-                   help="flow-match 步数（8 步 ≈ 94 s；20 步更清晰 ≈ 125 s；40 步 = 上游默认）")
+                   help="flow-match 步数（8 步稳态 ≈ 34 s/张；20 步更清晰 ≈ 55 s/张；40 步 = 上游默认）")
     p.add_argument("--output", "-o", type=Path, default=Path("output.png"),
                    help="输出 PNG 路径")
     p.add_argument("--model-dir", type=Path, default=None,
@@ -85,6 +87,21 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+def resolve_output_path(raw: Path) -> Path:
+    """把 ``--output`` 归一成「带受支持后缀的文件路径」。
+
+    OpenCV 靠扩展名挑编码器：给目录、或者干脆不给后缀，都会报
+    ``could not find a writer for the specified extension``（而且
+    ``imwrite`` 只返回 False、不抛异常 ⇒ 很容易被当成「出图失败」）。
+    这里统一补成 ``<目录>/img01.png`` 或 ``<路径>.png``。
+    """
+    if raw.is_dir():
+        return raw / "img01.png"
+    if not raw.suffix:
+        return raw.with_suffix(".png")
+    return raw
+
+
 async def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -108,18 +125,20 @@ async def main() -> None:
         )
         elapsed = time.perf_counter() - t0
 
-        args.output.parent.mkdir(parents=True, exist_ok=True)
+        out_path = resolve_output_path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             import cv2
 
-            cv2.imwrite(str(args.output), img)
+            if not cv2.imwrite(str(out_path), img):
+                LOG.warning("写 PNG 失败（%s）", out_path)
         except Exception as exc:  # noqa: BLE001 — 落盘失败不该掩盖出图结果
             LOG.warning("写 PNG 失败（%s）", exc)
 
         LOG.info("图像 shape=%s dtype=%s", img.shape, img.dtype)
         print(
             f"[qwen-image-2.1] done. steps={args.steps} "
-            f"shape={img.shape} elapsed={elapsed:.1f}s -> {args.output}"
+            f"shape={img.shape} elapsed={elapsed:.1f}s -> {out_path}"
         )
     finally:
         session.close()
