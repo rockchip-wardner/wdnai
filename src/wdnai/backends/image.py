@@ -61,7 +61,9 @@ Layout of the model package (see ``/home/rockchip/models/qwenimage21``)::
     dit_qwenimage21-512.head.1828.rknn / .weight          DiT 的「头」（另一张卡）
     dit_qwenimage21-512hc.int_ledger                     每核 internal 账本（跳探针）
     vae_qwenimage21-512.seg{0..3}.1828.rknn / .weight
-    reference_512/hidden_states.bin      ← 初始噪声（--fixed 用）
+
+⭐ 模型包里**只有模型**：「固定初始噪声」由 cshim 现场生成
+   （numpy 兼容的 PCG64 + ziggurat，与历史基线逐字节一致）。
 """
 from __future__ import annotations
 
@@ -90,7 +92,6 @@ _TE_RKNN = "llm_qwenimage21-te.1828.rknn"
 _TE_WEIGHT = "llm_qwenimage21-te.weight"
 _TE_TOKENIZER = "qwenimage21-te.tokenizer.gguf"
 _TE_EMBED = "qwenimage21-te.embed.bin"
-_REF_DIR = "reference_512"
 _N_SEG = 4
 
 #: DiT 段模型 / 权重名模板（切头单卡：4 段在同一张卡 + 头在另一张卡）
@@ -318,7 +319,6 @@ class ImageBackend:
         d = self.model_dir
         wanted = [
             _TE_RKNN, _TE_WEIGHT, _TE_TOKENIZER, _TE_EMBED,
-            str(Path(_REF_DIR) / "hidden_states.bin"),
             _HEAD_MODEL, _HEAD_WEIGHT_NAME,
             _INT_LEDGER_NAME,
         ]

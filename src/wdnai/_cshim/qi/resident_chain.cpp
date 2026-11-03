@@ -470,7 +470,7 @@ int ResidentChain::init(const std::vector<std::string>& models,
   // ⚠️ 顺序：model_init 之后才能 set_internal_mem。
   //
   // ⭐⭐⭐ 2026-10-31 关键修正（实测得出，见 debug.md §61.7）：
-  //   **「每段各自 create_mem」得到的��� 8 份独立内存，并不共享**（旧实现就是这个，
+  //   **「每段各自 create_mem」得到的是 8 份独立内存，并不共享**（旧实现就是这个，
   //   所以共享一直没真正生效）。
   //   实测可行的是：**在组内第一个 context 上 create_mem，然后把同一个 mem 数组
   //   直接传给组内其它 context 的 rknn3_set_internal_mem()** ⇒ 真正共享同一块物理内存。

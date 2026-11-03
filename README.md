@@ -162,7 +162,9 @@ bgr = out.attachment[0].images[0]
 ⭐⭐⭐ **运行时是 wdnai 自己的 C shim**（`src/wdnai/_cshim/libqi_qwen.so`，
 **源码随包发布**）—— 不是外部二进制、也不是任何 Rockchip 的闭源产物。
 它只链**系统自带**的 `librknn3_api.so` ⇒
-模型包里**只有模型**，不���任何 `.so` / 可执行文件。
+模型包里**只有模型**，不含任何 `.so` / 可执行文件。
+⭐ 连「固定初始噪声」也是 cshim **现场生成**的（numpy 兼容的 PCG64 + ziggurat，
+与历史基线**逐字节一致**）⇒ 包里**连数据文件都不用带**。
 
 ```bash
 # cshim 在 pip install 时自动编译；也可手动：

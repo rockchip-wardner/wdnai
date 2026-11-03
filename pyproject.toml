@@ -45,4 +45,6 @@ wdnai = [
     "_cshim/qi/*.h",
     "_cshim/qi/*.cpp",
     "_cshim/libqi_qwen.so",
+    # 生成 ziggurat 常量表的脚本（np_zig_tables.h 是它生成的，勿手改）
+    "_cshim/tools/*.py",
 ]

@@ -15,7 +15,7 @@ CPPFLAGS += -Iinclude -Iqi
 LDFLAGS  ?=
 LDLIBS   := -lrknn3_api -lpthread -ldl -lm
 
-SRCS := qi/api.cpp qi/util.cpp qi/te_encoder.cpp \
+SRCS := qi/api.cpp qi/util.cpp qi/te_encoder.cpp qi/np_noise.cpp \
         qi/rknn3_runner.cpp qi/resident_chain.cpp qi/vae_chain.cpp
 OBJS := $(patsubst qi/%.cpp,build/%.o,$(SRCS))
 TARGET := libqi_qwen.so

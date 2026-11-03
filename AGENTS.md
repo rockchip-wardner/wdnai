@@ -359,18 +359,31 @@ name `wdnai`, distribution name `wdnai`.
   模块 import 阶段打开。
 - `src/wdnai/_cshim/` — ⭐ **文生图的运行时（C 实现，源码在本仓库）**：
   `libqi_qwen.so`（`make` 编出来；`setup.py` 在 `build_py` 阶段自动编）。
-  里面是 `qi/{rknn3_runner,resident_chain,vae_chain,te_encoder,api}` ——
+  里面是 `qi/{rknn3_runner,resident_chain,vae_chain,te_encoder,np_noise,api}` ——
   **模型分段的规则、IO 落位、layout 转换、flow-match 数学全在 C 侧**
   ⇒ 数值行为与基线**逐字节一致**（PNG md5 `4766cd27…` / `7604d7b4…`）。
   **只链系统自带的 `librknn3_api.so`**（门面会 dlopen 系统自带的 rkcp）
   ⇒ 模型包里**不需要任何 .so 或可执行文件**。
   C ABI（Python 只碰这几个）：`qi_qwen_open` / `qi_qwen_te_encode` /
-  `qi_qwen_generate_batch` / `qi_qwen_free` / `qi_qwen_close`。
+  `qi_qwen_generate_batch` / `qi_qwen_fixed_noise` / `qi_qwen_free` / `qi_qwen_close`。
+- `src/wdnai/_cshim/qi/np_noise.{h,cpp}` + `np_zig_tables.h` — ⭐ **固定初始噪声
+  现场生成**（⇒ 模型包里**不用再带** `reference_512/hidden_states.bin`）。
+  里面是 **numpy 兼容的 PCG64（XSL-RR 128/64）+ ziggurat**：
+  历史基线 = `default_rng(0).standard_normal(64**3).reshape(64,64,64)[::2,::2,:]`。
+  ⚠️ **不能用 numpy 现算**（官方只保证「同一 build 内」的流一致，跨版本可能换算法）⇒ 整条链搬进 C。
+  ⚠️ `np_zig_tables.h` 是**自动生成**的（`deploy/scripts/gen_np_zig_tables.py`，
+  数据源 numpy 2.5.3 的 `ziggurat_constants.h`）⇒ **别手改**。
+  ⚠️ `np_noise.cpp` 里 `#pragma GCC optimize("fp-contract=off")` **必须保留**
+  （慢路径判定的 mul+add 被收缩成 FMA 会差 1 ULP ⇒ 临界样本判定翻转）；
+  ⚠️ **但全局 CXXFLAGS 不能关** —— `resident_chain.cpp` 的 FMA 收缩是基线行为的一部分。
+  ⚠️ `fp64_to_fp16_rne` 的次正规位移量是 **`43 - exp`**（fp32 版才是 `14 - exp`）⇒ 别抄错。
 - `src/wdnai/_qwen_image_c.py` — cshim 的 ctypes 绑定 +
   **纯 Python 的 gguf 分词器**（分词留在 Python ⇒ 不需要 Rockchip 的闭源
   `libtokenizer.a`）。⚠️ t2i 模板必须显式带 `<|im_start|>` / `<|im_end|>`
   （Rockchip 的闭源 tokenizer 会自动加，Python 的不会）⇒ 源码里用
   `"<" + "|im_start|>"` 拼，**别写字面量**（会被工具链吞掉）。
+  另有 `fixed_noise()`：返回固定初始噪声（fp16），md5 恒为
+  `b808cf7ecd34338323b783704c516128`（单测守着）。
 - `src/wdnai/backends/image.py` — `ImageBackend`（kind=`image`，文生图
   Qwen-Image-2.1 / RKNN3 rk1820，512×512）。**不再起子进程** ⇒ 改成
   **进程内调 cshim**（`_qwen_image_c.QwenImageShim`）。

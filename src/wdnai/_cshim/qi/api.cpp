@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "np_noise.h"
 #include "rknn3_runner.h"
 #include "resident_chain.h"
 #include "te_encoder.h"
@@ -299,13 +300,26 @@ int qi_qwen_generate_batch(qi_qwen_session* s, int n_images,
       std::vector<uint16_t> h = fresh_noise(n_elem, seed + (uint32_t)img);
       qi::write_file(x_path, h.data(), h.size() * sizeof(uint16_t));
     } else {
-      std::string ref = qi::join_path(s->model_dir, "reference_512/hidden_states.bin");
-      std::vector<unsigned char> buf;
-      if (!qi::read_whole_file(ref, &buf) || buf.size() != n_elem * sizeof(uint16_t)) {
-        set_err(err, err_len, "读参考噪声失败: " + ref);
-        return 1;
+      // 固定噪声：**现场生成**（numpy 兼容的 PCG64 + ziggurat），
+      // 与历史基线 reference_512/hidden_states.bin **逐字节一致**
+      // ⇒ 模型包里不需要再带这个文件。
+      // ⚠️ QI_NOISE_FILE 可强制改用外部文件（A/B 对拍 / 回退用）。
+      const char* force_file = getenv("QI_NOISE_FILE");
+      if (force_file && force_file[0]) {
+        std::vector<unsigned char> buf;
+        if (!qi::read_whole_file(force_file, &buf) || buf.size() != n_elem * sizeof(uint16_t)) {
+          set_err(err, err_len, "读指定噪声文件失败: " + std::string(force_file));
+          return 1;
+        }
+        qi::write_file(x_path, buf.data(), buf.size());
+      } else {
+        std::vector<uint16_t> h;
+        if (!qi::np_fixed_noise_512(&h)) {
+          set_err(err, err_len, "生成固定噪声失败");
+          return 1;
+        }
+        qi::write_file(x_path, h.data(), h.size() * sizeof(uint16_t));
       }
-      qi::write_file(x_path, buf.data(), buf.size());
     }
 
     std::string lat_path = qi::join_path(dir, "latents.bin");
@@ -415,5 +429,26 @@ int qi_qwen_generate_batch(qi_qwen_session* s, int n_images,
 
 // ---------------------------------------------------------------------------
 void qi_qwen_free(void* p) { free(p); }
+
+int qi_qwen_fixed_noise(uint16_t** out_fp16, int* n, char* err, int err_len) {
+  if (!out_fp16 || !n) {
+    set_err(err, err_len, "参数为空");
+    return 1;
+  }
+  std::vector<uint16_t> h;
+  if (!qi::np_fixed_noise_512(&h)) {
+    set_err(err, err_len, "生成固定噪声失败");
+    return 1;
+  }
+  uint16_t* buf = (uint16_t*)malloc(h.size() * sizeof(uint16_t));
+  if (!buf) {
+    set_err(err, err_len, "分配内存失败");
+    return 1;
+  }
+  memcpy(buf, h.data(), h.size() * sizeof(uint16_t));
+  *out_fp16 = buf;
+  *n = (int)h.size();
+  return 0;
+}
 
 const char* qi_qwen_version(void) { return "wdnai-cshim 1.0 (Qwen-Image-2.1, rk1820)"; }

@@ -117,6 +117,35 @@ def test_model_package_ships_no_closed_source_binary():
     assert Path("/usr/lib/librknn3_api_rkcp.so").exists()
 
 
+def test_fixed_noise_is_generated_not_shipped():
+    """⭐ 固定初始噪声必须**现场生成**，且与历史基线逐字节一致。
+
+    历史基线是模型包里的 ``reference_512/hidden_states.bin``，实测由
+    ``np.random.default_rng(0).standard_normal(64**3).reshape(64,64,64)[::2,::2,:]``
+    生成。numpy 只保证「同一 build 内」的流一致，跨版本可能换算法
+    （官方文档举的例子就是 Box-Muller → Ziggurat）⇒ 不能依赖 numpy 现算，
+    cshim 里搬了一份 PCG64 + ziggurat ⇒ 永久逐字节一致。
+    """
+    import hashlib
+
+    from wdnai._qwen_image_c import FIXED_NOISE_MD5, cshim_path, fixed_noise
+
+    if not cshim_path().exists():
+        pytest.skip("cshim 未编译（cd src/wdnai/_cshim && make）")
+    noise = fixed_noise()
+    assert noise.dtype == np.float16
+    assert noise.size == 1024 * 64
+    assert hashlib.md5(noise.tobytes()).hexdigest() == FIXED_NOISE_MD5
+
+
+def test_model_package_needs_no_data_file():
+    """⭐ 模型包里**只剩模型**：初始噪声不再需要随包发布。"""
+    from wdnai.model import _QWEN_IMAGE_21_REQUIRED
+
+    assert "reference_512/hidden_states.bin" not in _QWEN_IMAGE_21_REQUIRED
+    assert not any("reference_512" in f for f in _QWEN_IMAGE_21_REQUIRED)
+
+
 # --------------------------------------------------------------------------- #
 # .meta / .bin 解码
 # --------------------------------------------------------------------------- #

@@ -26,8 +26,8 @@ extern "C" {
 typedef struct qi_qwen_session qi_qwen_session;
 
 /* 噪声模式 */
-#define QI_NOISE_FIXED 0   /* 用 <model_dir>/reference_512/hidden_states.bin */
-#define QI_NOISE_FRESH 1   /* 现场生成（种子 = seed + 图片下标） */
+#define QI_NOISE_FIXED 0   /* 现场生成（numpy 兼容的 PCG64 + ziggurat，与历史基线逐字节一致） */
+#define QI_NOISE_FRESH 1   /* 现场生成（mt19937，种子 = seed + 图片下标） */
 
 /* 打开会话：加载 TE（常驻）+ DiT 头 + DiT 4 段（常驻，共享 internal）。
  * 失败返回 NULL，err 里是中文原因。 */
@@ -67,6 +67,12 @@ int qi_qwen_generate_batch(qi_qwen_session* s,
 
 /* 释放 C API 分配的内存（ehs / mask / rgb） */
 void qi_qwen_free(void* p);
+
+/* 生成「固定初始噪声」（512 路线：1024 token × 64 通道，fp16）。
+ * 与历史基线 reference_512/hidden_states.bin **逐字节一致**
+ * （md5 b808cf7ecd34338323b783704c516128）⇒ 模型包不需要带那个文件。
+ * out_fp16 由 qi_qwen_free 释放；*n 取元素个数（65536）。 */
+int qi_qwen_fixed_noise(uint16_t** out_fp16, int* n, char* err, int err_len);
 
 const char* qi_qwen_version(void);
 

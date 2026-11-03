@@ -988,27 +988,27 @@ def _verify_depth_anything_v3_files() -> None:
 
 # --------------------------------------------------------------------------- #
 # Qwen-Image-2.1: text-to-image (RKNN3 / rk1820). One model package holding
-# all three parts of the diffusion pipeline plus the C++ runtime that drives
-# them. File layout::
+# all three parts of the diffusion pipeline. File layout::
 #
 #     llm_qwenimage21-te.1828.rknn + .weight       text encoder (prompt → ehs)
 #     qwenimage21-te.embed.bin + .tokenizer.gguf   tokenizer / embedding table
 #     dit_qwenimage21-512hc.seg{0..3}.1828.rknn + .weight   DiT, 4 × 8 blocks（切头单卡）
 #     dit_qwenimage21-512.head.1828.rknn + .weight            DiT 的「头」（独立卡）
 #     vae_qwenimage21-512.seg{0..3}.1828.rknn + .weight   VAE decoder, 4 segments
-#     reference_512/hidden_states.bin               初始噪声
-#     runtime/qwen_image_rknn (+ runtime/lib/aarch64)      C++ 运行时
 #
 # The package lives in one flat directory (the ``/mnt/oem/models/`` layout);
 # the per-part file names keep the ``<part>_<Model>.<variant>.1828.rknn``
 # convention.
+#
+# ⭐ 第三十六轮：**包里只剩模型**（无 .so、无可执行文件、无数据文件）。
+#    运行时是 wdnai 自带的 C shim（``wdnai/_cshim``）；「固定初始噪声」由
+#    cshim 现场生成（numpy 兼容的 PCG64 + ziggurat），所以也不需要随包发布。
 # --------------------------------------------------------------------------- #
 _QWEN_IMAGE_21_REQUIRED = [
     "llm_qwenimage21-te.1828.rknn",
     "llm_qwenimage21-te.weight",
     "qwenimage21-te.embed.bin",
     "qwenimage21-te.tokenizer.gguf",
-    "reference_512/hidden_states.bin",
 ] + [
     f"vae_qwenimage21-512.seg{i}.{ext}"
     for i in range(4)

@@ -107,6 +107,11 @@ def _load() -> ctypes.CDLL:
     ]
     lib.qi_qwen_free.restype = None
     lib.qi_qwen_free.argtypes = [ctypes.c_void_p]
+    lib.qi_qwen_fixed_noise.restype = ctypes.c_int
+    lib.qi_qwen_fixed_noise.argtypes = [
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_uint16)), ctypes.POINTER(ctypes.c_int),
+        ctypes.c_char_p, ctypes.c_int,
+    ]
     lib.qi_qwen_version.restype = ctypes.c_char_p
     lib.qi_qwen_version.argtypes = []
     _LIB = lib
@@ -122,7 +127,10 @@ class QwenImageShim:
         模型包目录（必须含 ``llm_qwenimage21-te.*`` / ``dit_qwenimage21-512hc.seg*.*``
         / ``dit_qwenimage21-512.head.*`` / ``vae_qwenimage21-512.seg*.*``
         / ``qwenimage21-te.embed.bin`` / ``qwenimage21-te.tokenizer.gguf``
-        / ``dit_qwenimage21-512hc.int_ledger`` / ``reference_512/``）
+        / ``dit_qwenimage21-512hc.int_ledger``）
+
+        ⭐ 第三十六轮起**包里只有模型**：初始噪声由 cshim 现场生成
+        （numpy 兼容的 PCG64 + ziggurat），不再需要 ``reference_512/``。
     card_te:
         **TE + DiT 头**所在卡（如 ``b"0000:01:00.0"``）
     card_dit:
@@ -270,3 +278,35 @@ class QwenImageShim:
         from .backends.image import _write_png
 
         _write_png(Path(path), rgb)
+
+
+# --------------------------------------------------------------------------- #
+# 「固定初始噪声」（不需要会话）
+# --------------------------------------------------------------------------- #
+#: 历史基线 reference_512/hidden_states.bin 的 md5 —— cshim 现场生成的必须与它一致
+FIXED_NOISE_MD5 = "b808cf7ecd34338323b783704c516128"
+
+
+def fixed_noise() -> np.ndarray:
+    """生成「固定初始噪声」（1024 token × 64 通道，fp16）。
+
+    cshim 内部是 numpy 兼容的 **PCG64 + ziggurat**（不是 libstdc++ 的极坐标法），
+    与历史基线 ``reference_512/hidden_states.bin`` **逐字节一致**
+    （md5 ``b808cf7ecd34338323b783704c516128``）
+    ⇒ 模型包里不需要再带那个文件。
+
+    返回
+    ----
+    np.ndarray
+        形状 (65536,) 的 float16 数组。
+    """
+    lib = _load()
+    p = ctypes.POINTER(ctypes.c_uint16)()
+    n = ctypes.c_int(0)
+    err = ctypes.create_string_buffer(256)
+    rc = lib.qi_qwen_fixed_noise(ctypes.byref(p), ctypes.byref(n), err, ctypes.c_int(len(err)))
+    if rc != 0:
+        raise RuntimeError("生成固定噪声失败：" + err.value.decode("utf-8", "replace"))
+    arr = np.ctypeslib.as_array(p, shape=(n.value,)).copy()
+    lib.qi_qwen_free(p)
+    return arr.view(np.float16)   # ctypes 给的是 uint16 位模式，重新解释成 fp16
