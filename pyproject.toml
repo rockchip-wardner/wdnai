@@ -37,4 +37,12 @@ include = ["wdnai*"]
 exclude = ["tests*", "examples*"]
 
 [tool.setuptools.package-data]
-wdnai = ["models/README.md"]
+wdnai = [
+    "models/README.md",
+    # cshim（Qwen-Image-2.1 文生图运行时）：**源码随包发布**，.so 由 setup.py 现场编译
+    "_cshim/Makefile",
+    "_cshim/include/*.h",
+    "_cshim/qi/*.h",
+    "_cshim/qi/*.cpp",
+    "_cshim/libqi_qwen.so",
+]

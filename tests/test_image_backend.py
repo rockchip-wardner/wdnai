@@ -28,9 +28,7 @@ from wdnai.backends import image as image_mod
 from wdnai.backends.image import (
     ImageBackend,
     _DTYPES,
-    _check_runtime_flags,
     _read_meta,
-    _resolve_binary,
     _resolve_model_dir,
     _write_png,
 )
@@ -63,64 +61,60 @@ def test_model_dir_falls_back_to_env(tmp_path, monkeypatch):
     assert _resolve_model_dir(spec) == tmp_path
 
 
-def _fake_runtime(path: Path, *, with_flags: bool = True) -> Path:
-    """写一个「像运行时」的假二进制。
+# --------------------------------------------------------------------------- #
+# cshim（第三十六轮：不再有闭源二进制）
+# --------------------------------------------------------------------------- #
+def test_cshim_lives_inside_the_python_package():
+    """cshim 必须是 wdnai 包的一部分（源码 + 编译产物都在仓库里）。"""
+    from wdnai._qwen_image_c import cshim_path
 
-    ⚠️ 2026-11-02 第三十五轮：``_resolve_binary`` 现在会做**版本护栏**
-    （老 runtime 会**默默忽略** ``--te-resident`` ⇒ 走回老路 ⇒ 白等 79 s），
-    所以测试用的假二进制必须**带上关键参数的特征串**。
+    so = cshim_path()
+    assert so.parent.name == "_cshim"
+    assert so.name == "libqi_qwen.so"
+    assert so.parent.parent.name == "wdnai"
+
+
+def test_cshim_exports_the_expected_api():
+    """⛔ 没有闭源二进制 ⇒ 出图能力必须来自**我们自己的** .so。"""
+    from wdnai._qwen_image_c import cshim_path
+
+    so = cshim_path()
+    if not so.exists():
+        pytest.skip("cshim 未编译（cd src/wdnai/_cshim && make）")
+    import ctypes
+
+    lib = ctypes.CDLL(str(so))
+    for sym in ("qi_qwen_open", "qi_qwen_close", "qi_qwen_te_encode",
+                "qi_qwen_generate_batch", "qi_qwen_free"):
+        assert hasattr(lib, sym), sym
+
+
+def test_t2i_template_keeps_the_special_tokens():
+    """⭐ 回归护栏：模板必须带 Qwen 的对话特殊 token。
+
+    漏掉它们 ⇒ TE 输出变成「错位切片」⇒ **出图内容完全不对但 corr 依然很高**
+    （2026-11-01 修过一个致命 bug；2026-11-03 在 cshim 侧又踩了一次）。
     """
-    blob = b"\x7fELF" + (b"\x00" * 64)
-    if with_flags:
-        blob += b"te-resident share-internal head-model vae-stream"
-    path.write_bytes(blob)
-    path.chmod(0o755)
-    return path
+    from wdnai._qwen_image_c import build_t2i_template
+
+    t = build_t2i_template("a cat")
+    assert t.count("<" + "|im_start|>") == 3
+    assert t.count("<" + "|im_end|>") == 2
+    assert t.startswith("<" + "|im_start|>system")
 
 
-def test_binary_resolution_prefers_packaged_runtime(tmp_path, monkeypatch):
-    """模型包自带 runtime/ 时优先用它（模型包自包含）。"""
-    pkg = tmp_path / "pkg"
-    (pkg / "runtime").mkdir(parents=True)
-    binary = _fake_runtime(pkg / "runtime" / "qwen_image_rknn")
-    monkeypatch.delenv("WDNAI_QWEN_IMAGE_BIN", raising=False)
-    assert _resolve_binary(pkg) == binary
+def test_model_package_ships_no_closed_source_binary():
+    """⭐ 用户硬要求：发布包里**不得**有不开源的 bin / so。"""
+    from wdnai._qwen_image_c import cshim_path
 
-
-def test_binary_resolution_env_override(tmp_path, monkeypatch):
-    custom = _fake_runtime(tmp_path / "my_bin")
-    monkeypatch.setenv("WDNAI_QWEN_IMAGE_BIN", str(custom))
-    assert _resolve_binary(tmp_path) == custom
-
-
-def test_stale_runtime_is_rejected(tmp_path, monkeypatch):
-    """⭐ 模型包里的运行时副本**过期** ⇒ 必须**立刻报错**，不能默默跑老路。
-
-    2026-11-02 实测：包里的旧二进制没有 ``--te-resident`` ⇒ 默默忽略 ⇒
-    走回「读 te 目录里现成的 encoder_hidden_states.bin」的老路 ⇒
-    报「TE 目录里缺 encoder_hidden_states.bin」，**白等 79 s**。
-    """
-    pkg = tmp_path / "pkg"
-    (pkg / "runtime").mkdir(parents=True)
-    _fake_runtime(pkg / "runtime" / "qwen_image_rknn", with_flags=False)
-    monkeypatch.delenv("WDNAI_QWEN_IMAGE_BIN", raising=False)
-    with pytest.raises(RuntimeError) as exc:
-        _resolve_binary(pkg)
-    assert "太旧" in str(exc.value)
-    assert "te-resident" in str(exc.value)
-
-
-def test_runtime_flag_check_names_every_missing_flag(tmp_path):
-    """缺的每个参数都要在报错里列出来（否则没法判断该同步哪个版本）。"""
-    bad = tmp_path / "old_runtime"
-    bad.write_bytes(b"\x7fELF te-resident share-internal")
-    bad.chmod(0o755)
-    with pytest.raises(RuntimeError) as exc:
-        _check_runtime_flags(bad)
-    msg = str(exc.value)
-    assert "head-model" in msg
-    assert "vae-stream" in msg
-    assert "te-resident" not in msg
+    pkg = Path("/home/rockchip/models/qwenimage21")
+    if not pkg.is_dir():
+        pytest.skip("板端模型包不在本机")
+    assert not (pkg / "runtime" / "qwen_image_rknn").exists()
+    assert not (pkg / "runtime").exists()
+    # 系统自带的门面 + rkcp 就够用（native 从未被加载）
+    assert Path("/usr/lib/librknn3_api.so").exists()
+    assert Path("/usr/lib/librknn3_api_rkcp.so").exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -165,30 +159,52 @@ def test_png_writer_matches_runtime_reference(tmp_path):
     assert out.read_bytes() == expect
 
 
-def test_vae_tensor_decodes_to_bgr(tmp_path):
-    """NCHW [1,4,512,512] fp16 → BGR uint8，且和运行时的归一化一致。"""
-    side = 8
-    plane = side * side
-    # NCHW：通道 0 在 [0:64]，通道 3 是不可见通道（必须被忽略）。
-    data = np.zeros(4 * plane, dtype=np.float16)
-    data[:plane] = np.linspace(-1.0, 1.0, plane, dtype=np.float32)
-    data[3 * plane:] = 0.5
-    raw = tmp_path / "img01_vae_image.bin"
-    raw.write_bytes(data.tobytes())
-    (tmp_path / "img01_vae_image.bin.meta").write_text(
-        "# dtype shape\nfloat16 1,4,8,8\n"
-    )
+def test_run_texts_converts_rgb_to_bgr_and_writes_png(tmp_path, monkeypatch):
+    """cshim 返回 RGB uint8 ⇒ 后端写 PNG 并把附件转成 **BGR**。
 
-    backend = ImageBackend.__new__(ImageBackend)   # 只测解码，不碰路径
-    bgr, png = backend._load_image(tmp_path)
-    assert bgr.shape == (8, 8, 3)
+    （第三十六轮：解码不再走「读 .bin + .meta」，而是 cshim 直接给 RGB。）
+    """
+    rgb = np.zeros((4, 4, 3), dtype=np.uint8)
+    rgb[..., 0] = 10   # R
+    rgb[..., 1] = 20   # G
+    rgb[..., 2] = 30   # B
+
+    class _FakeShim:
+        def generate(self, prompts, **kw):
+            assert list(prompts) == ["a cat"]
+            return [rgb]
+
+        def close(self):
+            pass
+
+    backend = ImageBackend.__new__(ImageBackend)   # 不碰路径解析 / NPU
+    backend.spec = ModelSpec(name="x", kind="image", variant="qwen-image-2.1")
+    backend.model_dir = tmp_path
+    backend.sink = image_mod._ProgressSink()
+    backend.last_log = ""
+    backend.last_artifacts = {}
+    backend._workdir = None
+    backend._owns_workdir = False
+    backend._keep_artifacts = False
+    backend._shim = _FakeShim()
+
+    work = tmp_path / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    backend._make_workdir = lambda opts: work
+
+    results = backend.run_texts(["a cat"], output_dir=str(tmp_path / "copy"))
+    assert len(results) == 1
+    prompt, attachments = results[0]
+    assert prompt == "a cat"
+    bgr = attachments[0].images[0]
+    assert bgr.shape == (4, 4, 3)
     assert bgr.dtype == np.uint8
+    assert int(bgr[0, 0, 2]) == 10   # BGR 的第 2 通道 = R
+    assert int(bgr[0, 0, 0]) == 30   # BGR 的第 0 通道 = B
+    # PNG 与后端自己写的那份**逐字节相同**（复制到 output_dir）
+    png = work / "out" / "img01.png"
     assert png.is_file()
-    # 通道 0/1/2 是 RGB ⇒ BGR 的第 2 通道 = R = 通道 0
-    assert int(bgr[0, 0, 2]) == 0            # -1 → 0
-    assert int(bgr[-1, -1, 2]) == 255        # +1 → 255
-    # 通道 3 不参与成像
-    assert int(bgr[0, 0, 0]) == int(bgr[0, 0, 1]) == 127
+    assert (tmp_path / "copy" / "img01.png").read_bytes() == png.read_bytes()
 
 
 def test_dtype_table_covers_runtime_dtypes():

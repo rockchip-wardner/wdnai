@@ -159,6 +159,19 @@ bgr = out.attachment[0].images[0]
 ⚠️ `respond()` **不带** `generating=` 时只返回文本，图片会丢 —— 那是
 `respond` 的契约（它承诺给调用方一个**文本**结果），要图就用上面三条之一。
 
+⭐⭐⭐ **运行时是 wdnai 自己的 C shim**（`src/wdnai/_cshim/libqi_qwen.so`，
+**源码随包发布**）—— 不是外部二进制、也不是任何 Rockchip 的闭源产物。
+它只链**系统自带**的 `librknn3_api.so` ⇒
+模型包里**只有模型**，不���任何 `.so` / 可执行文件。
+
+```bash
+# cshim 在 pip install 时自动编译；也可手动：
+cd src/wdnai/_cshim && make          # 或 bash tools/build_cshim.sh
+```
+
+⚠️ 编译需要 C++ 编译器（板上 `/usr/bin/g++` 已有）；缺编译器时安装不会失败，
+只是文生图不可用（其它后端不受影响）。
+
 运行时参数（可写进 `spec.options` 或逐次传）：
 
 | 参数 | 默认 | 说明 |
@@ -312,7 +325,7 @@ preset 会在**构造时**检查文件是否齐全，缺文件抛 `FileNotFoundE
 | `WDNAI_MODELS_DIR` | 模型根目录（默认 `/userdata/models`） |
 | `WDNAI_QWEN3_VL_4B_DIR` / `WDNAI_QWEN3_4B_DIR` / `WDNAI_QWEN3_5_4B_VL_DIR` / `WDNAI_QWEN_2_5_OMNI_3B_DIR` / `WDNAI_LOCATE_ANYTHING_DIR` | 单个模型的目录覆盖 |
 | `WDNAI_QWEN_IMAGE_21_DIR` / `QI_MODEL_DIR` | Qwen-Image-2.1 模型包目录（默认 `$WDNAI_MODELS_DIR/qwenimage21`，板上实际在 `/home/rockchip/models/qwenimage21`） |
-| `WDNAI_QWEN_IMAGE_BIN` / `WDNAI_QWEN_IMAGE_ROOT` | Qwen-Image-2.1 运行时（`qwen_image_rknn`）位置；默认用模型包里的 `runtime/`，再退回 `$WDNAI_QWEN_IMAGE_ROOT/bin/` |
+| `QI_SPREAD_IO` / `QI_SPREAD_IO_IN` | cshim 内部默认 `0` / `1`（输出 IO 绝不能分散） |
 | `WDNAI_LIBRKNN3_API` | `librknn3_api.so` 路径 |
 | `WDNAI_LIBRKNNSMI` | `librknnsmi.so` 路径 |
 | `WDNAI_TRACE_PROMPT` | 打印每次推理实际发出的 prompt（排查 prompt 污染用） |

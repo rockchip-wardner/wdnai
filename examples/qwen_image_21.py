@@ -38,7 +38,11 @@ flow-match + VAE ≈ 34 s::
     dit_qwenimage21-512hc.int_ledger                         每核 internal 账本
     vae_qwenimage21-512.seg{0..3}.1828.rknn + .weight   VAE（4 段链）
     reference_512/hidden_states.bin              初始噪声
-    runtime/qwen_image_rknn                       C++ 运行时（+ runtime/lib/aarch64）
+
+⭐ **第三十六轮（2026-11-03）：发布包里只剩「模型」** —— 运行时是 wdnai 自己的
+C shim（``wdnai/_cshim/libqi_qwen.so``，**源码随包发布**），
+它只链**系统自带**的 ``librknn3_api.so`` ⇒
+**不再需要 ``runtime/qwen_image_rknn``，也不需要任何 Rockchip 的 .so**。
 
 ⏱ 耗时（板端实测，RK3588 + 2×RK1828，8 步）：**TE 与 DiT 常驻**
 （卡 0 = TE + 头，卡 1 = DiT 4 段 → VAE），一次性 init ≈ 78 s，
