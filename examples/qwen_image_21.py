@@ -37,12 +37,14 @@ flow-match + VAE ≈ 34 s::
     dit_qwenimage21-512.head.1828.rknn + .weight            DiT 的「头」（独立卡）
     dit_qwenimage21-512hc.int_ledger                         每核 internal 账本
     vae_qwenimage21-512.seg{0..3}.1828.rknn + .weight   VAE（4 段链）
-    reference_512/hidden_states.bin              初始噪声
 
 ⭐ **第三十六轮（2026-11-03）：发布包里只剩「模型」** —— 运行时是 wdnai 自己的
 C shim（``wdnai/_cshim/libqi_qwen.so``，**源码随包发布**），
 它只链**系统自带**的 ``librknn3_api.so`` ⇒
 **不再需要 ``runtime/qwen_image_rknn``，也不需要任何 Rockchip 的 .so**。
+
+⭐ 连「固定初始噪声」也是 cshim **现场生成**的（numpy 兼容的 PCG64 + ziggurat，
+与历史基线**逐字节一致**）⇒ 模型包里**连数据文件都不用带**。
 
 ⏱ 耗时（板端实测，RK3588 + 2×RK1828，8 步）：**TE 与 DiT 常驻**
 （卡 0 = TE + 头，卡 1 = DiT 4 段 → VAE），一次性 init ≈ 78 s，
@@ -111,7 +113,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0,
                    help="初始噪声种子（配合 --fixed 可复现）")
     p.add_argument("--fixed", dest="fixed", action="store_true",
-                   help="复用模型包里的固定噪声（可与 PyTorch 金标准对拍）")
+                   help="用固定噪声（cshim 现场生成，与历史基线逐字节一致 ⇒ 可对拍 md5）")
     p.add_argument("--fresh", dest="fixed", action="store_false",
                    help="每张图用随机噪声（默认）")
     p.add_argument("--keep-artifacts", action="store_true",
