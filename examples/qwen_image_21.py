@@ -111,7 +111,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     p.add_argument("--model-dir", type=Path, default=None,
                    help="覆盖模型包目录；默认自动解析 $WDNAI_MODELS_DIR/qwenimage21")
     p.add_argument("--seed", type=int, default=0,
-                   help="初始噪声种子（配合 --fixed 可复现）")
+                   help="初始噪声种子（只在 --fresh 下有意义：每张图用 seed+图序号）")
     p.add_argument("--fixed", dest="fixed", action="store_true",
                    help="用固定噪声（cshim 现场生成，与历史基线逐字节一致 ⇒ 可对拍 md5）")
     p.add_argument("--fresh", dest="fixed", action="store_false",
