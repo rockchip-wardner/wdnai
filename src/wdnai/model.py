@@ -340,7 +340,7 @@ def _qwen3_5_vl_9b_spec(**overrides) -> ModelSpec:
     Unlike the 4B export (one LLM RKNN on one card), the 9B export is
     split into ``seg0`` / ``seg1``: each stage lives on its own RK182x
     card and the two are chained by
-    :class:`Rknn3LiteMultiCardVLMBackend`.
+    :class:`~wdnai.backends.vlm_multicard.MultiCardVLMBackend`.
     Vision stays on stage 0's card. ``requires_cards=2`` is consumed by
     the compute layer (a single-card board cannot run this model).
 

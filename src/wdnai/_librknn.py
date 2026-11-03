@@ -727,7 +727,7 @@ class _LLMCallbackBundle:
 
     __slots__ = (
         "struct", "pins", "output_tensors", "n_output_tensors",
-        "_trampolines", "_output_buffer_refs", "_output_attr_refs",
+        "_trampolines",
     )
 
     def __init__(self) -> None:
@@ -736,8 +736,6 @@ class _LLMCallbackBundle:
         self._trampolines: List[Any] = []    # keep CFUNCTYPE refs alive
         self.output_tensors: Any = None      # ctypes array[ _RknnTensor ]
         self.n_output_tensors: c_uint32 = c_uint32(0)
-        self._output_buffer_refs: List[Any] = []
-        self._output_attr_refs: List[Any] = []
 
 
 def _pin_userdata(bundle: _LLMCallbackBundle, obj: Any) -> c_void_p:
@@ -1198,9 +1196,18 @@ class _Runtime:
         """
         if not mem_ptr:
             return
+        ptr = int(mem_ptr)
         try:
-            self.lib.rknn3_destroy_mem(self.context, c_void_p(int(mem_ptr)))
+            self.lib.rknn3_destroy_mem(self.context, c_void_p(ptr))
         except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._user_mem_blocks.remove(ptr)
+        except ValueError:
+            pass
+        try:
+            self._owned_mem.remove(ptr)
+        except ValueError:
             pass
 
     def set_shape(self, shape_id: int) -> None:
@@ -2334,6 +2341,14 @@ class RKNN3Lite:
         callback bundle for the next :meth:`init_llm_session` /
         :meth:`init_runtime` call.
 
+        Mirrors rknn3lite's ``create_output_tensors``: it queries
+        ``OUTPUT_ATTR`` per index and allocates **only** the output
+        buffers. It deliberately does **not** call
+        :meth:`_Runtime.create_tensor`, which would additionally
+        allocate a buffer for every model *input* — on the segmented
+        9B LLM (11 inputs) that extra allocation exhausts the NPU
+        pool and ``rknn3_session_init`` then times out.
+
         The TTS talker uses this to read ``past_hidden`` (output 1)
         per decode step. Returns a tuple ``(output_tensors_array, n)``
         where ``output_tensors_array`` is a ctypes array of
@@ -2341,20 +2356,40 @@ class RKNN3Lite:
         """
         if not isinstance(self.rknn_runtime, _LLMRuntime):
             return None, 0
-        if self.rknn_runtime._created is False:
+        rt = self.rknn_runtime
+        if rt._created is False:
             return None, 0
-        # ensure inputs/outputs arrays are built
-        if not self.rknn_runtime.outputs:
-            self.rknn_runtime.create_tensor()
         if indices is None:
-            indices = list(range(self.rknn_runtime.n_outputs))
+            io = rt.rknn3_query(_QueryCmd.IN_OUT_NUM)
+            indices = list(range(int(io.n_output)))
         n = len(indices)
+        if n <= 0:
+            return None, 0
         out_tensors = []
         for idx in indices:
+            attr = rt.rknn3_query(_QueryCmd.OUTPUT_ATTR, index=int(idx))
+            attr_copy = _TensorAttr()
+            ctypes.memmove(
+                ctypes.addressof(attr_copy),
+                ctypes.addressof(attr),
+                ctypes.sizeof(_TensorAttr),
+            )
+            size = int(attr_copy.aligned_size) or int(attr_copy.n_elems) * 2
+            mem_ptr = rt.lib.rknn3_create_mem(
+                rt.context,
+                c_uint64(size),
+                c_int32(int(attr_copy.core_id)),
+                c_int32(int(_MemAllocFlags.CACHEABLE)),
+            )
+            if not mem_ptr:
+                raise RuntimeError(
+                    f"rknn3_create_mem failed for output tensor {idx}"
+                )
+            rt._owned_mem.append(int(mem_ptr))
+            rt._attr_refs.append(attr_copy)
             t = _RknnTensor()
-            src = self.rknn_runtime._output_tensor_refs[idx]
-            t.mem = src.mem
-            t.attr = src.attr
+            t.mem = ctypes_cast(mem_ptr, POINTER(_TensorMemory))
+            t.attr = pointer(attr_copy)
             out_tensors.append(t)
         arr = (_RknnTensor * n)(*out_tensors)
         # Stash on the callback bundle so the next init_llm_session

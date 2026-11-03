@@ -1,15 +1,15 @@
-"""Qwen3.5-VL-9B backend built on the vendor ``rknn3lite`` pipeline.
+"""Qwen3.5-VL-9B backend for the segmented two-card export.
 
-The single-card 4B path stays on wdnai's ctypes shim. The segmented 9B
-export has two LLM sessions on different cards, which the shim cannot run
-reliably (the first ``rknn3_session_run`` hangs once the second session
-exists). The vendor pipeline uses ``rknn3lite.api`` and its
-``RKLLMCallback`` entry points, and runs both cards reliably.
+The 9B export is split into ``seg0`` / ``seg1``: each stage lives on its
+own RK182x card and the two are chained by a token-by-token pipeline.
+This module wraps the vendored pipeline in
+:mod:`._qwen35_vl_9b_vendor` behind the same backend surface as
+``VLMBackend``, so ``LLMLocalSession`` / the worker need no second code
+path for 9B.
 
-This module wraps that vendor implementation behind the same backend
-surface as ``VLMBackend`` so ``LLMLocalSession`` / the worker do not need
-a second code path for 9B. Text and vision share the same pipeline;
-vision runs on stage 0's card.
+Like every other backend, it talks to librknn3 through
+:mod:`wdnai._librknn` (plain ctypes) — no ``rknn3lite`` wheel. Text and
+vision share the same pipeline; vision runs on stage 0's card.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import os
 
 # Qwen3.5-VL's MRoPE fallback logs are very noisy during text decode
 # (one pair per stage per token). Match the vendor demo and silence the
-# RKNN logger before rknn3lite / librknn3 is loaded.
+# RKNN logger before librknn3 is loaded.
 os.environ["RKNN_LOG_LEVEL"] = "0"
 
 import json
@@ -33,7 +33,7 @@ from ._common import StreamSink
 
 
 class _StageHandle:
-    def __init__(self, owner: "Rknn3LiteMultiCardVLMBackend") -> None:
+    def __init__(self, owner: "MultiCardVLMBackend") -> None:
         self._owner = owner
 
     def clear_kvcache(self, *args: Any, **kwargs: Any) -> int:
@@ -44,18 +44,10 @@ class _StageHandle:
         self._owner.stop()
         return 0
 
-    def set_chat_template(self, *args: Any, **kwargs: Any) -> int:
-        rc = 0
-        for stage in getattr(self._owner, "stages", []) or []:
-            try:
-                rc = stage.rknn.set_chat_template("", "", "")
-            except Exception:  # noqa: BLE001
-                rc = -1
-        return rc
 
 
-class Rknn3LiteMultiCardVLMBackend:
-    """Two-stage Qwen3.5-VL-9B using the vendor ``rknn3lite`` pipeline."""
+class MultiCardVLMBackend:
+    """Two-stage Qwen3.5-VL-9B pipeline on two RK182x cards."""
 
     def __init__(
         self,
@@ -66,7 +58,7 @@ class Rknn3LiteMultiCardVLMBackend:
         device_id: Any = None,
     ) -> None:
         if spec.stage_count < 2:
-            raise ValueError("rknn3lite 9B backend requires stage_count >= 2")
+            raise ValueError("9B backend requires stage_count >= 2")
         os.environ["RKNN_LOG_LEVEL"] = "0"
         self.spec = spec
         self._stop = threading.Event()
@@ -185,6 +177,12 @@ class Rknn3LiteMultiCardVLMBackend:
         / ``assistant\\n`` line prefixes for multi-turn prompts. The 9B
         GGUF tokenizer has the authoritative Qwen3.5 chat template, so use
         it instead of wrapping the whole transcript inside one user message.
+
+        The C-side chat template cannot replace this: on the segmented 9B
+        stage0 a multi-turn bare transcript renders incorrectly (the model
+        answers with a thinking dump), while the Jinja2 template handles it
+        correctly. Keep this parser even though the backend is fully on the
+        ctypes shim.
         """
         text = prompt or ""
         matches = list(re.finditer(r"(?m)^(system|user|assistant)\n", text))
@@ -251,8 +249,11 @@ class Rknn3LiteMultiCardVLMBackend:
         prev = V.LAST_RESULT.last_output_text
         new = text[len(prev):] if text.startswith(prev) else text
         if new:
+            if not self.sink.text:
+                new = new.lstrip("\n")
             V.LAST_RESULT.last_output_text = text
-            self.sink.emit(new)
+            if new:
+                self.sink.emit(new)
 
     def _generate(
         self,
@@ -401,4 +402,4 @@ class Rknn3LiteMultiCardVLMBackend:
         self.vision = None
 
 
-__all__ = ["Rknn3LiteMultiCardVLMBackend"]
+__all__ = ["MultiCardVLMBackend"]

@@ -18,27 +18,31 @@ from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 
-from rknn3lite.api import (
+from .._librknn import (
     RKNN3Lite,
-    RKLLMCallback,
-    LLMResultCallback,
-    LLMGetEmbedCallback,
-    LLMTokenizerCallback,
-)
-from rknn3lite.api.rknn3_types import (
-    RKNN3QueryCmd,
-    RKNN3KVCachePolicy,
-    RKNN3KVCacheClearPolicy,
-    RKNN3Tensor,
     RKNN3Image,
-    RKNN3MemAllocFlags,
-    RKNN3TensorLayout,
+    RKNN3QueryCmd,
     RKNN3TensorType,
     Float16,
-    LLMOutputCallback,
-    LLMOutputCallbackState,
-    dump_tensor_attr,
+    build_llm_callback,
 )
+
+RKNN3_TENSOR_NCHW = 1
+RKNN3_FLAG_MEMORY_CACHEABLE = 1
+RKNN3_OUTPUT_CALLBACK_PREFILL_FINISHED = 1
+
+
+def dump_tensor_attr(attr, prefix=""):
+    try:
+        shape = [int(attr.shape[i]) for i in range(int(attr.n_dims))]
+    except Exception:
+        shape = []
+    print(
+        f"{prefix}: name={attr.name!r} shape={shape} "
+        f"dtype={int(attr.dtype)} layout={int(attr.layout)} "
+        f"aligned_size={int(attr.aligned_size)} n_elems={int(attr.n_elems)}",
+        flush=True,
+    )
 
 
 DEFAULT_MODEL_DIR = "/userdata/models/Qwen3.5-VL-9B"
@@ -330,22 +334,134 @@ class LastStageResultState:
 LAST_RESULT = LastStageResultState()
 
 
-@dataclass
-class StageCallbackContext:
-    pipeline: PipelineState
-    stage_index: int
-    embedding_dim: int
+class _StageTokenizeAdapter:
+    def __init__(self, tok):
+        self.tok = tok
+
+    def __call__(self, text, return_tensors=None, truncation=True, max_length=None):
+        ids = self.tok.encode(text, max_tokens=max_length)
+        return {"input_ids": np.asarray([ids], dtype=np.int32)}
 
 
-@dataclass
-class ResultCallbackContext:
-    stage_index: int
-    is_last_stage: bool
+class _StageEmbedCallback:
+    def __init__(self, pipeline: PipelineState):
+        self.pipeline = pipeline
+
+    def __call__(self, _py_obj, tokens, embed_ptr, length):
+        global embeds_data
+        try:
+            if embeds_data is None:
+                return -1
+            embedding_dim = int(embeds_data.shape[1])
+            num_tokens = len(tokens)
+            expected_len = num_tokens * embedding_dim * np.dtype(np.float16).itemsize
+            if int(length) != expected_len:
+                print(f"invalid embed buffer: length={length}, expected={expected_len}")
+                return -1
+            ids = np.asarray(tokens, dtype=np.int64)
+            if ids.size and (ids.min() < 0 or ids.max() >= embeds_data.shape[0]):
+                print("embed_callback token id out of range")
+                return -1
+            dst = np.ctypeslib.as_array(
+                ctypes.cast(embed_ptr, ctypes.POINTER(ctypes.c_uint16)),
+                shape=(num_tokens * embedding_dim,),
+            ).view(np.float16)
+            dst[:] = embeds_data[ids].reshape(-1)
+            slot = self.pipeline.slots[0]
+            with slot.cv:
+                slot.expected_tokens += num_tokens
+            return 0
+        except Exception as e:
+            print(f"embed_callback failed: {e}")
+            return -1
 
 
-@dataclass
-class EmbedCallbackContext:
-    pipeline: PipelineState
+class _StageResultCallback:
+    def __init__(self, stage_index: int, is_last_stage: bool):
+        self.stage_index = stage_index
+        self.is_last_stage = is_last_stage
+
+    def __call__(self, _py_obj, tokens, state):
+        try:
+            if not self.is_last_stage:
+                return 0
+            if int(state) == 5:
+                print(f"\n[last-stage result_callback] RKNN error state on stage{self.stage_index}")
+                return 0
+            if int(state) != 0 or not tokens:
+                return 0
+            LAST_RESULT.set_tokens(
+                [int(t) for t in tokens], source_stage=self.stage_index,
+            )
+            return 0
+        except Exception as e:
+            print(f"result_callback failed: {e}")
+            return 0
+
+
+class _StageOutputCallback:
+    def __init__(self, pipeline: PipelineState, stage_index: int, embedding_dim: int):
+        self.pipeline = pipeline
+        self.stage_index = stage_index
+        self.embedding_dim = embedding_dim
+
+    def __call__(self, _py_obj, views, state):
+        try:
+            pipeline = self.pipeline
+            slot = pipeline.slots[self.stage_index]
+            tensors = []
+            for view in views:
+                if view.data is None or int(view.n_elems) <= 0:
+                    continue
+                data = np.asarray(view.data, dtype=np.float16).tobytes()
+                blob = TensorBlob(
+                    name=view.name,
+                    dtype=int(view.dtype),
+                    n_elems=int(view.n_elems),
+                    aligned_size=len(data),
+                    data=data,
+                )
+                tensors.append(blob)
+                vlog(
+                    pipeline,
+                    f"[stage{self.stage_index}] captured output name={blob.name}, "
+                    f"dtype={blob.dtype}, n_elems={blob.n_elems}, aligned_size={blob.aligned_size}",
+                )
+            if not tensors:
+                return 0
+
+            with slot.cv:
+                remaining = max(0, slot.expected_tokens - slot.emitted_tokens)
+                if slot.active_input_tokens > 0:
+                    n_tokens = slot.active_input_tokens
+                elif int(state) == RKNN3_OUTPUT_CALLBACK_PREFILL_FINISHED:
+                    n_tokens = remaining
+                else:
+                    n_tokens = min(remaining, pipeline.bucket_size)
+
+                if n_tokens == 0:
+                    embed = pick_embed_tensor(tensors)
+                    if embed is not None and embed.n_elems > 0 and self.embedding_dim > 0:
+                        n_tokens = embed.n_elems // self.embedding_dim
+
+                slot.emitted_tokens += int(n_tokens)
+                slot.batches.append(StageBatch(tensors=tensors, n_tokens=int(n_tokens)))
+                slot.cv.notify()
+
+            vlog(
+                pipeline,
+                f"[stage{self.stage_index}] output_callback state={int(state)}, "
+                f"batch_tokens={n_tokens}, emitted={slot.emitted_tokens}/{slot.expected_tokens}",
+            )
+            return 0
+        except Exception as e:
+            print(f"stage_output_callback failed: {e}")
+            try:
+                self.pipeline.fail()
+            except Exception:
+                pass
+            return -1
+
 
 
 class StageRuntime:
@@ -361,30 +477,14 @@ class StageRuntime:
         self.model_type = ""
         self.output_tensors = None
         self.n_output_tensors = 0
-        self.callback = None
-        self.callback_refs = []
-        self.userdata_refs = []
 
     def release(self):
-        if self.rknn is not None and self.output_tensors is not None:
-            for i in range(self.n_output_tensors):
-                try:
-                    mem = self.output_tensors[i].mem
-                    if mem:
-                        self.rknn.destroy_mem(mem)
-                        self.output_tensors[i].mem = None
-                except Exception:
-                    pass
-            self.output_tensors = None
-            self.n_output_tensors = 0
+        self.output_tensors = None
+        self.n_output_tensors = 0
 
         if self.rknn is not None:
             self.rknn.release()
             self.rknn = None
-
-        self.callback = None
-        self.callback_refs.clear()
-        self.userdata_refs.clear()
 
 
 class VisionRuntime:
@@ -409,17 +509,6 @@ class VisionRuntime:
 def vlog(pipeline: PipelineState, msg: str):
     if pipeline.verbose:
         print(msg, flush=True)
-
-
-def make_userdata(obj, keepalive: list):
-    holder = ctypes.py_object(obj)
-    ptr = ctypes.cast(ctypes.pointer(holder), ctypes.c_void_p)
-    keepalive.extend([obj, holder])
-    return ptr
-
-
-def userdata_value(userdata):
-    return ctypes.cast(userdata, ctypes.POINTER(ctypes.py_object)).contents.value
 
 
 def replace_seg_suffix(path: str, seg_idx: int) -> str:
@@ -498,25 +587,15 @@ def pick_embed_tensor(tensors: List[TensorBlob]) -> Optional[TensorBlob]:
     return tensors[0]
 
 
-class CoreMemInfo(ctypes.Structure):
-    _fields_ = [
-        ("core_id", ctypes.c_int32),
-        ("weight_size", ctypes.c_uint64),
-        ("internal_size", ctypes.c_uint64),
-        ("reserved", ctypes.c_uint8 * 424),
-    ]
-
-
 def query_core_internal_size(rknn):
-    core_num = int(rknn.rknn3_query(RKNN3QueryCmd.RKNN3_QUERY_CORE_NUMBER))
-    info = CoreMemInfo()
-    info.core_id = 0
-    rknn.rknn_runtime.rknn3_query(
-        int(RKNN3QueryCmd.RKNN3_QUERY_CORE_MEM_SIZE), info
-    )
-    if int(info.internal_size) <= 0:
+    core_num = int(rknn.rknn3_query(RKNN3QueryCmd.CORE_NUMBER))
+    sizes = rknn.rknn3_query(RKNN3QueryCmd.CORE_MEM_SIZE)
+    if not sizes:
         raise RuntimeError("queried internal memory size is zero")
-    return core_num, int(info.internal_size)
+    internal = max(int(m.internal_size) for m in sizes)
+    if internal <= 0:
+        raise RuntimeError("queried internal memory size is zero")
+    return core_num, internal
 
 
 def setup_shared_internal_mem(vision: "VisionRuntime", stage: StageRuntime):
@@ -531,24 +610,20 @@ def setup_shared_internal_mem(vision: "VisionRuntime", stage: StageRuntime):
     mems = []
     try:
         for core_id in range(core_num):
-            mem = vision.rknn.rknn_runtime.create_mem(
+            mem = vision.rknn.create_mem(
                 shared_size,
                 core_id,
-                RKNN3MemAllocFlags.RKNN3_FLAG_MEMORY_CACHEABLE,
+                RKNN3_FLAG_MEMORY_CACHEABLE,
             )
-            if mem is None:
+            if not mem:
                 raise RuntimeError(f"create_mem failed for core {core_id}")
-            mems.append(mem)
-        ret = stage.rknn.set_internal_mem(mems)
-        if ret != 0:
-            raise RuntimeError(f"llm set_internal_mem failed ret={ret}")
-        ret = vision.rknn.set_internal_mem(mems)
-        if ret != 0:
-            raise RuntimeError(f"vision set_internal_mem failed ret={ret}")
+            mems.append(int(mem))
+        stage.rknn.set_internal_mem(mems)
+        vision.rknn.set_internal_mem(mems)
     except Exception:
         for mem in mems:
             try:
-                vision.rknn.destroy_mem(mem)
+                vision.rknn.destroy_user_mem(mem)
             except Exception:
                 pass
         raise
@@ -565,7 +640,7 @@ def destroy_shared_internal_mem(vision: Optional["VisionRuntime"], mems):
         return
     for mem in mems:
         try:
-            vision.rknn.destroy_mem(mem)
+            vision.rknn.destroy_user_mem(mem)
         except Exception:
             pass
     mems.clear()
@@ -620,84 +695,6 @@ def estimate_multimodal_input_tokens(prompt_tokens: int, n_images: int, n_image_
     return prompt_tokens - n_images + n_images * (n_image_tokens + 2)
 
 
-def tokenizer_callback(userdata, text_ptr, text_len, tokens_ptr, n_tokens_max):
-    global tokenizer
-    try:
-        tok = userdata_value(userdata) if userdata else tokenizer
-        if tok is None:
-            print("tokenizer_callback: tokenizer userdata is None")
-            return -1
-        text = text_ptr.decode("utf-8")
-        tokens = tok.encode(text, max_tokens=int(n_tokens_max))
-        n_tokens = len(tokens)
-        if n_tokens <= 0:
-            print(f"Tokenizer failed for {text}")
-            return n_tokens
-        for i in range(n_tokens):
-            tokens_ptr[i] = int(tokens[i])
-        return n_tokens
-    except Exception as e:
-        print(f"tokenizer_callback failed: {e}")
-        return -1
-
-
-def embed_callback(userdata, tokens_ptr, num_tokens, embed, length):
-    global embeds_data
-    try:
-        ctx: EmbedCallbackContext = userdata_value(userdata)
-        embedding_dim = int(embeds_data.shape[1])
-        expected_len = int(num_tokens) * embedding_dim * np.dtype(np.float16).itemsize
-        if int(length) != expected_len:
-            print(f"invalid embed buffer: length={length}, expected={expected_len}")
-            return -1
-
-        token_ids = np.ctypeslib.as_array(
-            tokens_ptr, shape=(int(num_tokens),)
-        ).astype(np.int64, copy=False)
-        if token_ids.size and (token_ids.min() < 0 or token_ids.max() >= embeds_data.shape[0]):
-            print("embed_callback token id out of range")
-            return -1
-
-        dst = np.ctypeslib.as_array(
-            ctypes.cast(embed, ctypes.POINTER(ctypes.c_uint16)),
-            shape=(int(num_tokens) * embedding_dim,),
-        ).view(np.float16)
-        dst[:] = embeds_data[token_ids].reshape(-1)
-
-        slot = ctx.pipeline.slots[0]
-        with slot.cv:
-            slot.expected_tokens += int(num_tokens)
-            total = slot.expected_tokens
-        vlog(ctx.pipeline, f"[embed_callback] num_tokens={num_tokens}, total={total}")
-        return 0
-    except Exception as e:
-        print(f"embed_callback failed: {e}")
-        return -1
-
-
-def result_callback(userdata, result_ptr, state):
-    try:
-        ctx: ResultCallbackContext = userdata_value(userdata) if userdata else None
-        if ctx is None or not ctx.is_last_stage:
-            return 0
-
-        if int(state) == 5:
-            print(f"\n[last-stage result_callback] RKNN error state on stage{ctx.stage_index}")
-            return 0
-        if int(state) != 0 or not result_ptr:
-            return 0
-
-        n = int(result_ptr.contents.num_tokens)
-        if n <= 0:
-            return 0
-        tokens = [int(result_ptr.contents.token_ids[i]) for i in range(n)]
-        LAST_RESULT.set_tokens(tokens, source_stage=ctx.stage_index)
-        return 0
-    except Exception as e:
-        print(f"result_callback failed: {e}")
-        return 0
-
-
 def flush_generated_text():
     global tokenizer
     with LAST_RESULT.lock:
@@ -718,74 +715,6 @@ def flush_generated_text():
                 LAST_RESULT.last_output_text += new_part
         except Exception as e:
             print(f"\n[Decode error: {e}]", flush=True)
-
-
-def stage_output_callback(userdata, output_tensors, n_output_tensors, state):
-    try:
-        cb_ctx: StageCallbackContext = userdata_value(userdata)
-        pipeline = cb_ctx.pipeline
-        slot = pipeline.slots[cb_ctx.stage_index]
-
-        tensors = []
-        for i in range(int(n_output_tensors)):
-            tensor = output_tensors[i]
-            if not tensor.attr or not tensor.mem:
-                continue
-            attr = tensor.attr.contents
-            mem = tensor.mem.contents
-            if not mem.virt_addr or int(attr.aligned_size) <= 0:
-                continue
-
-            name = bytes(attr.name).split(b"\x00", 1)[0].decode("utf-8", errors="ignore")
-            data = ctypes.string_at(mem.virt_addr, int(attr.aligned_size))
-            blob = TensorBlob(
-                name=name,
-                dtype=int(attr.dtype),
-                n_elems=int(attr.n_elems),
-                aligned_size=int(attr.aligned_size),
-                data=data,
-            )
-            tensors.append(blob)
-            vlog(
-                pipeline,
-                f"[stage{cb_ctx.stage_index}] captured output[{i}] name={name}, "
-                f"dtype={blob.dtype}, n_elems={blob.n_elems}, aligned_size={blob.aligned_size}",
-            )
-
-        if not tensors:
-            return 0
-
-        with slot.cv:
-            remaining = max(0, slot.expected_tokens - slot.emitted_tokens)
-            if slot.active_input_tokens > 0:
-                n_tokens = slot.active_input_tokens
-            elif int(state) == int(LLMOutputCallbackState.RKLLM_OUTPUT_CALLBACK_PREFILL_FINISHED):
-                n_tokens = remaining
-            else:
-                n_tokens = min(remaining, pipeline.bucket_size)
-
-            if n_tokens == 0:
-                embed = pick_embed_tensor(tensors)
-                if embed is not None and embed.n_elems > 0 and cb_ctx.embedding_dim > 0:
-                    n_tokens = embed.n_elems // cb_ctx.embedding_dim
-
-            slot.emitted_tokens += int(n_tokens)
-            slot.batches.append(StageBatch(tensors=tensors, n_tokens=int(n_tokens)))
-            slot.cv.notify()
-
-        vlog(
-            pipeline,
-            f"[stage{cb_ctx.stage_index}] output_callback state={int(state)}, "
-            f"batch_tokens={n_tokens}, emitted={slot.emitted_tokens}/{slot.expected_tokens}",
-        )
-        return 0
-    except Exception as e:
-        print(f"stage_output_callback failed: {e}")
-        try:
-            userdata_value(userdata).pipeline.fail()
-        except Exception:
-            pass
-        return -1
 
 
 def init_stage_context(
@@ -825,8 +754,8 @@ def init_stage_context(
         print(f"[{stage.name}] init_runtime failed")
         return False
 
-    io_num = stage.rknn.rknn3_query(RKNN3QueryCmd.RKNN3_QUERY_IN_OUT_NUM)
-    llm_config = stage.rknn.rknn3_query(RKNN3QueryCmd.RKNN3_QUERY_LLM_CONFIG)
+    io_num = stage.rknn.rknn3_query(RKNN3QueryCmd.IN_OUT_NUM)
+    llm_config = stage.rknn.rknn3_query(RKNN3QueryCmd.LLM_CONFIG)
     if io_num is None or llm_config is None:
         print(f"[{stage.name}] query model info failed")
         return False
@@ -855,10 +784,10 @@ def init_stage_context(
 
     if verbose:
         for i in range(int(io_num.n_input)):
-            attr = stage.rknn.rknn3_query(RKNN3QueryCmd.RKNN3_QUERY_INPUT_ATTR, index=i)
+            attr = stage.rknn.rknn3_query(RKNN3QueryCmd.INPUT_ATTR, index=i)
             dump_tensor_attr(attr, prefix=f"{stage.name}_input")
         for i in range(int(io_num.n_output)):
-            attr = stage.rknn.rknn3_query(RKNN3QueryCmd.RKNN3_QUERY_OUTPUT_ATTR, index=i)
+            attr = stage.rknn.rknn3_query(RKNN3QueryCmd.OUTPUT_ATTR, index=i)
             dump_tensor_attr(attr, prefix=f"{stage.name}_output")
 
     return True
@@ -902,41 +831,19 @@ def init_stage_session(
         "max_context_len": ctx_len,
         "keep_history": 1,
         "ignore_eos_token": ignore_eos,
-        "logits_name": b"output",
+        "logits_name": "output",
     }]
 
-    callback = RKLLMCallback()
-    stage.callback = callback
-
-    tok_cb = LLMTokenizerCallback(tokenizer_callback)
-    emb_cb = LLMGetEmbedCallback(embed_callback)
-    callback.tokenizer_callback = tok_cb
-    callback.embed_callback = emb_cb
-    stage.callback_refs.extend([tok_cb, emb_cb])
-
-    callback.tokenizer_userdata = make_userdata(tokenizer, stage.userdata_refs)
-
-    embed_ctx = EmbedCallbackContext(pipeline=pipeline)
-    callback.embed_userdata = make_userdata(embed_ctx, stage.userdata_refs)
-
-    res_cb = LLMResultCallback(result_callback)
-    result_ctx = ResultCallbackContext(stage_index=stage_idx, is_last_stage=is_last_stage)
-    callback.result_callback = res_cb
-    callback.result_userdata = make_userdata(result_ctx, stage.userdata_refs)
-    stage.callback_refs.append(res_cb)
-
-    if not is_last_stage:
-        out_cb = LLMOutputCallback(stage_output_callback)
-        callback.output_callback = out_cb
-        cb_ctx = StageCallbackContext(
-            pipeline=pipeline,
-            stage_index=stage_idx,
-            embedding_dim=stage.embedding_dim,
-        )
-        callback.output_userdata = make_userdata(cb_ctx, stage.userdata_refs)
-        callback.output_tensors = ctypes.cast(stage.output_tensors, ctypes.POINTER(RKNN3Tensor))
-        callback.n_output_tensors = stage.n_output_tensors
-        stage.callback_refs.append(out_cb)
+    callback = build_llm_callback(
+        result_cb=_StageResultCallback(stage_idx, is_last_stage),
+        tokenizer=_StageTokenizeAdapter(tokenizer),
+        embed_callback=_StageEmbedCallback(pipeline),
+        output_cb=(
+            None if is_last_stage
+            else _StageOutputCallback(pipeline, stage_idx, stage.embedding_dim)
+        ),
+        output_tensors=None if is_last_stage else stage.output_tensors,
+    )
 
     ret = stage.rknn.init_llm_session(llm_args=llm_args, llm_callback=callback)
     if ret != 0:
@@ -948,17 +855,13 @@ def init_stage_session(
         print(f"[{stage.name}] WARNING: reset chat template failed ret={ret}")
 
     if kvcache_policy != "default":
-        policy_map = {
-            "normal": RKNN3KVCachePolicy.RKNN3_KVCACHE_POLICY_NORMAL,
-            "recurrent": RKNN3KVCachePolicy.RKNN3_KVCACHE_POLICY_RECURRENT,
-        }
-        ret = stage.rknn.set_kvcache_policy(policy_map[kvcache_policy])
-        if ret != 0:
-            print(f"[{stage.name}] set_kvcache_policy({kvcache_policy}) failed")
-            return False
+        print(
+            f"[{stage.name}] WARNING: kvcache_policy={kvcache_policy!r} is not "
+            "supported by the ctypes shim; keeping the model default"
+        )
 
     if verbose:
-        mem = stage.rknn.rknn3_query(RKNN3QueryCmd.RKNN3_QUERY_DEVICE_MEM_INFO)
+        mem = stage.rknn.rknn3_query(RKNN3QueryCmd.DEVICE_MEM_INFO)
         if mem is not None:
             print(
                 f"[{stage.name}] device mem: total={mem.sys_total / 1048576.0:.1f}MB, "
@@ -974,7 +877,7 @@ def vision_geometry_from_attr(in_attr):
     layout = int(in_attr.layout)
 
     if len(shape) == 4:
-        if layout == int(RKNN3TensorLayout.RKNN3_TENSOR_NCHW):
+        if layout == int(RKNN3_TENSOR_NCHW):
             channel, height, width = shape[1], shape[2], shape[3]
             return False, int(width), int(height), int(channel), True, shape
         height, width, channel = shape[1], shape[2], shape[3]
@@ -1055,7 +958,7 @@ def init_vision(
         return False
 
     if verbose:
-        mem = vision.rknn.rknn3_query(RKNN3QueryCmd.RKNN3_QUERY_DEVICE_MEM_INFO)
+        mem = vision.rknn.rknn3_query(RKNN3QueryCmd.DEVICE_MEM_INFO)
         if mem is not None:
             print(
                 f"[vision] device mem: total={mem.sys_total / 1048576.0:.1f}MB, "
@@ -1621,7 +1524,7 @@ def main():
 
             for stage in stages:
                 try:
-                    stage.rknn.clear_kvcache(RKNN3KVCacheClearPolicy.RKNN3_KVCACHE_CLEAR_ALL)
+                    stage.rknn.clear_kvcache()
                 except Exception:
                     pass
 

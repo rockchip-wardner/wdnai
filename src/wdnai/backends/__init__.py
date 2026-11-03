@@ -54,10 +54,10 @@ def build_backend(
         from .omni import OmniBackend  # type: ignore  # noqa: WPS433
         return OmniBackend(spec, npu=npu, device_id=device_id)
     if spec.kind == "vlm_multicard":
-        from .vlm_multicard_rknn3lite import (  # type: ignore  # noqa: WPS433
-            Rknn3LiteMultiCardVLMBackend,
+        from .vlm_multicard import (  # type: ignore  # noqa: WPS433
+            MultiCardVLMBackend,
         )
-        return Rknn3LiteMultiCardVLMBackend(
+        return MultiCardVLMBackend(
             spec, npu_indices=npu_indices,
             npu=npu, device_id=device_id,
         )
@@ -71,7 +71,7 @@ def build_backend(
 
 
 __all__ = [
-    "TextBackend", "VLMBackend", "Rknn3LiteMultiCardVLMBackend",
+    "TextBackend", "VLMBackend", "MultiCardVLMBackend",
     "TTSBackend", "EmbeddingBackend", "LocateAnythingBackend",
     "OmniBackend", "ASRBackend", "DepthAnythingBackend", "ImageBackend",
     "build_backend", "resolve_device_id",

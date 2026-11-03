@@ -326,6 +326,15 @@ name `wdnai`, distribution name `wdnai`.
   additionally concatenates 3 deepstack aux tensors (output indices
   1..3) into `RKNN3AuxTensorWrapper`s with the chosen variant's
   vision output's `aligned_size`.
+- `src/wdnai/backends/vlm_multicard.py` — Qwen3.5-VL-9B 两段式双卡后端
+  （`kind="vlm_multicard"`）：seg0/seg1 各一个 LLM session、各绑一张
+  RK182x，vision 与 seg0 同卡并共享 internal mem；逐 token pipeline 在
+  `_qwen35_vl_9b_vendor.py`（该文件同时保留可直接运行的 CLI demo）。
+  **全部走 `_librknn` ctypes shim，不依赖 `rknn3lite`**。prompt 由
+  Python 侧 Jinja2 渲染（GGUF `tokenizer.chat_template` +
+  `_messages_from_prompt`）：真机 A/B 显示 C 侧 `set_chat_template` 在
+  分段 stage0 上单轮可用，但多轮 bare transcript 会退化成 thinking
+  dump（去掉 transcript 的 system 段也不行），所以 Jinja2 这层必须保留。
 - `src/wdnai/backends/tts.py` — `TTSBackend` + vendored
   `Qwen3TTSDriver` (1893 lines, originally in
   `rknn3-toolkit-lite/examples/Qwen3-TTS/qwen3_tts_demo.py` and
@@ -404,11 +413,15 @@ name `wdnai`, distribution name `wdnai`.
   empty in-tree; weights are user-placed (or installed via the
   rknn3_model_zoo flow).
 - `tests/test_mock_e2e.py` — Monkey-patches
-  `rknn3lite.api.RKNN3Lite` + transformers + the result-callback +
+  `wdnai._librknn.RKNN3Lite` + transformers + the result-callback +
   `build_llm_callback` so the full SDK runs without hardware. Covers
   Qwen3 / Qwen2.5 text, Qwen3-VL / Qwen2.5-VL image, override
   pass-through, and the full `respond()` path (JSON hint injection
   + pydantic parse).
+- `tests/test_multicard_pipeline.py` — Qwen3.5-VL-9B 两段 pipeline 的
+  离线回归（fake `RKNN3Lite`，不占硬件）：tokenizer 适配、embed
+  callback 写入/计数、output/result callback 语义、`run_pipeline_once`
+  的 token→embed→token 串联、shared internal mem 的建立/释放。
 - `tests/test_capability.py` — `SoftwareCapability` 词表：成员与裸字符串
   相等且 hash 一致、`json.dumps` 出裸字符串、`__str__` 还原裸值、
   严格校验与老配置迁移语义分离。
