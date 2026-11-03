@@ -736,7 +736,17 @@ _QWEN3_VL_EMBEDDING_2B_REQUIRED = (
 
 
 def _qwen3_vl_embedding_2b_dir() -> Path:
-    return _models_root() / _QWEN3_VL_EMBEDDING_2B_DIR_NAME
+    """Resolve the Qwen3-VL-Embedding-2B model directory.
+
+    Override via the ``WDNAI_QWEN3_VL_EMBEDDING_2B_DIR`` env var (full
+    path); fallback ``$WDNAI_MODELS_DIR/Qwen3-VL-Embedding-2B`` (which
+    itself defaults to ``/userdata/models/Qwen3-VL-Embedding-2B`` when
+    ``WDNAI_MODELS_DIR`` is unset). Mirrors ``_locate_anything_dir`` so
+    every model dir honors the same ``WDNAI_MODELS_DIR`` root.
+    """
+    override = _os.environ.get("WDNAI_QWEN3_VL_EMBEDDING_2B_DIR")
+    return Path(override) if override else (
+        _models_root() / _QWEN3_VL_EMBEDDING_2B_DIR_NAME)
 
 
 def _default_qwen3_vl_embedding_2b_paths() -> dict:
@@ -936,6 +946,23 @@ def _default_depth_anything_v3_paths() -> dict:
     }
 
 
+#: Directory name the TTS weights live in, under the models root.
+_QWEN3_TTS_DIR_NAME = "Qwen3-TTS"
+
+
+def _qwen3_tts_dir() -> Path:
+    """Resolve the Qwen3-TTS model directory.
+
+    Override via the ``WDNAI_QWEN3_TTS_DIR`` env var (full path); fallback
+    ``$WDNAI_MODELS_DIR/Qwen3-TTS`` (which itself defaults to
+    ``/userdata/models/Qwen3-TTS`` when ``WDNAI_MODELS_DIR`` is unset).
+    Mirrors ``_locate_anything_dir`` so every model dir honors the same
+    ``WDNAI_MODELS_DIR`` root.
+    """
+    override = _os.environ.get("WDNAI_QWEN3_TTS_DIR")
+    return Path(override) if override else _models_root() / _QWEN3_TTS_DIR_NAME
+
+
 def _verify_depth_anything_v3_files() -> None:
     """Raise :class:`FileNotFoundError` listing any missing DA3 files.
 
@@ -1066,8 +1093,12 @@ class SystemLanguageModel:
                                     ``SoftwareCapability.TEXT_CHAT``,
                                     ``VISION_CHAT`` and ``TOOL_CALL``
                                     capabilities from a single RKNN.
-    - ``qwen3_tts()``            — Qwen3-TTS bound to ``/userdata/models/Qwen3-TTS``;
-                                    the 4 ``.1828.rknn`` files are looked up inside
+    - ``qwen3_tts()``            — Qwen3-TTS bound to
+                                    ``$WDNAI_MODELS_DIR/Qwen3-TTS`` (default
+                                    ``/userdata/models/Qwen3-TTS``; override the
+                                    root via ``WDNAI_MODELS_DIR`` or pin a custom
+                                    path via ``WDNAI_QWEN3_TTS_DIR``); the 4
+                                    ``.1828.rknn`` files are looked up inside
                                     that directory.
     - ``qwen_2_5_omni_3b()``     — Qwen2.5-Omni-3B (audio) bound to
                                     ``$WDNAI_MODELS_DIR/Qwen2.5-Omni-3B`` (default
@@ -1189,7 +1220,8 @@ class SystemLanguageModel:
         """Return a :class:`ModelSpec` pre-bound to the fixed Qwen3-TTS files.
 
         The directory is expected at ``/userdata/models/Qwen3-TTS/`` (override
-        the root with the ``WDNAI_MODELS_DIR`` environment variable). The TTS
+        the root with the ``WDNAI_MODELS_DIR`` environment variable, or pin
+        the directory itself with ``WDNAI_QWEN3_TTS_DIR``). The TTS
         backend derives the four ``<role>.1828.rknn`` / ``<role>.weight`` paths
         from that directory at construction time.
         """
@@ -1199,7 +1231,7 @@ class SystemLanguageModel:
             variant="qwen3-tts",
             target="rk1820",
             core_mask=0xFF,
-            tts_model_dir=str(_models_root() / "Qwen3-TTS"),
+            tts_model_dir=str(_qwen3_tts_dir()),
         )
 
     # ---- Omni (audio language model) ------------------------------------
@@ -1298,7 +1330,8 @@ class SystemLanguageModel:
         Retrieval embedding model (no token generation): the LLM is run via the
         plain ``RKNN3Lite`` path with manual inputs and returns a normalized
         2048-dim vector. Expected at ``/userdata/models/Qwen3-VL-Embedding-2B/``
-        (override the root with the ``WDNAI_MODELS_DIR`` environment variable);
+        (override the root with the ``WDNAI_MODELS_DIR`` environment variable,
+        or pin the directory itself with ``WDNAI_QWEN3_VL_EMBEDDING_2B_DIR``);
         missing files raise :class:`FileNotFoundError`.
         """
         _verify_qwen3_vl_embedding_2b_files()
