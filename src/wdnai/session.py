@@ -857,6 +857,16 @@ class LLMLocalSession(LLMSession):
             model, npu=npu, device_id=device_id,
             npu_indices=getattr(self, "npu_indices", None),
         )
+        # 后端可选的**预热**钩子：某些后端把重量级资源（RKNN 上下文、
+        # 常驻权重、cshim 会话）留到第一次推理才建 —— 那会让「第一次
+        # 推理」变成 init + 推理之和，容易顶穿调用方的单次超时预算。
+        # 有 warmup() 的后端在这里把资源拉起来，推理阶段就只剩推理。
+        #
+        # 只有**确实实现**了 warmup 的后端会走到这条分支（getattr 默认
+        # None ⇒ 其它后端零行为变化）。
+        _warmup = getattr(self._backend, "warmup", None)
+        if callable(_warmup):
+            _warmup()
         # rknn3 is a synchronous C API: ``session_run`` blocks for the whole
         # decode. Run it on a dedicated worker thread so ``respond`` stays a
         # true coroutine and concurrent callers on the event loop are not

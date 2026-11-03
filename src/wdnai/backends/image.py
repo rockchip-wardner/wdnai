@@ -251,8 +251,13 @@ class ImageBackend:
     """Qwen-Image-2.1 text-to-image (RKNN3 / rk1820).
 
     Construction only *resolves and validates* the on-disk layout — no
-    NPU work happens until :meth:`run_text` is called, so building a
-    session is cheap and does not touch the cards.
+    NPU work happens until :meth:`warmup` / :meth:`run_text` is called.
+
+    ⭐ 2026-11-03 第三十七轮：``LLMLocalSession`` 构造完 backend 后会调
+    可选的 ``warmup()`` 钩子（见 :meth:`warmup`）⇒ **构造 session 不再是
+    零 NPU 成本**（会付 ~90 s 的 cshim init）。这是刻意的：把这笔开销挪到
+    worker 的 load 阶段，推理阶段就只剩 34 s，不会顶穿 webui 的 120 s
+    RPC 推理超时。
 
     :meth:`run_text` returns ``(prompt, [ImageAttachment])``: the text is
     the prompt echo (the same convention the TTS backend uses) and the
@@ -332,6 +337,21 @@ class ImageBackend:
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
+    def warmup(self) -> None:
+        """把 cshim 会话拉起来（TE + DiT 常驻，约 90 s）。
+
+        ⭐ 为什么要单独一个钩子：cshim 是**懒加载**的（构造 backend 不碰
+        NPU），于是第一次推理要付「90 s init + 34 s 生成」= 124 s，
+        **超过 webui 的 120 s RPC 推理超时** ⇒ 第一次出图必然超时，
+        而超时之后 worker 还在跑，用户看到的是「一直转圈然后报错」。
+
+        把 init 挪到 session 构造期（worker 的 ``load`` 阶段，UI 显示
+        「加载中」）⇒ 推理阶段只剩 34 s。
+
+        幂等：``_ensure_shim`` 内部判空，重复调用不会重复 init。
+        """
+        self._ensure_shim(self._options({}))
+
     def run_text(self, prompt: str, **overrides: Any) -> Tuple[str, List[Attachment]]:
         """Generate one image from ``prompt``.
 

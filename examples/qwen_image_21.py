@@ -175,9 +175,13 @@ async def main() -> None:
     out_dir, rename_to = resolve_output_dir(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # ⚠️ 计时从**建 session 之前**开始：cshim 是懒加载的，但
+    # ``LLMLocalSession`` 构造期会调 backend 的 ``warmup()`` ⇒ TE + DiT 的
+    # 常驻 init（约 76~90 s）算在**这里**。早前把 t0 放在 session 之后，
+    # 报出来的「总耗时」就少算了这一大笔（2 张图报 64.7 s，实际 ~140 s）。
+    t0 = time.perf_counter()
     session = LLMLocalSession(model=model)
     try:
-        t0 = time.perf_counter()
         # ⭐ 批量：**一个进程**跑完 N 张（TE / DiT / VAE 都只 init 一次）
         images = await session.generate_images(
             prompts,

@@ -411,6 +411,12 @@ name `wdnai`, distribution name `wdnai`.
   uint8**（cshim 直接给 RGB，SDK 转 BGR），PNG 由 SDK 用纯标准库写。
   模型包默认 `/home/rockchip/models/qwenimage21`（`WDNAI_QWEN_IMAGE_21_DIR`
   / `QI_MODEL_DIR` 可覆盖），**包里只剩模型**（无 .so、无可执行文件）。
+  ⭐ **第三十七轮新增 `warmup()` 钩子**：cshim 会话是**懒加载**的
+  （构造 backend 不碰 NPU），于是「第一次推理」= 90 s init + 34 s 生成
+  = 124 s，**超过 webui 的 120 s RPC 推理超时** ⇒ 第一次出图必然超时。
+  `LLMLocalSession` 构造完 backend 后会调可选的 `warmup()` ⇒ init 挪到
+  worker 的 load 阶段，推理阶段只剩 34 s。**给其它重后端加预热时也走
+  同一个钩子**（`getattr(backend, "warmup", None)`，没实现就是 no-op）。
 - `src/wdnai/models/README.md` — model file layout
   (`/userdata/models/<name>/`), `.1828.rknn` naming convention, the
   Qwen3-VL-4B / Qwen3-TTS file tables. The directory itself ships

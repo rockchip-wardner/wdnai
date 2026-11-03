@@ -598,7 +598,7 @@ cd /home/rockchip/wdnwebui
 |---|---|
 | `<--out>/imgNN.png` | 512×512 RGB PNG（8 bit/通道，无 alpha） |
 | stdout `第 N/M 张 shape=(512, 512, 3) dtype=uint8 -> …` | ndarray 形状与类型（BGR，H×W×C） |
-| stdout `[qwen-image-2.1] done. N 张, steps=… 总耗时 …s` | 端到端墙钟耗时（含 TE 编码 + DiT 生成 + VAE 解码） |
+| stdout `[qwen-image-2.1] done. N 张, steps=… 总耗时 …s` | 端到端墙钟耗时（含 **一次性 init** + TE 编码 + DiT 生成 + VAE 解码）。⚠️ 第三十七轮起计时从**建 session 之前**起算 —— `LLMLocalSession` 构造期会调 backend 的 `warmup()`（cshim init 挪到这里了），早前把 `t0` 放在 session 之后 ⇒ 报出来的总耗时少算了这 ~78~90 s |
 
 分段耗时（板端实测，RK3588 + 2×RK1828，8 步）：
 
