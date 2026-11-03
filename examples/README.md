@@ -536,14 +536,17 @@ cd /home/rockchip/wdnwebui
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
-| `--prompt` | **必填** | 要画的提示词（中英文都行）。空串会抛 `ValueError` |
-| `--steps` | `8` | flow-match 步数。8 步 ≈ 94 s；20 步 ≈ 125 s；40 步 ≈ 177 s。**纯运行时参数，模型不重建** |
-| `--output` / `-o` | `output.png` | 输出 PNG 路径（父目录自动创建） |
+| `prompt`（位置参数，或 `--prompt`） | **必填** | 要画的提示词（中英文都行）。用 `\|` 分隔多个 ⇒ **批量**（一个进程跑完 N 张） |
+| `steps`（位置参数，或 `--steps`） | `8` | flow-match 步数。8 步 ≈ 34 s/张；20 步 ≈ 55 s/张。**纯运行时参数，模型不重建** |
+| `--out` / `--output` / `-o` | `/tmp/qi21` | 输出**目录** ⇒ 产物为 `img01.png` / `img02.png`…；也可以给 `.png` 文件路径（单张直接改名过去） |
 | `--model-dir` | 自动解析 | 覆盖模型包目录；默认 `$WDNAI_MODELS_DIR/qwenimage21`，板上实际在 `/home/rockchip/models/qwenimage21` |
-| `--seed` | `0` | 初始噪声种子（配合 `--fixed-noise`） |
-| `--fixed-noise` | 关 | 复用模型包里的固定噪声（`reference_512/hidden_states.bin`），可复现 |
+| `--seed` | `0` | 初始噪声种子（**只在 `--fresh` 下有意义**：每张图用 seed+图序号） |
+| `--fixed` | 关 | 用固定噪声（cshim 现场生成，与历史基线逐字节一致 ⇒ 可对拍 md5） |
+| `--fresh` | **默认** | 每张图用随机噪声 |
 | `--keep-artifacts` | 关 | 保留中间产物（潜变量 / VAE 原始张量 / TE 输出） |
 | `-v` / `--verbose` | 关 | 打开 SDK 的 DEBUG 日志 |
+
+⚠️ 板端跑之前**先** `export RKNN3_NETWORK_SOCKET_FILE=/tmp/rk-mdns.ini`（否则连不上 NPU proxy）。
 
 #### 素材目录约定
 
@@ -553,18 +556,20 @@ cd /home/rockchip/wdnwebui
 
 | 产出 | 含义 |
 |---|---|
-| `<--output>` | 512×512 RGB PNG（8 bit/通道，无 alpha） |
-| stdout `图像 shape=(512, 512, 3) dtype=uint8` | ndarray 形状与类型（BGR，H×W×C） |
-| stdout `elapsed=94.7s` | 端到端墙钟耗时（含 TE 编码 + DiT 生成 + VAE 解码） |
+| `<--out>/imgNN.png` | 512×512 RGB PNG（8 bit/通道，无 alpha） |
+| stdout `第 N/M 张 shape=(512, 512, 3) dtype=uint8 -> …` | ndarray 形状与类型（BGR，H×W×C） |
+| stdout `[qwen-image-2.1] done. N 张, steps=… 总耗时 …s` | 端到端墙钟耗时（含 TE 编码 + DiT 生成 + VAE 解码） |
 
 分段耗时（板端实测，RK3588 + 2×RK1828，8 步）：
 
 | 阶段 | 耗时 | 说明 |
 |---|---|---|
-| TE 编码 | ~37 s | **97% 是 `model_init`**（4 GB 权重灌进 NPU），推理本身只要 0.16 s |
-| DiT 常驻 init | ~23 s | 一次性；之后**生成过程零 load / 零 model_init** |
+| 一次性 init | ~78~90 s | TE 常驻（~37 s）+ DiT 4 段常驻（~39 s）+ VAE（~2 s） |
+| TE 编码（**常驻后**） | **~0.16 s** | TE 权重已灌进 NPU ⇒ 每张图只跑推理，不再 `model_init` |
 | flow-match 8 步 | ~21 s | 每步 2.60 s（4 段串行，每段 ~580 ms） |
-| VAE 4 段链 | ~10 s | 流式逐段释放 |
+| VAE 4 段链 | ~10 s | 流式逐段释放（**必须等 DiT 释放后**才能加载，两者不能共卡） |
+
+⇒ 卡布局：**卡 0 = TE + DiT 的头**，**卡 1 = DiT 4 段 →（跑完 N 张后释放）→ VAE**。
 
 ### 容易踩的坑
 
@@ -577,20 +582,26 @@ cd /home/rockchip/wdnwebui
 2. **给文生图传自定义 `generating=` schema 会抛 `ValidationError`。**
    扩散模型不产 JSON —— 这是预期行为，不是 bug。用 `LMOutput` 本身即可。
 
-3. **模型包必须带 `runtime/qwen_image_rknn`（+ `runtime/lib/aarch64/`）。**
-   缺了它 SDK 会回退去 `/home/rockchip/projects/deploy/bin/` 找；两处都没有就
-   `FileNotFoundError`。可以用 `WDNAI_QWEN_IMAGE_BIN` / `WDNAI_QWEN_IMAGE_ROOT` 指。
+3. **模型包里只剩「模型」—— 没有运行时、没有数据文件。**
+   第三十六轮起运行时是 wdnai 自带的 C shim（`wdnai/_cshim/libqi_qwen.so`，
+   源码随包发布，只链系统自带的 `librknn3_api.so`）；
+   `reference_512/`（固定初始噪声 + TE 参考输出）也已整个删除 ⇒
+   **初始噪声由 cshim 现场生成**（numpy 兼容的 PCG64 + ziggurat，与历史基线
+   逐字节一致，md5 `b808cf7ecd34338323b783704c516128`）。
 
-4. **`reference_512/hidden_states.bin` 的文件名不能改。**
-   运行时按这个名字读初始噪声；改名 ⇒ `找不到初始噪声` 直接退出。
+4. **要跟历史基线对拍 md5，必须加 `--fixed`。**
+   默认是 `--fresh`（随机噪声）⇒ md5 必然不同，不是 bug。
+   `--fixed` 的可复现性来自那个固定噪声本身，**不来自 `--seed`**。
 
 5. **`fm_mu` 必须用 512 路线的 `0.5387096774`。**
    1024 路的 `0.6935483871` 用在这里会让出图完全不对（但不会报错）。
 
-6. **TE 与 DiT 物理无法共卡 ⇒ 每次换提示词都要重跑 TE。**
-   TE 权重本身占 486 MiB/核，与常驻的 DiT 抢不下同一张卡。
-   所以「94 s 一张」是**架构天花板**，不是实现问题 ——
-   步数只影响 flow-match 那 21 s。
+6. **TE 与 DiT 不能共卡，但 TE 可以常驻。**
+   TE 权重占 486 MiB/核，DiT 4 段占 525 MiB/核 ⇒ 挤不进同一张卡；
+   但「头」只有 6.4 MiB/核 ⇒ **卡 0 放 TE + 头，卡 1 放 DiT 段**。
+   ⇒ 换提示词**不用**重跑 TE（编码只要 0.16 s），「每张 ≈ 34 s」。
+   ⚠️ VAE 与 DiT 物理上也不能共卡（525 + 588 > 池）⇒ serve 的顺序固定为
+   「先跑完 N 张潜变量 → 释放 DiT → 再逐张解码」。
 
 7. **别在跑图的过程中 reset / rescan / 烧固件 / 重启板子。**
    这些是把 RK1820 弄坏的真凶（详见 `deploy/debug.md` §69）。
