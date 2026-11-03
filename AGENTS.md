@@ -357,22 +357,34 @@ name `wdnai`, distribution name `wdnai`.
   （长音频截前 5 秒，短音频尾部补零）。走 `wdnai._librknn` shim，
   `RKNN3Lite` 只在 `open_context()` 里 import —— native driver 绝不能在
   模块 import 阶段打开。
+- `src/wdnai/_cshim/` — ⭐ **文生图的运行时（C 实现，源码在本仓库）**：
+  `libqi_qwen.so`（`make` 编出来；`setup.py` 在 `build_py` 阶段自动编）。
+  里面是 `qi/{rknn3_runner,resident_chain,vae_chain,te_encoder,api}` ——
+  **模型分段的规则、IO 落位、layout 转换、flow-match 数学全在 C 侧**
+  ⇒ 数值行为与基线**逐字节一致**（PNG md5 `4766cd27…` / `7604d7b4…`）。
+  **只链系统自带的 `librknn3_api.so`**（门面会 dlopen 系统自带的 rkcp）
+  ⇒ 模型包里**不需要任何 .so 或可执行文件**。
+  C ABI（Python 只碰这几个）：`qi_qwen_open` / `qi_qwen_te_encode` /
+  `qi_qwen_generate_batch` / `qi_qwen_free` / `qi_qwen_close`。
+- `src/wdnai/_qwen_image_c.py` — cshim 的 ctypes 绑定 +
+  **纯 Python 的 gguf 分词器**（分词留在 Python ⇒ 不需要 Rockchip 的闭源
+  `libtokenizer.a`）。⚠️ t2i 模板必须显式带 `<|im_start|>` / `<|im_end|>`
+  （Rockchip 的闭源 tokenizer 会自动加，Python 的不会）⇒ 源码里用
+  `"<" + "|im_start|>"` 拼，**别写字面量**（会被工具链吞掉）。
 - `src/wdnai/backends/image.py` — `ImageBackend`（kind=`image`，文生图
-  Qwen-Image-2.1 / RKNN3 rk1820，512×512）。**不 import librknn3**：
-  它驱动模型包自带的 C++ 运行时 `qwen_image_rknn`（子进程），因此在
-  非 RK 机器上 import 也是安全的。流水线三段：TE（text encoder，
-  单独进程占满卡池，跑完释放）→ DiT（4 × 8-block 段，**双卡各 2 段**，
-  常驻 ⇒ 生成过程零 load / 零 model_init）→ VAE（4 段链，**必须
-  `--vae-stream`**，否则第 2 段 `MODEL_SETUP fail`）。三条硬约束写在
-  `backends/image.py` 的注释里：`QI_SPREAD_IO=0`（输出 IO 绝不能分散）、
-  `QI_SPREAD_IO_IN=1`（只分散输入 IO，否则 VAE 第 3 段 `create_mem`
-  失败）、`--vae-release-dit`（TE 已退出，VAE 可接管 DiT 的池）。
+  Qwen-Image-2.1 / RKNN3 rk1820，512×512）。**不再起子进程** ⇒ 改成
+  **进程内调 cshim**（`_qwen_image_c.QwenImageShim`）。
+  流水线三段：TE（text encoder，**常驻**，与 DiT 的头共卡 0）→
+  DiT（4 × 8-block 段，**切头单卡**，共享 internal，常驻 ⇒ 生成过程
+  零 load / 零 model_init）→ VAE（4 段链，**流式**，且必须在
+  **DiT 释放之后**才加载 —— 两者物理上不能共卡）。
+  两条硬约束写在 `backends/image.py` 的注释里：`QI_SPREAD_IO=0`
+  （输出 IO 绝不能分散）、`QI_SPREAD_IO_IN=1`（只分散输入 IO，
+  否则 VAE 第 3 段 `create_mem` 失败）。
   `run_text()` 返回 `(prompt_str, [ImageAttachment])`；图片是 **BGR
-  uint8**，由 SDK 自己从 `img01_vae_image.bin`（NCHW `[1,4,512,512]`
-  fp16）解码，PNG 由 SDK 用纯标准库写 —— 与运行时那份
-  `scripts/fp16_to_png.py` **逐位相同**（有单测守着）。
+  uint8**（cshim 直接给 RGB，SDK 转 BGR），PNG 由 SDK 用纯标准库写。
   模型包默认 `/home/rockchip/models/qwenimage21`（`WDNAI_QWEN_IMAGE_21_DIR`
-  / `QI_MODEL_DIR` 可覆盖），运行时在包内 `runtime/qwen_image_rknn`。
+  / `QI_MODEL_DIR` 可覆盖），**包里只剩模型**（无 .so、无可执行文件）。
 - `src/wdnai/models/README.md` — model file layout
   (`/userdata/models/<name>/`), `.1828.rknn` naming convention, the
   Qwen3-VL-4B / Qwen3-TTS file tables. The directory itself ships
@@ -768,7 +780,9 @@ grounding 链路定义在 `src/wdnai/grounding.py`（独立模块，**不**耦�
   抛 `ValidationError` —— 扩散模型不产 JSON，这是预期行为。
 - **不要在 `backends/image.py` 里手写 ctypes 调 librknn3**：文生图的
   三段编排（DiT 分段 / VAE 分段链 / 每段 IO 落位）都是实机量出来的规则，
-  已经固化在 C++ 运行时里，用子进程驱动它，别在 Python 里重写一遍。
+  已经固化在 **cshim（C 侧）** 里 —— 用 `src/wdnai/_cshim/` 那份，
+  **别在 Python 里重写一遍**（纯 Python 版试过：能对齐，但要额外复刻
+  FMA 收缩、fp16 次正规数的怪癖、libstdc++ 的 mt19937，容易踩 1 ULP 的坑）。
 
 ## Known limits
 
