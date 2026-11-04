@@ -19,6 +19,8 @@
 
 #include <stdint.h>
 
+#include "progress.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -37,7 +39,25 @@ qi_qwen_session* qi_qwen_open(const char* model_dir,
                               uint32_t core_mask,
                               char* err, int err_len);
 
+/* 同上，但**在加载模型之前**就装上进度回调。
+ * ⭐ 要看到那 ~90 s 的 init 进度（TE 37 s + DiT 39 s）就必须用这个：
+ *   qi_qwen_open 里的 init 发生在返回之前，事后再 set_progress 就晚了。 */
+qi_qwen_session* qi_qwen_open_ex(const char* model_dir,
+                                 const char* card_te,
+                                 const char* card_dit,
+                                 uint32_t core_mask,
+                                 qi_progress_cb cb, void* user,
+                                 char* err, int err_len);
+
 void qi_qwen_close(qi_qwen_session* s);
+
+/* 装进度回调（可选；不装就是现在的行为 —— 一行日志都不多打）。
+ *
+ * 回调在**调用方那个线程**上同步触发。阶段与口径见 progress.h。
+ * 典型用法（Python）：
+ *     lib.qi_qwen_set_progress(s, cb, None)   # cb = CFUNCTYPE(...) 实例
+ */
+void qi_qwen_set_progress(qi_qwen_session* s, qi_progress_cb cb, void* user);
 
 /* TE 编码：tokens 是**带 t2i 模板**的完整 token 序列（Python 侧分词得到）。
  * 输出 ehs（fp16，128×4096）与 mask（bool，128），由 qi_qwen_free 释放。 */

@@ -417,6 +417,25 @@ name `wdnai`, distribution name `wdnai`.
   `LLMLocalSession` 构造完 backend 后会调可选的 `warmup()` ⇒ init 挪到
   worker 的 load 阶段，推理阶段只剩 34 s。**给其它重后端加预热时也走
   同一个钩子**（`getattr(backend, "warmup", None)`，没实现就是 no-op）。
+  ⭐⭐⭐ **第三十七轮：cshim 加了进度回调**（`qi_progress_ctx`）——
+  出图是重操作（首次 load ~90 s + 每张 8 步 ~34 s），上层（Web UI 卡片）
+  要画进度条就必须知道「现在到哪一步、这一步多久、还剩多久」。
+  - C 侧：`qi/progress.h` 定义 `qi_progress_cb` + `qi_progress_ctx`；
+    `qi_qwen_open_ex()`（比 `qi_qwen_open` 多两个参数）能在**加载模型之前**
+    装上回调 ⇒ 那 90 s 的 init 进度也看得见（事后 `qi_qwen_set_progress`
+    就晚了 —— init 发生在 `qi_qwen_open` 内部）。
+  - ⭐ **全局只有一个时钟**：`qi_progress_ctx` 由会话持有，各层
+    （api.cpp / resident_chain / vae_chain）**共享指针** ⇒ elapsed 口径
+    全局一致。第一版让每层各自计时，结果「release」那条报出 21 s
+    （那是「距上一次**本层**发射」的间隔，跨层对不上）。
+  - ⭐ **换阶段要重置计时基准**（`qi_progress_stage()`）：否则新请求的第
+    一条进度会把「worker 空闲了多久」当成「这一步花了多久」
+    （实测：TE 编码显示 44.6 s，其实是 worker 空等了 44 s）。
+  - Python 侧用 `ctypes.CDLL`（**不是** PyDLL）⇒ 调用期间 GIL 释放 ⇒
+    C 里回调 Python 安全（PyDLL 会自锁）。
+  - backend 把回调转成结构化消息
+    `qi|stage=flow|step=3|total=8|elapsed_ms=2601.5`，经 `sink.emit()`
+    ⇒ `on_delta` ⇒ DDS delta 通道 ⇒ 上层。
 - `src/wdnai/models/README.md` — model file layout
   (`/userdata/models/<name>/`), `.1828.rknn` naming convention, the
   Qwen3-VL-4B / Qwen3-TTS file tables. The directory itself ships

@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
+#include <chrono>
 #include <string>
 #include <algorithm>
 
@@ -878,6 +879,7 @@ int ResidentChain::run_flowmatch(const std::string& input_dir, int steps, double
     if (f) { fprintf(f, "# dtype shape\nfloat16 1\n"); fclose(f); }
   }
 
+  // 进度计时：t_prev_step = 上一步跑完的时刻（第一步 = flow 阶段开始）
   for (int k = 0; k < steps; ++k) {
     double sigma = sig[k], sigma_next = sig[k + 1];
 
@@ -962,6 +964,11 @@ int ResidentChain::run_flowmatch(const std::string& input_dir, int steps, double
       f = fopen(buf, "wb");
       if (f) { fwrite(vb.data(), 1, vb.size(), f); fclose(f); }
     }
+
+    // ---- 进度：这一步跑完了 ----
+    // elapsed_ms 由**共享 ctx** 统一算（口径与会话层的事件一致）
+    // ⇒ 上层直接拿它当「这一步花了多久」，按剩余步数外推就是 ETA。
+    qi_progress_emit(progress_ctx_, "flow", k + 1, steps);
   }
 
   // ---- 输出最终潜变量（fp16，与 run_flowmatch.py 的 latents_nchw.bin 同格式）----

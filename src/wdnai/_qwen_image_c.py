@@ -16,7 +16,7 @@ from __future__ import annotations
 import ctypes
 import os
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 import numpy as np
 
@@ -40,6 +40,18 @@ _IM_END = "<" + "|im_end|>"
 #: 噪声模式
 NOISE_FIXED = 0
 NOISE_FRESH = 1
+
+#: C 侧进度回调的 ctypes 签名：
+#:     void (*)(void* user, const char* stage, int step, int total, double elapsed_ms)
+#:
+#: ⚠️ **GIL 安全**：本模块用 ``ctypes.CDLL``（**不是** PyDLL）⇒ 调 C 函数
+#:    期间 GIL 是**释放**的 ⇒ C 里回调 Python 时会重新拿 GIL
+#:    （ctypes 内部用 PyGILState_Ensure）⇒ 不会自锁 ✅
+#:    用 PyDLL 就不行（PyDLL 不释放 GIL ⇒ 同线程回调 Python 直接死锁）。
+_PROGRESS_CB = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int,
+    ctypes.c_double,
+)
 
 _LIB: Optional[ctypes.CDLL] = None
 
@@ -83,6 +95,16 @@ def _load() -> ctypes.CDLL:
     lib.qi_qwen_open.argtypes = [
         ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32,
         ctypes.c_char_p, ctypes.c_int,
+    ]
+    lib.qi_qwen_open_ex.restype = ctypes.c_void_p
+    lib.qi_qwen_open_ex.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32,
+        _PROGRESS_CB, ctypes.c_void_p,
+        ctypes.c_char_p, ctypes.c_int,
+    ]
+    lib.qi_qwen_set_progress.restype = None
+    lib.qi_qwen_set_progress.argtypes = [
+        ctypes.c_void_p, _PROGRESS_CB, ctypes.c_void_p,
     ]
     lib.qi_qwen_close.restype = None
     lib.qi_qwen_close.argtypes = [ctypes.c_void_p]
@@ -135,6 +157,17 @@ class QwenImageShim:
         **TE + DiT 头**所在卡（如 ``b"0000:01:00.0"``）
     card_dit:
         **DiT 4 段 + VAE**所在卡（如 ``b"0003:31:00.0"``）
+    core_mask:
+        NPU 核掩码（默认全开）
+    verbose:
+        打印版本号
+    progress:
+        **进度回调**，签名 ``cb(stage: str, step: int, total: int, elapsed_ms: float)``。
+        ``stage`` ∈ {"init", "te", "flow", "vae", "vae_init", "release", "done"}；
+        ``elapsed_ms`` = **距上一次回调**的毫秒数（= 这一步花了多久）。
+
+        ⭐ 必须在**构造时**传 —— 那 ~90 s 的模型加载（TE 37 s + DiT 39 s）
+        发生在 ``qi_qwen_open`` **内部**，事后再装就看不到那段了。
     """
 
     def __init__(
@@ -145,15 +178,32 @@ class QwenImageShim:
         card_dit: bytes = b"0003:31:00.0",
         core_mask: int = 0xFF,
         verbose: bool = True,
+        progress: Optional[Callable[[str, int, int, float], None]] = None,
     ) -> None:
         self._lib = _load()
         self.model_dir = Path(model_dir)
         self._err = ctypes.create_string_buffer(512)
-        self._h = self._lib.qi_qwen_open(
+        # 进度回调的 CFUNCTYPE 实例必须**持有引用** —— 否则会被 GC，
+        # C 侧再回调就是野指针。
+        self._progress_cb = None
+        if progress is not None:
+            def _trampoline(_user, stage, step, total, elapsed_ms):
+                try:
+                    progress(
+                        stage.decode("utf-8", "replace"),
+                        int(step), int(total), float(elapsed_ms),
+                    )
+                except Exception:  # noqa: BLE001 — 回调出错不能拖垮生成
+                    pass
+
+            self._progress_cb = _PROGRESS_CB(_trampoline)
+        self._h = self._lib.qi_qwen_open_ex(
             str(self.model_dir).encode(),
             card_te,
             card_dit,
             ctypes.c_uint32(core_mask),
+            self._progress_cb,
+            None,
             self._err,
             ctypes.c_int(len(self._err)),
         )

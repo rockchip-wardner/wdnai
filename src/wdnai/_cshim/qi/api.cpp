@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -102,7 +103,23 @@ struct qi_qwen_session {
   uint32_t core_mask = 0xFF;
   bool dit_ready = false;
   bool vae_ready = false;
+
+  // ---- 进度回调（可选）----
+  // ⚠️ 一个会话只有**一个** qi_progress_ctx —— 各层共享它 ⇒ elapsed 口径全局一致
+  qi_progress_ctx prog;
 };
+
+// 发一条进度（走**共享**的 ctx ⇒ 与 resident_chain / vae_chain 的口径一致）
+static void emit_progress(qi_qwen_session* s, const char* stage, int step, int total) {
+  if (!s) return;
+  qi_progress_emit(&s->prog, stage, step, total);
+}
+
+// 阶段开工：把计时基准挪到现在（见 progress.h 的说明）
+static void begin_stage(qi_qwen_session* s, const char* stage) {
+  if (!s) return;
+  qi_progress_stage(&s->prog, stage);
+}
 
 // ---------------------------------------------------------------------------
 // 把 DiT 链重新 init 起来（generate_batch 结束后 DiT 被释放，
@@ -137,6 +154,14 @@ static int init_dit(qi_qwen_session* s, char* err, int err_len) {
 qi_qwen_session* qi_qwen_open(const char* model_dir, const char* card_te,
                               const char* card_dit, uint32_t core_mask, char* err,
                               int err_len) {
+  return qi_qwen_open_ex(model_dir, card_te, card_dit, core_mask, nullptr, nullptr,
+                         err, err_len);
+}
+
+qi_qwen_session* qi_qwen_open_ex(const char* model_dir, const char* card_te,
+                                 const char* card_dit, uint32_t core_mask,
+                                 qi_progress_cb cb, void* user, char* err,
+                                 int err_len) {
   if (!model_dir) {
     set_err(err, err_len, "model_dir 为空");
     return nullptr;
@@ -146,6 +171,14 @@ qi_qwen_session* qi_qwen_open(const char* model_dir, const char* card_te,
   s->card_te = card_te ? card_te : "";
   s->card_dit = card_dit ? card_dit : "";
   s->core_mask = core_mask ? core_mask : 0xFF;
+  // ⚠️ 进度回调必须在**加载模型之前**装上 —— 否则那 90 s 的 init
+  //    （TE 37 s + DiT 39 s）完全看不到，用户面对的就是一段空白等待。
+  if (cb) {
+    s->prog.cb = cb;
+    s->prog.user = user;
+    s->dit.set_progress(&s->prog);
+    s->vae.set_progress(&s->prog);
+  }
 
   // ---- 板端铁律：输出不分散（QI_SPREAD_IO=1 会让输出恒为全 0），只分散输入 ----
   if (!getenv("QI_SPREAD_IO")) setenv("QI_SPREAD_IO", "0", 1);
@@ -187,6 +220,8 @@ qi_qwen_session* qi_qwen_open(const char* model_dir, const char* card_te,
   }
 
   // ---- 1. TE（常驻；36.8 s 的 model_init 在这里）----
+  begin_stage(s, "init");
+  emit_progress(s, "init", 1, 3);
   int ret = s->te.open(qi::join_path(s->model_dir, kTeModel),
                        qi::join_path(s->model_dir, kTeWeight),
                        qi::join_path(s->model_dir, kTeEmbed), s->core_mask,
@@ -198,10 +233,12 @@ qi_qwen_session* qi_qwen_open(const char* model_dir, const char* card_te,
   }
 
   // ---- 2. DiT：4 段（切头单卡，共享 internal）+ 头模型（另一张卡）----
+  emit_progress(s, "init", 2, 3);
   if (init_dit(s, err, err_len) != 0) {
     delete s;
     return nullptr;
   }
+  emit_progress(s, "init", 3, 3);
   return s;
 }
 
@@ -211,6 +248,17 @@ void qi_qwen_close(qi_qwen_session* s) {
   s->dit.release();
   s->vae.release();
   delete s;
+}
+
+void qi_qwen_set_progress(qi_qwen_session* s, qi_progress_cb cb, void* user) {
+  if (!s) return;
+  s->prog.cb = cb;
+  s->prog.user = user;
+  qi_progress_stage(&s->prog, nullptr);  // 换了回调 ⇒ 计时重新起算
+  // DiT / VAE 也要拿到**同一个** ctx ⇒ flow-match 每一步、VAE 每一段
+  // 报出来的 elapsed 才和会话层的事件对得上（口径统一）。
+  s->dit.set_progress(&s->prog);
+  s->vae.set_progress(&s->prog);
 }
 
 // ---------------------------------------------------------------------------
@@ -266,9 +314,13 @@ int qi_qwen_generate_batch(qi_qwen_session* s, int n_images,
     uint16_t* ehs = nullptr;
     uint8_t* mask = nullptr;
     int ehs_n = 0, mask_n = 0;
+    // 进度：TE 编码。**开工**重置计时，**干完**再报 ⇒ 上层看到的
+    // elapsed 就是「这次编码花了多久」（而不是「worker 空等了多久」）。
+    begin_stage(s, "te");
     if (qi_qwen_te_encode(s, toks, n_tok, &ehs, &ehs_n, &mask, &mask_n, err, err_len) != 0) {
       return 1;
     }
+    emit_progress(s, "te", img + 1, n_images);
 
     // 工作目录：每张一份（runner 按文件名读输入）
     char sub[256];
@@ -322,6 +374,7 @@ int qi_qwen_generate_batch(qi_qwen_session* s, int n_images,
       }
     }
 
+    begin_stage(s, "flow");
     std::string lat_path = qi::join_path(dir, "latents.bin");
     std::string dump_dir = debug_dump ? dir : std::string();
     int ret = s->dit.run_flowmatch(dir, steps, mu, shift_terminal, x_path, lat_path,
@@ -337,6 +390,8 @@ int qi_qwen_generate_batch(qi_qwen_session* s, int n_images,
   }
 
   // ---- ③ 释放 DiT（与 VAE 物理上不能共卡）----
+  begin_stage(s, "release");
+  emit_progress(s, "release", 1, 1);
   s->dit.release();
   s->dit_ready = false;
 
@@ -354,6 +409,8 @@ int qi_qwen_generate_batch(qi_qwen_session* s, int n_images,
     return 1;
   }
   s->vae_ready = true;
+  begin_stage(s, "vae_init");
+  emit_progress(s, "vae_init", 1, 1);
 
   const size_t px = (size_t)512 * 512 * 3;
   uint8_t* all_rgb = (uint8_t*)malloc(px * (size_t)n_images);
@@ -365,6 +422,7 @@ int qi_qwen_generate_batch(qi_qwen_session* s, int n_images,
     char pref[256];
     snprintf(pref, sizeof(pref), "%s/img%02d", s->work_dir.c_str(), img + 1);
     double ms = 0.0;
+    begin_stage(s, "vae");
     ret = s->vae.decode(latents[(size_t)img], /*channels=*/0, s->work_dir, pref, &ms);
     if (ret != 0) {
       set_err(err, err_len, "VAE 解码失败: " + s->vae.error());
@@ -424,6 +482,8 @@ int qi_qwen_generate_batch(qi_qwen_session* s, int n_images,
   *out_rgb = all_rgb;
   s->vae.release();
   s->vae_ready = false;
+  begin_stage(s, "done");
+  emit_progress(s, "done", 1, 1);
   return 0;
 }
 

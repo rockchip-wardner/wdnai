@@ -317,3 +317,45 @@ def test_preset_shape():
     assert spec.variant == "qwen-image-2.1"
     assert spec.options["steps"] == 8
     assert spec.options["fm_mu"] == "0.5387096774"
+
+
+# --------------------------------------------------------------------------- #
+# 进度（第三十七轮：cshim → sink → on_delta）
+# --------------------------------------------------------------------------- #
+def test_cshim_progress_becomes_a_structured_sink_message():
+    """cshim 的进度回调必须变成**可解析**的结构化消息。
+
+    上层（Web UI 卡片）靠它画进度条：「现在到哪一步、这一步多久、还剩多久」。
+    格式：``qi|stage=flow|step=3|total=8|elapsed_ms=2601.5``
+    """
+    from wdnai.backends.image import ImageBackend
+
+    backend = ImageBackend.__new__(ImageBackend)   # 不走 __init__（不碰 NPU）
+    backend.sink = image_mod._ProgressSink()
+    seen = []
+    backend.sink.add_observer(seen.append)
+
+    backend._on_cshim_progress("flow", 3, 8, 2601.5)
+
+    assert len(seen) == 1
+    msg = seen[0]
+    assert msg.startswith("qi|"), msg
+    fields = dict(
+        part.split("=", 1) for part in msg[len("qi|"):].split("|") if "=" in part
+    )
+    assert fields["stage"] == "flow"
+    assert fields["step"] == "3"
+    assert fields["total"] == "8"
+    assert float(fields["elapsed_ms"]) == pytest.approx(2601.5, abs=0.1)
+
+
+def test_progress_message_does_not_touch_the_npu():
+    """进度消息只是字符串 ⇒ 不该有任何副作用（不写文件、不碰设备）。"""
+    from wdnai.backends.image import ImageBackend
+
+    backend = ImageBackend.__new__(ImageBackend)
+    backend.sink = image_mod._ProgressSink()
+    seen = []
+    backend.sink.add_observer(seen.append)
+    backend._on_cshim_progress("vae", 2, 4, 2228.0)
+    assert "stage=vae" in seen[0]

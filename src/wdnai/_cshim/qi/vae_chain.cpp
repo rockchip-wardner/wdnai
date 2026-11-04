@@ -255,6 +255,8 @@ int VaeChain::decode(const std::vector<unsigned char>& lat_fp16, int channels,
       return -1;
     }
     printf("[vae-chain] 第 %zu/%zu 段推理完成，耗时 %.1f ms\n", i + 1, runners_.size(), ms);
+    // ---- 进度：这一段跑完了（elapsed 由共享 ctx 统一算）----
+    qi_progress_emit(progress_ctx_, "vae", (int)i + 1, (int)runners_.size());
 
     // ---- 5. 取输出，作为下一段的输入 ----
     carry.clear();

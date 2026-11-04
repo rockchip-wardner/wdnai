@@ -313,9 +313,37 @@ class ImageBackend:
             card_te=str(opts["card0"]).encode(),
             card_dit=str(opts["card1"]).encode(),
             verbose=bool(opts.get("verbose", True)),
+            progress=self._on_cshim_progress,
         )
         _log("  cshim 就绪（{:.1f} s）".format(time.perf_counter() - t0))
         return self._shim
+
+    # ------------------------------------------------------------------ #
+    # 进度（cshim → sink → on_delta → 上层）
+    # ------------------------------------------------------------------ #
+    def _on_cshim_progress(
+        self, stage: str, step: int, total: int, elapsed_ms: float,
+    ) -> None:
+        """把 cshim 的进度回调转成**结构化消息**发给上层。
+
+        消息格式（``qi|`` 前缀 ⇒ 与人类可读消息区分得开）::
+
+            qi|stage=flow|step=3|total=8|elapsed_ms=2601.5
+
+        字段：
+        * ``stage``   —— init / te / flow / vae / vae_init / release / done
+        * ``step``    —— 该阶段内的 1-based 步序
+        * ``total``   —— 该阶段的总步数
+        * ``elapsed_ms`` —— **这一步**花了多久（距上一次回调）
+
+        上层（Web UI 卡片）据此画进度条、显示「每一步在做什么 / 这一步多久 /
+        还剩多久」。
+        """
+        self.sink.emit(
+            "qi|stage={}|step={}|total={}|elapsed_ms={:.1f}".format(
+                stage, int(step), int(total), float(elapsed_ms)
+            )
+        )
 
     # ------------------------------------------------------------------ #
     # Layout
@@ -422,6 +450,8 @@ class ImageBackend:
                 if opts.get("verbose", True):
                     _log("  {} → {}".format(png_path.name, png_path))
             total_ms = (time.perf_counter() - t_start) * 1000.0
+            # 收尾阶段（写 PNG / 复制产物）—— 让进度条有个明确的末态
+            self.sink.emit("qi|stage=save|step=1|total=1|elapsed_ms=0.0")
             self.sink.perf.update({
                 "te_ms": te_ms,
                 "generate_ms": gen_ms,

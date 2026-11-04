@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "rknn3_runner.h"
+#include "progress.h"
 
 namespace qi {
 
@@ -44,6 +45,11 @@ class VaeChain {
   bool resident() const { return resident_; }
   size_t n_pieces() const { return runners_.size(); }
   const std::string& error() const { return err_; }
+
+  // ---- 进度回调（可选）----
+  // 每跑完一段报一次（stage="vae"）⇒ 上层能显示「VAE 第 2/4 段」。
+  // ⚠️ 传的是**会话的共享 ctx 指针** ⇒ elapsed 口径全局一致。
+  void set_progress(qi_progress_ctx* ctx) { progress_ctx_ = ctx; }
 
   // 解一张图。
   //   lat_fp16   : DiT 的潜变量（fp16，token 主序 (1, T, C)）
@@ -69,6 +75,9 @@ class VaeChain {
   bool resident_ = false;
   bool inited_ = false;
   std::string err_;
+
+  // 进度回调（每段报一次）—— **共享**的 ctx（口径统一）
+  qi_progress_ctx* progress_ctx_ = nullptr;
 };
 
 }  // namespace qi

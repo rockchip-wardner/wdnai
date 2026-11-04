@@ -52,6 +52,7 @@
 
 #include "rknn3_api.h"
 #include "rknn3_runner.h"
+#include "progress.h"
 
 namespace qi {
 
@@ -146,6 +147,13 @@ class ResidentChain {
   // 打印内存占用摘要
   void print_mem_summary() const;
 
+  // ---- 进度回调（可选）----
+  // flow-match 每跑完一步就报一次（stage="flow"），
+  // 上层据此画进度条 + 估剩余时间。
+  // ⚠️ 传的是**会话的共享 ctx 指针**（不是自己的副本）⇒ elapsed 口径
+  //    与会话层（init/te/release/done）完全一致。
+  void set_progress(qi_progress_ctx* ctx) { progress_ctx_ = ctx; }
+
  private:
   std::vector<std::unique_ptr<ModelRunner>> runners_;
   // ⭐ 方案 D：切出来的「头」模型（单独一张卡）
@@ -164,6 +172,9 @@ class ResidentChain {
   std::vector<bool> stream_;             // 该段是否流式
   std::vector<size_t> runner_seg_;       // runner 下标 → 段号
   uint32_t core_mask_ = 0;               // 流式段也要用
+
+  // 进度回调（flow-match 每步报一次）—— **共享**的 ctx（口径统一）
+  qi_progress_ctx* progress_ctx_ = nullptr;
 };
 
 // 探针：跑一次普通 model_init，拿到该模型的每核 internal/weight 需求。
