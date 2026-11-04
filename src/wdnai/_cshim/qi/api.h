@@ -49,6 +49,24 @@ qi_qwen_session* qi_qwen_open_ex(const char* model_dir,
                                  qi_progress_cb cb, void* user,
                                  char* err, int err_len);
 
+/* 同 qi_qwen_open_ex，但多一个 **VAE 核掩码**（只对**本机 RK3588 的 rknn2
+ * NPU**有效；TE / DiT 仍走 card_te / card_dit 指定的 rk1820）。
+ *
+ *   vae_core_mask = 0    ⇒ 用默认（RKNN_NPU_CORE_0_1_2，即 RK3588 的 3 个核全用）
+ *   vae_core_mask = 7    ⇒ 显式 3 核
+ *   vae_core_mask = 1    ⇒ 只用 1 个核
+ *
+ * ⭐ 为什么要有这个：把 VAE 放到**本机**的 rknn2 NPU 上之后，它与 DiT（跑在
+ *   1828 协处理器上）**物理分开** ⇒ DiT 可以一直常驻 ⇒ 生成过程零 model_init。
+ *   而 VAE 用几个核是可以调的（3 核约 1.5 s/张，单核约 4.6 s/张）。 */
+qi_qwen_session* qi_qwen_open_ex2(const char* model_dir,
+                                  const char* card_te,
+                                  const char* card_dit,
+                                  uint32_t core_mask,
+                                  uint32_t vae_core_mask,
+                                  qi_progress_cb cb, void* user,
+                                  char* err, int err_len);
+
 void qi_qwen_close(qi_qwen_session* s);
 
 /* 装进度回调（可选；不装就是现在的行为 —— 一行日志都不多打）。
@@ -74,7 +92,9 @@ int qi_qwen_te_encode(qi_qwen_session* s,
  * 流程（与参考实现的 serve 一致）：
  *   ① 逐张 TE 编码（TE 常驻）
  *   ② 逐张 flow-match（DiT 4 段常驻，零 load / 零 model_init）
- *   ③ **释放 DiT**（DiT 与 VAE 物理上不能共卡）
+ *   ③ **释放 DiT**（DiT 与 VAE 物理上不能共卡）—— ⚠️ 只有当 VAE 走的是
+ *      **rknn3 / 同卡** 时才会释放；VAE 走**本机 rknn2**（不同设备）时
+ *      **DiT 全程常驻**，生成过程一次 model_init 都不会发生
  *   ④ 加载 VAE 4 段（流式），逐张解码 + 归一化成 uint8
  */
 int qi_qwen_generate_batch(qi_qwen_session* s,

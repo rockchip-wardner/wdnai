@@ -60,7 +60,18 @@ Layout of the model package (see ``/home/rockchip/models/qwenimage21``)::
     dit_qwenimage21-512hc.seg{0..3}.1828.rknn / .weight   DiT 4 段（切头）
     dit_qwenimage21-512.head.1828.rknn / .weight          DiT 的「头」（另一张卡）
     dit_qwenimage21-512hc.int_ledger                     每核 internal 账本（跳探针）
-    vae_qwenimage21-512.seg{0..3}.1828.rknn / .weight
+    vae_qwenimage21-512.rknn2.rknn                       ⭐ VAE（rknn2，跑本机 NPU）
+    vae_qwenimage21-512.seg{0..3}.1828.rknn / .weight    VAE 兜底（rknn3，跑 1828）
+
+⭐ **VAE 有两条路，cshim 自动选**：
+
+* ``vae_qwenimage21-512.rknn2.rknn`` 存在 ⇒ VAE 跑**本机 RK3588 的 rknn2
+  NPU**（3 核全用）⇒ 与 DiT（1828）**物理分开** ⇒ DiT 全程常驻 ⇒
+  生成过程**零 model_init**。
+* 不存在 / 本机没装 ``rknn2-runtime`` ⇒ 自动退回 rknn3 的 4 段 VAE 链
+  （与 DiT 共卡 ⇒ 每批图结束要释放 DiT 再重建，**39 s**）。
+
+⇒ rknn3 的 4 段**必须留在包里**（它是兜底），rknn2 整图是「加速项」。
 
 ⭐ 模型包里**只有模型**：「固定初始噪声」由 cshim 现场生成
    （numpy 兼容的 PCG64 + ziggurat，与历史基线逐字节一致）。
@@ -110,6 +121,16 @@ _FM_MU_512 = "0.5387096774"
 #: Default board topology (2 × RK1828 behind the RK3588 host).
 _CARD0 = "0000:01:00.0"
 _CARD1 = "0003:31:00.0"
+
+#: ⭐ VAE 的 NPU 核掩码 —— **只作用于本机 RK3588 的 rknn2 NPU**（3 个核）。
+#:
+#: 当模型包里带 rknn2 版 VAE（``vae_qwenimage21-512.rknn2.rknn``）时，
+#: VAE 跑在**本机** NPU 上 ⇒ 与 DiT（1828 协处理器）**物理分开**
+#: ⇒ DiT 全程常驻 ⇒ 生成过程**零 model_init**。
+#:
+#: - 0 = 默认（RKNN_NPU_CORE_0_1_2 ⇒ 3 个核全用）
+#: - 7 = 显式 3 核；1 = 只用 1 核（留给别的任务）
+_VAE_CORE_MASK = 0
 
 #: Candidate model-package directories, in priority order.
 _MODEL_DIR_CANDIDATES = (
@@ -312,6 +333,7 @@ class ImageBackend:
             self.model_dir,
             card_te=str(opts["card0"]).encode(),
             card_dit=str(opts["card1"]).encode(),
+            vae_core_mask=int(opts.get("vae_core_mask", _VAE_CORE_MASK)),
             verbose=bool(opts.get("verbose", True)),
             progress=self._on_cshim_progress,
         )
@@ -516,6 +538,7 @@ class ImageBackend:
             "noise_seed": 0,
             "card0": _CARD0,
             "card1": _CARD1,
+            "vae_core_mask": _VAE_CORE_MASK,
             "output_dir": None,
             "work_dir": None,
             "keep_artifacts": False,

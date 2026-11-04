@@ -102,6 +102,14 @@ def _load() -> ctypes.CDLL:
         _PROGRESS_CB, ctypes.c_void_p,
         ctypes.c_char_p, ctypes.c_int,
     ]
+    # ⭐ 带 VAE 核掩码的版本：VAE 跑在**本机 RK3588 的 rknn2 NPU**上时用
+    lib.qi_qwen_open_ex2.restype = ctypes.c_void_p
+    lib.qi_qwen_open_ex2.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32,
+        ctypes.c_uint32,
+        _PROGRESS_CB, ctypes.c_void_p,
+        ctypes.c_char_p, ctypes.c_int,
+    ]
     lib.qi_qwen_set_progress.restype = None
     lib.qi_qwen_set_progress.argtypes = [
         ctypes.c_void_p, _PROGRESS_CB, ctypes.c_void_p,
@@ -158,7 +166,18 @@ class QwenImageShim:
     card_dit:
         **DiT 4 段 + VAE**所在卡（如 ``b"0003:31:00.0"``）
     core_mask:
-        NPU 核掩码（默认全开）
+        NPU 核掩码（默认全开）—— 只作用于 **rknn3** 侧（1828）
+    vae_core_mask:
+        ⭐ **VAE** 的 NPU 核掩码（只作用于**本机 RK3588 的 rknn2 NPU**）。
+
+        VAE 跑在 rknn2 上时，DiT（1828）与 VAE（3588）**物理分开**
+        ⇒ DiT 全程常驻 ⇒ 生成过程**零 model_init**。
+
+        - ``0``  → 默认（``RKNN_NPU_CORE_0_1_2``，RK3588 的 **3 个核全用**）
+        - ``7``  → 显式 3 核
+        - ``1``  → 只用 1 个核（更慢，但给别的任务留资源）
+
+        VAE 走 rknn3（同卡）时这个参数被忽略。
     verbose:
         打印版本号
     progress:
@@ -177,6 +196,7 @@ class QwenImageShim:
         card_te: bytes = b"0000:01:00.0",
         card_dit: bytes = b"0003:31:00.0",
         core_mask: int = 0xFF,
+        vae_core_mask: int = 0,
         verbose: bool = True,
         progress: Optional[Callable[[str, int, int, float], None]] = None,
     ) -> None:
@@ -197,11 +217,12 @@ class QwenImageShim:
                     pass
 
             self._progress_cb = _PROGRESS_CB(_trampoline)
-        self._h = self._lib.qi_qwen_open_ex(
+        self._h = self._lib.qi_qwen_open_ex2(
             str(self.model_dir).encode(),
             card_te,
             card_dit,
             ctypes.c_uint32(core_mask),
+            ctypes.c_uint32(vae_core_mask),
             self._progress_cb,
             None,
             self._err,
