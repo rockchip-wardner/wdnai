@@ -194,13 +194,17 @@ name `wdnai`, distribution name `wdnai`.
   三段**共享**一份按 NPU 核分配的内部显存（C++ 的
   `da3_init_internal_mem_share`，约 1.6 GB）：少了 `user_mem_internal=1`
   + `set_internal_mem` 这一步，`rknn3_model_init` 直接
-  `MODEL_SETUP fail`。view 数（10）是**烤进导出**的（`global` 输入
+  `MODEL_SETUP fail`。view 数是**烤进导出**的（`global` 输入
   `[V,L,1,D]`），不是运行期参数 —— 送图张数必须与之一致。
-  **当前限制**：只完成基础的 **10-view（多视图融合）** 版本；
-  **单路（单图）深度估计尚未实现**。
+  **当前部署的导出是 1-view（280×280）**：`global` 输入 `[1,401,1,768]`、
+  `head` 输出 `[1,1,280,280]` —— 一张图即可出深度图 + 置信度。
   **换 V 不需要改 SDK** —— `self.views` 是从 `global` 的输入张量属性上读
   出来的，重新导出 `--views N`（model-zoo 已验证 1-10）即可，`estimate()`
   的张数校验与报错文案自动跟着变。
+  部署侧文件命名跟 `LocateAnything-3B` 一致：
+  `<role>_<Model>.<WxH>.<N>view.1828.rknn` + 同名 `.weight`（**去掉 `.1828`
+  段**）—— `depth_weight_path()` 按 `.1828.rknn` → `.weight` 派生，
+  旧的「`.rknn` → `.weight`」只作兼容兜底。
   实测（RK3588；用重复帧填充槽位模拟有效 view 数递减，始终比较同一张图
   的深度）：10→5 偏 **1.58%**、10→3 偏 **2.59%**、10→1 偏 **4.14%**，
   收益递减但未饱和（5 帧吃到 62% 的收益）；**顺序不重要**（逆序 3.98%，

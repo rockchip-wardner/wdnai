@@ -904,22 +904,35 @@ def _verify_locate_anything_files() -> None:
 # Depth Anything V3: monocular depth estimation (image-in, depth-map-out).
 # File layout — **three** RKNN stages, each with its own ``.weight``::
 #
-#     da3_base_local.rknn  + .weight    (image  [1,H,W,3] uint8 → tokens [1,L,D])
-#     da3_base_global.rknn + .weight    (tokens [V,L,1,D] → 4 feature maps)
-#     da3_base_head.rknn   + .weight    (features → depth/conf [1,V,H,W])
+#     local_DepthAnythingV3.280x280.1view.1828.rknn
+#         + local_DepthAnythingV3.280x280.1view.weight
+#         (image  [1,280,280,3] uint8 → tokens [1,401,768])
+#     global_DepthAnythingV3.280x280.1view.1828.rknn
+#         + global_DepthAnythingV3.280x280.1view.weight
+#         (tokens [1,401,1,768] → 4 feature maps [1,400,1,1536])
+#     head_DepthAnythingV3.280x280.1view.1828.rknn
+#         + head_DepthAnythingV3.280x280.1view.weight
+#         (features [1,400,1536] → depth/conf [1,1,280,280])
+#
+# The file names follow the repo-wide deployment convention
+# ``<role>_<Model>[.<WxH>[.<N>view]].1828.rknn`` — the same shape as
+# ``vision_LocateAnything.448x448.1828.rknn``. The ``.280x280`` / ``.1view``
+# segments only **document** what the export baked in: the backend reads
+# the real geometry (resolution, view count, token counts) off the tensor
+# attributes, never by parsing the file name.
 #
 # The number of views (``V``) is **baked into the export**: ``global``'s
-# input shape is ``[V,L,1,D]`` and ``head``'s is ``[V,F,G]``, so a model
-# exported with ``--views 10`` only ever accepts 10 images. The backend
+# input shape is ``[V,L,1,D]`` and ``head``'s output is ``[1,V,H,W]``, so a
+# model exported with ``--views 10`` only ever accepts 10 images. The backend
 # reads ``V`` off the model itself instead of taking it as a parameter.
 # --------------------------------------------------------------------------- #
 _DEPTH_ANYTHING_V3_REQUIRED = (
-    "da3_base_local.rknn",
-    "da3_base_local.weight",
-    "da3_base_global.rknn",
-    "da3_base_global.weight",
-    "da3_base_head.rknn",
-    "da3_base_head.weight",
+    "local_DepthAnythingV3.280x280.1view.1828.rknn",
+    "local_DepthAnythingV3.280x280.1view.weight",
+    "global_DepthAnythingV3.280x280.1view.1828.rknn",
+    "global_DepthAnythingV3.280x280.1view.weight",
+    "head_DepthAnythingV3.280x280.1view.1828.rknn",
+    "head_DepthAnythingV3.280x280.1view.weight",
 )
 
 
@@ -940,9 +953,9 @@ def _default_depth_anything_v3_paths() -> dict:
     """Return absolute paths to the three DA3 RKNN stages."""
     d = _depth_anything_v3_dir()
     return {
-        "depth_local_path":  str(d / "da3_base_local.rknn"),
-        "depth_global_path": str(d / "da3_base_global.rknn"),
-        "depth_head_path":   str(d / "da3_base_head.rknn"),
+        "depth_local_path":  str(d / "local_DepthAnythingV3.280x280.1view.1828.rknn"),
+        "depth_global_path": str(d / "global_DepthAnythingV3.280x280.1view.1828.rknn"),
+        "depth_head_path":   str(d / "head_DepthAnythingV3.280x280.1view.1828.rknn"),
     }
 
 

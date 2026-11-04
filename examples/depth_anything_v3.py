@@ -1,13 +1,13 @@
 """Depth Anything V3 demo —— output matches the C++ demo line-for-line.
 
-**⚠️ 当前限制**：本 sample 只覆盖 **10-view（多视图融合）** 导出 ——
-``global`` 段在 10 张图之间做融合，送图张数必须正好是 10。
-**单路（单图）深度估计尚未实现**。
+**当前部署的导出是 1-view（280×280）**：``global`` 段输入形状是
+``[1, 401, 1, 768]``，``head`` 段输出 ``[1, 1, 280, 280]`` —— 一张图即可出
+深度图 + 置信度。送图张数必须正好等于 view 数。
 
 换 view 数**不需要改代码** —— backend 从模型上读 V，只要重新导出三段 RKNN
 （model-zoo 的 ``--views``，已验证范围 1-10）。代价见
 ``examples/README.md`` 的「view 数与实时流」一节：
-``--views 5`` 只差 1.58% 且延迟减半（推荐先做），``--views 1`` 差 4.14%。
+``--views 5`` 只差 1.58% 且延迟减半，``--views 1`` 差 4.14%。
 多相机几何还需要 model-zoo 导出 **ray** 分支（当前不支持）且换更大的模型。
 
 The C++ demo at ``rknn3-model-zoo/examples/depth_anything_v3/cpp/main.cpp``
@@ -18,22 +18,21 @@ visualisation window, one heatmap per view and a montage. This Python port
 mirrors that layout so the two runs can be compared side by side; only the
 timing numbers (which depend on the actual hardware) vary.
 
-A run against the model-zoo's ``model/images.txt`` (10 frames) produces
+A run against the model-zoo's ``model/images.txt`` (first frame) produces
 something close to::
 
-    mode=depth views=10 model=DepthAnythingV3 image=280x280
+    mode=depth views=1 model=DepthAnythingV3 image=384x384
+    pipeline config: views=1 image=3x280x280 local_tokens=401 hidden=768
     origin size=1024x576 crop size=1024x576
     input image: 1024 x 576, subsampling: 4:2:0, colorspace: YCbCr, orientation: 1
     depth visualization valid region: x=[0,280) y=[0,280)
-    local view 1/10 done
-    ...
-    local_tokens: elems=3079680 min=-6.074219 max=6.269531 mean=-0.005947
-    depth: elems=784000 min=0.350586 max=1.421875 mean=0.975114
-    confidence: elems=784000 min=1.000000 max=5.597656 mean=2.675516
-    shared inverse-depth visualization range: [0.730385, 2.169492]
+    local view 1/1 done
+    local_tokens: elems=307968 min=-5.203125 max=6.199219 mean=-0.006022
+    depth: elems=78400 min=0.529297 max=1.383789 mean=0.940304
+    confidence: elems=78400 min=1.000977 max=5.890625 mean=3.244078
+    shared inverse-depth visualization range: [0.734577, 1.777778]
     saved depth heatmap: depth_vis/depth_00.jpg
-    ...
-    saved depth montage: depth_vis/depth_montage.jpg layout=5x2 canvas=1400x560
+    saved depth montage: depth_vis/depth_montage.jpg layout=1x1 canvas=280x280
     depth output directory: depth_vis
     DA3-BASE split RKNN pipeline finished.
 
@@ -51,6 +50,10 @@ skips that (handy for CI / batch runs).
 
     examples/depth_anything_v3/frame_01.jpg .. frame_10.jpg
     examples/depth_anything_v3/images.txt      # 每行一个文件名
+
+``images.txt`` 默认**只有 1 行**（``frame_01.jpg``）—— 对应 1-view 导出。
+要跑多视图导出，把 ``frame_02..10.jpg`` 也列进清单即可（张数必须等于
+模型的 view 数）。
 
 ``images.txt`` 里的路径是**相对列表自身目录**的裸文件名，所以整个目录可以
 整体搬走而不必改内容；换成绝对路径同样有效。
@@ -74,9 +77,14 @@ from wdnai.backends.depth_anything import (
 )
 
 # --------------------------------------------------------------------------- #
-# Default input list — the 10 frames that ship with this sample, copied from
-# the model-zoo's DA3 demo (``examples/depth_anything_v3/model/``). The list
-# is resolved **relative to this file**, so the sample runs from any cwd.
+# Default input list — the frames that ship with this sample, copied from the
+# model-zoo's DA3 demo (``examples/depth_anything_v3/model/``). The list is
+# resolved **relative to this file**, so the sample runs from any cwd.
+#
+# The shipped ``images.txt`` lists **one** frame (``frame_01.jpg``) because
+# the deployed export is 1-view; the other nine frames stay in the folder for
+# multi-view exports (append them — the count must equal the model's view
+# count).
 # --------------------------------------------------------------------------- #
 _EXAMPLES_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_IMAGE_LIST = os.path.join(_EXAMPLES_DIR, "depth_anything_v3", "images.txt")

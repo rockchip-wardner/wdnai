@@ -109,16 +109,16 @@ examples/
 > （`rknn3-model-zoo/examples/depth_anything_v3/cpp/main.cpp`），
 > 所以两边可以直接并排 diff。
 
-> **⚠️ 当前限制**：本版本**只完成基础的 10-view（多视图融合）**。
-> `global` 段在 10 张图之间做融合，送图张数必须正好是 10。
-> **单路（单图）深度估计尚未实现**。
+> **当前部署的导出是 1-view（280×280）**：`global` 段输入形状是
+> `[1, 401, 1, 768]`、`head` 段输出 `[1, 1, 280, 280]` —— 一张图即可出深度图
+> + 置信度。送图张数必须正好等于模型的 view 数。
 >
-> 后续路线（详见下方「view 数与实时流」一节）：
+> 换 view 数**不需要改代码**（详见下方「view 数与实时流」一节）：
 >
 > | 路线 | 代价 | 要改什么 |
 > |---|---|---|
-> | **`--views 5`**（推荐先做） | 精度差 1.58%，延迟减半 | **重新导出三段 RKNN，SDK / sample / worker 零改动** |
-> | `--views 1` | 精度差 4.14%，真·实时 | 同上，仍然是重新导出 |
+> | **`--views 1`**（**当前部署的就是它**） | 相对 10-view 精度差 4.14%，真·实时 | 只需要重新导出三段 RKNN，**SDK / sample / worker 零改动** |
+> | `--views 5` | 精度差 1.58%，延迟减半 | 同上 |
 > | 多相机几何 | — | model-zoo 要改导出脚本加 **ray** 分支，且需换更大的模型（DA3-Base 的位姿精度只有 Giant 的 1/4） |
 >
 > **V 是导出时参数**：backend 从模型上读 view 数，所以换 V **不需要改代码**。
@@ -130,17 +130,17 @@ examples/
 ```bash
 cd /userdata/wdnwebui
 
-# 默认：用本 sample 自带的 10 张图，热力图输出到 ./depth_vis
+# 默认：用本 sample 自带的 1 张图，热力图输出到 ./depth_vis
 .venv/bin/python .venv/src/wdnai/examples/depth_anything_v3.py
 
 # 指定输出目录
 .venv/bin/python .venv/src/wdnai/examples/depth_anything_v3.py --output-dir /tmp/da3_vis
 
-# 换自己的素材（张数必须正好 10，见「坑」第 1 条）
+# 换自己的素材（张数必须正好等于模型的 view 数，见「坑」第 1 条）
 .venv/bin/python .venv/src/wdnai/examples/depth_anything_v3.py \
     --image-list /path/to/my_images.txt
 
-# 直接给图（可重复；同样必须正好 10 张）
+# 直接给图（可重复；张数同样必须等于模型的 view 数）
 .venv/bin/python .venv/src/wdnai/examples/depth_anything_v3.py \
     --image a.jpg --image b.jpg ...
 
@@ -152,7 +152,7 @@ cd /userdata/wdnwebui
 .venv/bin/python .venv/src/wdnai/examples/depth_anything_v3.py --model-dir /path/to/models
 ```
 
-- **耗时**：**首次约 18.4 s**（几乎全是模型加载），**稳态推理约 1.34 s**。
+- **耗时**：**首次约 21~23 s**（几乎全是模型加载），**1-view 稳态推理约 0.3 s**。
   分阶段实测见下方「性能实测」。
 - **占 NPU**：是。同一时刻别再跑别的 sample，否则会抢卡。
 - **默认 `--output-dir` 是 `depth_vis`，相对当前工作目录**（对齐 C++ demo）。
@@ -182,18 +182,18 @@ examples/depth_anything_v3/
 └── images.txt                      # 每行一个裸文件名
 ```
 
-`images.txt` 内容：
+`images.txt` 内容（**1 行**，对应 1-view 导出）：
 
 ```
 frame_01.jpg
-frame_02.jpg
-...
-frame_10.jpg
 ```
+
+其余 9 帧仍在目录里 —— 要跑多视图导出，把 `frame_02.jpg … frame_10.jpg`
+追加进清单即可（张数必须等于模型的 view 数）。
 
 #### 数量硬约束
 
-**图片张数必须正好等于模型的 view 数（本导出 = 10）。**
+**图片张数必须正好等于模型的 view 数（当前部署的导出 = 1）。**
 view 数是**烤进 RKNN 导出**的（`global` 段输入形状就是 `[V, L, 1, D]`），
 不是运行期参数 —— 送 3 张或 12 张都不行，改张数必须重新导出模型。
 
@@ -206,19 +206,19 @@ view 数是**烤进 RKNN 导出**的（`global` 段输入形状就是 `[V, L, 1,
 
 | 行 | 含义 |
 |---|---|
-| `mode=depth views=10 model=DepthAnythingV3 image=384x384` | `views` = 实际喂进去的图片张数；`image=384x384` 是 `spec.image_size` 的**名义提示值，不是真实输入分辨率**（真实值看下一行） |
-| `pipeline config: views=10 image=3x280x280 local_tokens=401 hidden=768` | **真实几何**，从模型张量属性上读出来：输入 3×280×280、每个 view 401 个 token、hidden 768 |
+| `mode=depth views=1 model=DepthAnythingV3 image=384x384` | `views` = 实际喂进去的图片张数；`image=384x384` 是 `spec.image_size` 的**名义提示值，不是真实输入分辨率**（真实值看下一行） |
+| `pipeline config: views=1 image=3x280x280 local_tokens=401 hidden=768` | **真实几何**，从模型张量属性上读出来：输入 3×280×280、每个 view 401 个 token、hidden 768 |
 | `origin size=1024x576 crop size=1024x576` | 原图分辨率（自带素材是 1024×576） |
 | `input image: 1024 x 576, subsampling: 4:2:0, colorspace: YCbCr, orientation: 1` | 复刻 C++ demo 的 libjpeg 信息行（对齐输出格式用） |
 | `depth visualization valid region: x=[0,280) y=[0,280)` | 深度可视化的有效区域 |
-| `local view N/10 done` | 第 N 张图过完 `local` 段（逐图出 token） |
+| `local view N/V done` | 第 N 张图过完 `local` 段（逐图出 token） |
 | `[time] local view N preprocess … ms` | 第 N 张图的预处理耗时 |
-| `local_tokens: elems=3079680 min=… max=… mean=…` | `local` 段输出张量统计。`elems = 10 × 401 × 768` |
-| `depth: elems=784000 min=… max=… mean=…` | 深度图。`elems = 10 × 280 × 280`；**值是逆深度**（见「坑」第 2 条） |
-| `confidence: elems=784000 min=… max=… mean=…` | 逐像素置信度 |
-| `shared inverse-depth visualization range: [lower, upper]` | 10 张图**共享**的逆深度着色窗口（2% / 98% percentile 截断） |
+| `local_tokens: elems=307968 min=… max=… mean=…` | `local` 段输出张量统计。`elems = V × 401 × 768` |
+| `depth: elems=78400 min=… max=… mean=…` | 深度图。`elems = V × 280 × 280`；**值是逆深度**（见「坑」第 2 条） |
+| `confidence: elems=78400 min=… max=… mean=…` | 逐像素置信度 |
+| `shared inverse-depth visualization range: [lower, upper]` | 全部 view **共享**的逆深度着色窗口（2% / 98% percentile 截断） |
 | `saved depth heatmap: <dir>/depth_NN.jpg` | 每张图一张 Turbo 伪彩热力图 |
-| `saved depth montage: <dir>/depth_montage.jpg layout=5x2 canvas=1400x560` | 5 列拼图，便于一眼看一组 |
+| `saved depth montage: <dir>/depth_montage.jpg layout=1x1 canvas=280x280` | 拼图（1-view 时是 1×1） |
 | `depth output directory: <dir>` | 产出目录 |
 | `[time] global run … ms` / `[time] head run … ms` / `[time] total … ms` | 各段耗时（随硬件负载浮动） |
 | `DA3-BASE split RKNN pipeline finished.` | 正常结束标志 |
@@ -227,10 +227,21 @@ view 数是**烤进 RKNN 导出**的（`global` 段输入形状就是 `[V, L, 1,
 
 | 文件 | 内容 |
 |---|---|
-| `depth_00.jpg` … `depth_09.jpg` | 每 view 一张 Turbo 伪彩深度图 |
-| `depth_montage.jpg` | 5×2 拼图（1400×560） |
+| `depth_00.jpg` … | 每 view 一张 Turbo 伪彩深度图 |
+| `depth_montage.jpg` | 拼图（1-view 时 1×1，多视图时 5×2） |
 
-#### 基准数值（自带 10 张素材，与 C++ demo **逐位相同**）
+#### 基准数值（自带素材，与 C++ demo **逐位相同**）
+
+**当前部署的 1-view 导出**（`frame_01.jpg`，RK3588 实测）：
+
+```
+local_tokens: elems=307968  min=-5.203125 max=6.199219 mean=-0.006022
+depth:        elems=78400   min=0.529297  max=1.383789 mean=0.940304
+confidence:   elems=78400   min=1.000977  max=5.890625 mean=3.244078
+shared inverse-depth visualization range: [0.734577, 1.777778]
+```
+
+**10-view 导出（历史基线，供对照）**：
 
 ```
 local_tokens: elems=3079680 min=-6.074219 max=6.269531 mean=-0.005947
@@ -249,7 +260,10 @@ shared inverse-depth visualization range: [0.730385, 2.169492]
 > 与 backend 的 `_share_internal_memory` / `_read_model_geometry` 计时；
 > 推理跑 4 轮取后 3 轮均值。
 
-#### 模型加载（一次性，约 18.4 s）
+> 下面的加载耗时与 view 数**无关**（三段权重一样大）；推理耗时分
+> **1-view（当前部署）** 与 **10-view（历史基线）** 两组给出。
+
+#### 模型加载（一次性，约 18~23 s）
 
 | 阶段 | 耗时 | 占比 | 说明 |
 |---|---|---|---|
@@ -265,12 +279,23 @@ shared inverse-depth visualization range: [0.730385, 2.169492]
 
 - **加载不是 page cache 主导的** —— 第二次加载（权重已在 cache）耗时和第一次一样，
   说明这 18 s 是**真实的 PCIe 传输 + NPU 初始化**。
-- 跑 sample 时看到的 `[time] total ≈ 20 s` **包含加载**，
+- 跑 sample 时看到的 `[time] total ≈ 20~23 s` **包含加载**，
   别把它当成推理耗时。
 - 加载完的常驻占用：NPU 侧共享内部显存约 1.6 GB + 三段权重约 1.28 GB
   ≈ **2.9 GB**（与 worker manifest 里的 `memory_estimate_mb: 3000` 对得上）。
 
-#### 推理（稳态，一次 10 view）
+#### 推理（稳态）
+
+**1-view（当前部署，280×280）** —— 单次跑实测：
+
+| 阶段 | 耗时 | 备注 |
+|---|---|---|
+| `local` ×1 | **0.079 s** | 含预处理（1024×576 → 280×280） |
+| `global` ×1 | **0.101 s** | 一次处理 1 个 view 的 token |
+| `head` ×1 | **0.138 s** | 一次出 1 张深度图 + 1 张置信度图 |
+| **合计** | **≈ 0.32 s** | 约 **3 次/秒** 的更新率 |
+
+**10-view（历史基线）**：
 
 | 阶段 | 耗时 | 备注 |
 |---|---|---|
@@ -289,15 +314,18 @@ shared inverse-depth visualization range: [0.730385, 2.169492]
   | 全量（10 帧都算） | 0.251 s | 0.681 s | 0.407 s | 1.340 s |
   | 增量（只算 1 帧） | 0.026 s | 0.662 s | 0.391 s | **1.079 s** |
 
-- **`global` 段是真跨帧融合**：把 10 张图换成 10 张同一张，`depth[0]` 的均值
-  从 0.996872 变成 0.974225（**差 4.1%**，max_diff 0.446）——
-  模型确实依赖多帧上下文，**单帧推理会掉精度**。
+- **`global` 段是真跨帧融合**（多视图导出才用得上）：把 10 张图换成 10 张同一张，
+  `depth[0]` 的均值从 0.996872 变成 0.974225（**差 4.1%**，max_diff 0.446）——
+  模型确实依赖多帧上下文，**单帧推理会掉精度**（1-view 导出即固定承受这 4.14%）。
 
 #### 对实时流的含义
 
-按 25 fps 相机估：攒满 10 帧要 0.36 s，加一次推理 1.1~1.4 s
-→ **端到端延迟约 1.5~1.8 s**，深度更新率约 0.75 次/秒。
-性能上完全够用，瓶颈在「必须攒 10 帧」这个硬约束上，不是算力。
+**1-view（当前部署）**：一帧进、一帧出，无攒帧约束 → **端到端延迟约 0.4 s
+（含取帧）**，深度更新率约 3 次/秒。实时流场景下这是最省的一档。
+
+**10-view（历史基线）**：按 25 fps 相机估，攒满 10 帧要 0.36 s，加一次推理
+1.1~1.4 s → **端到端延迟约 1.5~1.8 s**，深度更新率约 0.75 次/秒；
+瓶颈在「必须攒 10 帧」这个硬约束上，不是算力。
 
 ### view 数与实时流
 
@@ -422,11 +450,11 @@ model-zoo 的 `da3_export/head.py` 只返回 `output.depth` 和 `output.depth_co
 
 ### 容易踩的坑
 
-1. **张数必须正好是 10。**
-   view 数烤在导出里，不是运行期参数。送 3 张曾经只在 numpy 的
+1. **张数必须正好等于模型的 view 数（当前部署 = 1）。**
+   view 数烤在导出里，不是运行期参数。送多一张曾经只在 numpy 的
    `reshape` 里炸出 `cannot reshape array of size … into shape (10,401,1,768)`
-   —— 模型已经加载（**约 18.4 s**）、10 张图也已经过完 `local` 段，白等一场。
-   现在 sample 在跑推理前就校验并直接报「这个 DA3 导出是为 10 个 view 建的」。
+   —— 模型已经加载（**约 18~23 s**）、图也已经过完 `local` 段，白等一场。
+   现在 sample 在跑推理前就校验并直接报「这个 DA3 导出是为 N 个 view 建的」。
 
 2. **`depth` 是「逆深度」，不是距离。**
    值 = `1 / depth`，**越大越近**。它不是米数、不是公尺、也不是任何真实物理量，
@@ -437,7 +465,7 @@ model-zoo 的 `da3_export/head.py` 只返回 `output.depth` 和 `output.depth_co
    `mode=depth … image=384x384` 打的是 `spec.image_size`（dataclass 默认值，
    只是个提示）；`pipeline config: … image=3x280x280` 才是从模型上读出来的真值。
 
-4. **10 张图共享一个着色窗口。**
+4. **全部 view 共享一个着色窗口。**
    `shared inverse-depth visualization range` 是**跨全部 view** 一起算的
    2%/98% percentile，所以同一张图里颜色相同 = 相对深度相同。
    **不能把单张图的颜色单独解读**，也别拿单图去和另一组素材的图比颜色。
@@ -449,9 +477,19 @@ model-zoo 的 `da3_export/head.py` 只返回 `output.depth` 和 `output.depth_co
    **不要用「JPEG 字节完全相同」当验收标准**，要比解码后的像素。
 
 6. **模型文件必须就位。**
-   默认路径 `/userdata/models/Depth-Anything-V3/`，需要
-   `da3_base_{local,global,head}.rknn` + 同名 `.weight` 共 6 个文件
-   （可用 `WDNAI_DEPTH_ANYTHING_V3_DIR` 或 `--model-dir` 覆盖）。
+   默认路径 `/userdata/models/Depth-Anything-V3/`，需要 6 个文件（命名跟
+   `LocateAnything-3B` 一致：`<role>_<Model>.<WxH>.<N>view.1828.rknn` +
+   同名 `.weight`）：
+
+   ```
+   local_DepthAnythingV3.280x280.1view.1828.rknn    + local_DepthAnythingV3.280x280.1view.weight
+   global_DepthAnythingV3.280x280.1view.1828.rknn   + global_DepthAnythingV3.280x280.1view.weight
+   head_DepthAnythingV3.280x280.1view.1828.rknn     + head_DepthAnythingV3.280x280.1view.weight
+   ```
+
+   `.weight` 的名字是**去掉 `.1828` 段**（不是把 `.rknn` 换成 `.weight`）——
+   `depth_weight_path()` 先按 `.1828.rknn` → `.weight` 派生。
+   目录可用 `WDNAI_DEPTH_ANYTHING_V3_DIR` 或 `--model-dir` 覆盖。
    缺文件会抛 `FileNotFoundError`，在 webui 侧会被 worker 转成 `errored` 状态。
 
 7. **`--npu` 是 `get_devices_id()` 的**下标**，不是 PCI 地址。**
@@ -472,26 +510,28 @@ model-zoo 的 `da3_export/head.py` 只返回 `output.depth` 和 `output.depth_co
    但换模型 / 换导出时值得留意。
 
 10. **`[time] total` 含模型加载，别当成推理耗时。**
-    sample 打印的 `total ≈ 20 s` 里，**约 18.4 s 是加载**（开设备上下文 6.7 s +
-    `model_init` 9.8 s + 共享显存 0.7 s），真正的推理只有 **1.34 s**。
+    sample 打印的 `total ≈ 20~23 s` 里，**约 18~22 s 是加载**（开设备上下文 6.7 s +
+    `model_init` 9.8 s + 共享显存 0.7 s），真正的推理只有 **0.32 s**（1-view）
+    / **1.34 s**（10-view）。
     想知道推理有多快，看 `[time] global run` / `[time] head run`，或者直接看
     「性能实测」那张表 —— 拿 `total` 去评估实时流吞吐会算错一个数量级。
 
 11. **实时流绝不能跨场景拼帧。**
-    把 10 个槽位里的 7 个换成**别的场景**的画面，depth[0] 相对基线偏 **62%**，
-    深度绝对尺度都塌了（均值 0.377 vs 0.997），模型 confidence 崩到 1.12
-    （基线 2.92）。实时流的 V 帧必须来自**同一段连续视频**，
-    不能拿不同摄像头/不同时段的帧凑数。
+    （多视图导出才用得上）把 10 个槽位里的 7 个换成**别的场景**的画面，
+    depth[0] 相对基线偏 **62%**，深度绝对尺度都塌了（均值 0.377 vs 0.997），
+    模型 confidence 崩到 1.12（基线 2.92）。实时流的 V 帧必须来自
+    **同一段连续视频**，不能拿不同摄像头/不同时段的帧凑数。
 
 12. **view 的顺序不重要，别为此做重排序。**
-    把 10 帧逆序喂进去，depth[0] 只偏 3.98%（单路是 4.14%），空间结构相关系数
-    仍有 0.998 —— `global` 的跨 view 注意力是**集合式**的，不是时序建模。
+    （多视图导出）把 10 帧逆序喂进去，depth[0] 只偏 3.98%（单路是 4.14%），
+    空间结构相关系数仍有 0.998 —— `global` 的跨 view 注意力是**集合式**的，
+    不是时序建模。
     （顺带纠正一个容易犯的错：比较逆序结果时**必须比同一张图**，
     逆序后 slot0 装的是另一帧，拿它跟基线比会算出假的大偏差。）
 
 13. **别用 `confidence` 判断 view 数给得好不好。**
-    退化输入（10 张重复图）下 confidence **最高**（3.37），真实 10 帧反而更低
-    （2.92）。它衡量的是局部证据一致性，不是全局正确性。
+    （多视图导出）退化输入（10 张重复图）下 confidence **最高**（3.37），
+    真实 10 帧反而更低（2.92）。它衡量的是局部证据一致性，不是全局正确性。
 ---
 
 ## qwen_image_21 —— Qwen-Image-2.1 文生图（512×512）

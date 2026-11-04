@@ -441,9 +441,18 @@ def _stats(arr: np.ndarray) -> Dict[str, float]:
 def depth_weight_path(rknn_path: str) -> str:
     """Derive the ``.weight`` path that belongs to an ``.rknn`` file.
 
-    Mirrors ``make_weight_path`` in the C++ demo: replace a trailing
-    ``.rknn`` with ``.weight``, otherwise append ``.weight``.
+    The deployed file names follow the repo-wide convention
+    ``<role>_<Model>[.<variant>].1828.rknn`` paired with
+    ``<role>_<Model>[.<variant>].weight`` — the ``.1828`` target segment is
+    dropped from the weight name (same rule as ``vlm.py``:
+    ``str(f).replace(".1828.rknn", ".weight")``).
+
+    The legacy spelling (``.rknn`` → ``.weight``, mirroring
+    ``make_weight_path`` in the C++ demo) is kept as a fallback so an
+    older export layout still resolves.
     """
+    if rknn_path.endswith(".1828.rknn"):
+        return rknn_path[: -len(".1828.rknn")] + ".weight"
     if rknn_path.endswith(".rknn"):
         return rknn_path[: -len(".rknn")] + ".weight"
     return rknn_path + ".weight"
@@ -455,9 +464,9 @@ class DepthAnythingBackend:
     Owns the three RKNN stages and drives them as the C++ demo does:
     ``local`` once per view, ``global`` once over all views, ``head`` once.
 
-    **当前限制**：只支持 **10-view（多视图融合）** 导出 —— ``global`` 段在
-    10 张图之间做融合，view 数烤进了它的输入形状，不是运行期参数。
-    **单路（单图）深度估计尚未实现**。
+    **当前部署的导出是 1-view（280×280）**：``global`` 段的输入形状是
+    ``[1, 401, 1, 768]``，``head`` 段输出 ``[1, 1, 280, 280]`` —— 单张图
+    即可出深度图 + 置信度。多视图融合导出（``--views N``）同样能用。
 
     换 view 数**不需要改这个类**：``self.views`` 是从 ``global`` 的输入张量
     属性上读出来的（见 :meth:`_read_model_geometry`），所以重新导出

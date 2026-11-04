@@ -1,10 +1,1 @@
 frame_01.jpg
-frame_02.jpg
-frame_03.jpg
-frame_04.jpg
-frame_05.jpg
-frame_06.jpg
-frame_07.jpg
-frame_08.jpg
-frame_09.jpg
-frame_10.jpg
