@@ -60,12 +60,12 @@ Layout of the model package (see ``/home/rockchip/models/qwenimage21``)::
     dit_qwenimage21-512hc.seg{0..3}.1828.rknn / .weight   DiT 4 段（切头）
     dit_qwenimage21-512.head.1828.rknn / .weight          DiT 的「头」（另一张卡）
     dit_qwenimage21-512hc.int_ledger                     每核 internal 账本（跳探针）
-    vae_qwenimage21-512.rknn2.rknn                       ⭐ VAE（rknn2，跑本机 NPU）
+    vae_qwenimage21-512.3588.rknn                       ⭐ VAE（rknn2，跑本机 NPU）
     vae_qwenimage21-512.seg{0..3}.1828.rknn / .weight    VAE 兜底（rknn3，跑 1828）
 
 ⭐ **VAE 有两条路，cshim 自动选**：
 
-* ``vae_qwenimage21-512.rknn2.rknn`` 存在 ⇒ VAE 跑**本机 RK3588 的 rknn2
+* ``vae_qwenimage21-512.3588.rknn`` 存在 ⇒ VAE 跑**本机 RK3588 的 rknn2
   NPU**（3 核全用）⇒ 与 DiT（1828）**物理分开** ⇒ DiT 全程常驻 ⇒
   生成过程**零 model_init**。
 * 不存在 / 本机没装 ``rknn2-runtime`` ⇒ 自动退回 rknn3 的 4 段 VAE 链
@@ -79,6 +79,7 @@ Layout of the model package (see ``/home/rockchip/models/qwenimage21``)::
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -119,12 +120,40 @@ _INT_LEDGER_NAME = "dit_qwenimage21-512hc.int_ledger"
 _FM_MU_512 = "0.5387096774"
 
 #: Default board topology (2 × RK1828 behind the RK3588 host).
+#: ⚠️ 这两个只是**枚举失败时的兜底** —— 正常路径是 `_ep_card_ids()` 现枚举。
 _CARD0 = "0000:01:00.0"
 _CARD1 = "0003:31:00.0"
 
+#: PCIe BDF 形态（``0000:01:00.0``）—— 能跑 rknn 模型的卡。
+#: RGA/VPU（USB 序列号形态）不算。
+_PCI_BDF_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.\d+$")
+
+
+def _ep_card_ids() -> List[str]:
+    """枚举本机的 PCIe EP 协卡（RK1828），按 PCI BDF 升序。
+
+    「卡号」的定义域：``_ep_card_ids()[i]`` 即第 i 张卡。
+    枚举不到（没装 rknn3 runtime / 驱动异常）⇒ 返回空列表，
+    调用方退回兜底的硬编码地址。
+    """
+    try:
+        from .._librknn import RKNN3Lite
+        devs = RKNN3Lite().get_devices_id()
+    except Exception:  # noqa: BLE001 — 枚举失败不该让整个后端起不来
+        return []
+    out: List[str] = []
+    for d in devs or ():
+        try:
+            t = d.decode("utf-8", "replace").strip() if isinstance(d, bytes) else str(d).strip()
+        except Exception:  # noqa: BLE001
+            continue
+        if _PCI_BDF_RE.match(t):
+            out.append(t)
+    return sorted(set(out))
+
 #: ⭐ VAE 的 NPU 核掩码 —— **只作用于本机 RK3588 的 rknn2 NPU**（3 个核）。
 #:
-#: 当模型包里带 rknn2 版 VAE（``vae_qwenimage21-512.rknn2.rknn``）时，
+#: 当模型包里带 rknn2 版 VAE（``vae_qwenimage21-512.3588.rknn``）时，
 #: VAE 跑在**本机** NPU 上 ⇒ 与 DiT（1828 协处理器）**物理分开**
 #: ⇒ DiT 全程常驻 ⇒ 生成过程**零 model_init**。
 #:
@@ -318,21 +347,40 @@ class ImageBackend:
     def _ensure_shim(self, opts: Dict[str, Any]):
         """打开（或复用）cshim 会话。
 
-        ⭐ 会话里 TE + DiT 常驻 ⇒ 批量出图时只 init 一次。
-           ⚠️ 但 **DiT 与 VAE 不能共卡** ⇒ 每批图结束后 DiT 被释放，
-             下一批要重新 init（39 s）—— 这是物理限制，不是实现问题。
+        ⭐ 会话里 **TE + DiT + VAE 全部常驻** ⇒ 批量出图时只 init 一次，
+           推理过程中**不卸载 / 不重装载**任何模型。
+           ⚠️ VAE 必须**独占**一个 NPU 设备：要么本机 3588（rknn2），
+             要么第三张 1828 卡（rknn3 4 段）。两者都没有 ⇒ open 直接失败。
         """
         if self._shim is not None:
             return self._shim
         from .._qwen_image_c import QwenImageShim
 
         self._ensure_proxy()
-        self.sink.emit("[Qwen-Image-2.1] 加载模型（TE + DiT 常驻，约 90 s）…")
+        self.sink.emit("[Qwen-Image-2.1] 加载模型（TE + DiT + VAE 全部常驻，约 90 s）…")
         t0 = time.perf_counter()
+        # ---- 拓扑：现枚举本机 EP 卡（RK1828），按 BDF 升序 ----
+        #   card0 = TE + DiT 头 / card1 = DiT 4 段 / card2 = VAE(rknn3) 独占第三张卡
+        #   两种支持的布局：
+        #     A) 2×1828 + 3588 ⇒ VAE 走本机 3588 的 rknn2（card_vae 留空）
+        #     B) 3×1828       ⇒ VAE(rknn3 4 段) 独占 card2
+        #   全部模型在 open 阶段一次装好并全程常驻，**推理过程中不卸载/不重装载**。
+        eps = _ep_card_ids()
+        if eps:
+            card_te = opts.get("card0") or eps[0]
+            card_dit = opts.get("card1") or (eps[1] if len(eps) > 1 else eps[0])
+            card_vae = opts.get("card2") or (eps[2] if len(eps) > 2 else "")
+        else:
+            # 枚举不到 ⇒ 退回兜底（只够 2×1828 + 3588 这一种布局）
+            card_te = opts.get("card0") or _CARD0
+            card_dit = opts.get("card1") or _CARD1
+            card_vae = opts.get("card2") or ""
+            _log("  ⚠️ 枚举不到 EP 协卡 ⇒ 用兜底地址（VAE 只能走本机 3588）")
         self._shim = QwenImageShim(
             self.model_dir,
-            card_te=str(opts["card0"]).encode(),
-            card_dit=str(opts["card1"]).encode(),
+            card_te=str(card_te).encode(),
+            card_dit=str(card_dit).encode(),
+            card_vae=str(card_vae).encode(),
             vae_core_mask=int(opts.get("vae_core_mask", _VAE_CORE_MASK)),
             verbose=bool(opts.get("verbose", True)),
             progress=self._on_cshim_progress,
@@ -538,6 +586,7 @@ class ImageBackend:
             "noise_seed": 0,
             "card0": _CARD0,
             "card1": _CARD1,
+            "card2": "",
             "vae_core_mask": _VAE_CORE_MASK,
             "output_dir": None,
             "work_dir": None,

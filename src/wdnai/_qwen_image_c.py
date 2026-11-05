@@ -110,6 +110,18 @@ def _load() -> ctypes.CDLL:
         _PROGRESS_CB, ctypes.c_void_p,
         ctypes.c_char_p, ctypes.c_int,
     ]
+    # ⭐ 带「VAE 独占卡」的版本：拓扑 A（2×1828+3588）传空 card_vae，
+    #    拓扑 B（3×1828）传第三张卡的 BDF。
+    #    ⚠️⚠️ **restype/argtypes 必须显式声明**：ctypes 默认 restype=c_int，
+    #    会把 64 位会话指针**截断成 32 位** ⇒ open 阶段 C 侧照常跑完（看不出
+    #    异常），但后续 generate/te_encode 拿截断指针解引用 ⇒ **SIGSEGV**。
+    lib.qi_qwen_open_ex3.restype = ctypes.c_void_p
+    lib.qi_qwen_open_ex3.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.c_uint32, ctypes.c_uint32,
+        _PROGRESS_CB, ctypes.c_void_p,
+        ctypes.c_char_p, ctypes.c_int,
+    ]
     lib.qi_qwen_set_progress.restype = None
     lib.qi_qwen_set_progress.argtypes = [
         ctypes.c_void_p, _PROGRESS_CB, ctypes.c_void_p,
@@ -164,7 +176,19 @@ class QwenImageShim:
     card_te:
         **TE + DiT 头**所在卡（如 ``b"0000:01:00.0"``）
     card_dit:
-        **DiT 4 段 + VAE**所在卡（如 ``b"0003:31:00.0"``）
+        **DiT 4 段**所在卡（如 ``b"0003:31:00.0"``）
+    card_vae:
+        ⭐ **VAE 独占卡**（PCI BDF，如 ``b"0006:xx:00.0"``）—— 只在
+        **3×1828** 拓扑下需要：模型包里没有 ``vae_qwenimage21-512.3588.rknn``
+        （本机 3588 跑 rknn2）时，VAE(rknn3 4 段) 改用它**独占**第三张卡。
+
+        **两种支持的拓扑**（全部模型在 open 阶段一次装好、全程常驻，
+        推理过程中**不卸载/不重装载**）：
+
+        A) ``2×1828 + 3588`` —— ``card_vae`` 留空 ⇒ VAE 跑本机 3588 的 NPU。
+        B) ``3×1828`` —— ``card_vae`` = 第三张卡 ⇒ VAE 独占它。
+
+        两者都没有 ⇒ **open 直接失败**（不再退回「与 DiT 共卡 + 每批重建 39 s」）。
     core_mask:
         NPU 核掩码（默认全开）—— 只作用于 **rknn3** 侧（1828）
     vae_core_mask:
@@ -182,7 +206,8 @@ class QwenImageShim:
         打印版本号
     progress:
         **进度回调**，签名 ``cb(stage: str, step: int, total: int, elapsed_ms: float)``。
-        ``stage`` ∈ {"init", "te", "flow", "vae", "vae_init", "release", "done"}；
+        ``stage`` ∈ {"init", "te", "flow", "vae", "done"}（``vae_init`` / ``release``
+        是旧「与 DiT 共卡」拓扑的遗留，现已**不再出现**）；
         ``elapsed_ms`` = **距上一次回调**的毫秒数（= 这一步花了多久）。
 
         ⭐ 必须在**构造时**传 —— 那 ~90 s 的模型加载（TE 37 s + DiT 39 s）
@@ -195,6 +220,7 @@ class QwenImageShim:
         *,
         card_te: bytes = b"0000:01:00.0",
         card_dit: bytes = b"0003:31:00.0",
+        card_vae: bytes = b"",
         core_mask: int = 0xFF,
         vae_core_mask: int = 0,
         verbose: bool = True,
@@ -217,10 +243,11 @@ class QwenImageShim:
                     pass
 
             self._progress_cb = _PROGRESS_CB(_trampoline)
-        self._h = self._lib.qi_qwen_open_ex2(
+        self._h = self._lib.qi_qwen_open_ex3(
             str(self.model_dir).encode(),
             card_te,
             card_dit,
+            card_vae,
             ctypes.c_uint32(core_mask),
             ctypes.c_uint32(vae_core_mask),
             self._progress_cb,

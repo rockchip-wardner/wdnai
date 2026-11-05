@@ -237,7 +237,7 @@ int VaeChain2::decode(const std::vector<unsigned char>& lat_fp16, int channels,
       // 输出是 [1, C, H, W]（逻辑 NCHW）⇒ 取前 3 通道归一化成 uint8 RGB
       //
       // ⭐⭐ **dtype 必须看实际拿到的值，不能写死 fp16**：
-      //    * fp16 模型（`vae_qwenimage21-512.rknn2.rknn` 早期版本）→ fp16
+      //    * fp16 模型（`vae_qwenimage21-512.3588.rknn` 早期版本）→ fp16
       //    * **量化模型（w8a8）→ runtime 用 want_float=1 反量化成 fp32**
       //      （不置 want_float 拿到的是裸 int8，当 fp16 读直接是垃圾）
       //    写死 fp16 会把 fp32 的字节两两当成一个 fp16 读 ⇒ **元素数翻倍**

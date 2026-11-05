@@ -28,6 +28,14 @@
 
 namespace {
 
+// ⚠️ stdout 在**重定向到文件**时默认是**全缓冲**（4~8 KB）⇒ 进程被
+//    SIGSEGV / SIGKILL 掉时，缓冲区里的日志**全部丢失** ⇒ 现场看起来
+//    「worker 莫名其妙就死了，没有任何线索」。
+//    改成行缓冲 ⇒ 每行 printf 立刻落盘，崩溃点前最后一行就是断点。
+struct StdoutLineBuffer {
+  StdoutLineBuffer() { setvbuf(stdout, nullptr, _IOLBF, 0); }
+} g_stdout_line_buffer;
+
 void set_err(char* err, int err_len, const std::string& msg) {
   if (!err || err_len <= 0) return;
   snprintf(err, (size_t)err_len, "%s", msg.c_str());
@@ -41,28 +49,54 @@ const char* kHeadModel = "dit_qwenimage21-512.head.1828.rknn";
 const char* kHeadWeight = "dit_qwenimage21-512.head.weight";
 const char* kLedger = "dit_qwenimage21-512hc.int_ledger";
 
+// 「VAE 没有独占设备」时的统一报错文案（open 阶段的**秒级**检查与
+//  真正 init VAE 之前各用一次 ⇒ 两处文案不会漂移）。
+static const char* kNoDedicatedVae =
+    "VAE 没有可独占的 NPU 设备：模型包里既没有 vae_qwenimage21-512.3588.rknn"
+    "（本机 3588 跑 rknn2），也没给第三张 1828 卡（跑 rknn3 的 4 段 VAE）。"
+    "**不再退回「与 DiT 共卡」** —— 那会让每批图多 39 s 的 DiT 重建。";
+
 // ⭐ rknn2（**本机 RK3588 NPU**）上的 VAE 解码器。
-//   整图版：vae_qwenimage21-512.rknn2.rknn
-//   分段版：vae_qwenimage21-512.rknn2.seg{0..N}.rknn
+//   命名跟模型包里的其它文件统一成「后缀 = 跑在哪块 SoC」：
+//     整图版：vae_qwenimage21-512.3588.rknn
+//     分段版：vae_qwenimage21-512.seg{0..N}.3588.rknn
+//   （与 DiT/TE 的 .1828.rknn 同一套命名规则）
+//   旧的 `vae_qwenimage21-512.rknn2.rknn` / `.rknn2.seg{0..N}.rknn` 仍兼容，
+//   老模型包不用重新打包。
 //   ⚠️ 整图优先；没有整图就按 seg0/seg1/... 找分段。
-const char* kVae2Whole = "vae_qwenimage21-512.rknn2.rknn";
-const char* kVae2SegStem = "vae_qwenimage21-512.rknn2.seg";
 constexpr int kVae2MaxSegs = 8;
 
 // 在 model_dir 里找 rknn2 的 VAE 模型（整图优先，其次分段）
 static std::vector<std::string> find_vae2_models(const std::string& model_dir) {
   std::vector<std::string> out;
-  std::string whole = qi::join_path(model_dir, kVae2Whole);
-  if (access(whole.c_str(), R_OK) == 0) {
-    out.push_back(whole);
-    return out;
+  // ---- 整图（按优先级）----
+  static const char* kWholeNames[] = {
+      "vae_qwenimage21-512.3588.rknn",   // 新命名：.3588 = 跑在 RK3588 上
+      "vae_qwenimage21-512.rknn2.rknn",   // 旧命名（兼容老模型包）
+  };
+  for (const char* name : kWholeNames) {
+    std::string p = qi::join_path(model_dir, name);
+    if (access(p.c_str(), R_OK) == 0) {
+      out.push_back(p);
+      return out;
+    }
   }
-  for (int i = 0; i < kVae2MaxSegs; ++i) {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "%s%d.rknn", kVae2SegStem, i);
-    std::string p = qi::join_path(model_dir, buf);
-    if (access(p.c_str(), R_OK) != 0) break;
-    out.push_back(p);
+  // ---- 分段流式 ----
+  struct SegForm { const char* stem; const char* suffix; };
+  static const SegForm kSegForms[] = {
+      {"vae_qwenimage21-512.seg", ".3588.rknn"},   // 新命名
+      {"vae_qwenimage21-512.rknn2.seg", ".rknn"},  // 旧命名（兼容老模型包）
+  };
+  for (const SegForm& form : kSegForms) {
+    std::vector<std::string> segs;
+    for (int i = 0; i < kVae2MaxSegs; ++i) {
+      char buf[128];
+      snprintf(buf, sizeof(buf), "%s%d%s", form.stem, i, form.suffix);
+      std::string p = qi::join_path(model_dir, buf);
+      if (access(p.c_str(), R_OK) != 0) break;
+      segs.push_back(p);
+    }
+    if (!segs.empty()) return segs;
   }
   return out;
 }
@@ -122,17 +156,19 @@ bool read_meta_shape(const std::string& path, std::vector<int>* shape) {
 struct qi_qwen_session {
   qi::TeEncoder te;
   qi::ResidentChain dit;
-  qi::VaeChain vae;      // rknn3 的 VAE 链（1828 上，与 DiT 共卡 ⇒ 要互斥）
+  qi::VaeChain vae;      // rknn3 的 VAE 链（1828 上，**独占第三张卡** ⇒ 与 DiT 互不干扰）
   qi::VaeChain2 vae2;    // rknn2 的 VAE 链（**本机 RK3588 NPU** ⇒ 与 DiT 物理分开）
   std::string model_dir;
   std::string work_dir;
   std::string card_te;
   std::string card_dit;
+  std::string card_vae;   // rknn3 VAE 独占的第三张 1828 卡（空 ⇒ 只能走 rknn2）
   uint32_t core_mask = 0xFF;
   uint32_t vae_core_mask = 0;   // 0 ⇒ 默认（3 核全用）
   bool dit_ready = false;
   bool vae_ready = false;
   bool vae2_ready = false;      // ⭐ rknn2 VAE 可用 ⇒ DiT 全程常驻
+  bool vae_resident = false;    // rknn3 VAE 链也常驻（独占第三张卡时）
 
   // ---- 进度回调（可选）----
   // ⚠️ 一个会话只有**一个** qi_progress_ctx —— 各层共享它 ⇒ elapsed 口径全局一致
@@ -152,8 +188,12 @@ static void begin_stage(qi_qwen_session* s, const char* stage) {
 }
 
 // ---------------------------------------------------------------------------
-// 把 DiT 链重新 init 起来（generate_batch 结束后 DiT 被释放，
-// 因为 DiT 与 VAE 物理上不能共卡 ⇒ 下一批图要重新 init）
+// 把 DiT 链 init 起来（**只在 open 阶段调用一次**）
+//
+// ⚠️ 旧拓扑（VAE 与 DiT 共卡）里，generate_batch 结束会释放 DiT、下一批
+//    再 init 回来（每批多 39 s model_init）。现在 VAE 必须独占设备，
+//    DiT **全程常驻** ⇒ 这个函数**不再**有「重建」用途；
+//    generate_batch 里 dit_ready=false 会**直接报错**（拒绝推理中重建模型）。
 static int init_dit(qi_qwen_session* s, char* err, int err_len) {
   std::vector<std::string> seg_models, seg_weights, device_ids;
   for (int i = 0; i < 4; ++i) {
@@ -200,14 +240,46 @@ qi_qwen_session* qi_qwen_open_ex2(const char* model_dir, const char* card_te,
                                   const char* card_dit, uint32_t core_mask,
                                   uint32_t vae_core_mask, qi_progress_cb cb, void* user,
                                   char* err, int err_len) {
+  // 老接口：没有第三张卡 ⇒ 只能走 rknn2（本机 3588）
+  return qi_qwen_open_ex3(model_dir, card_te, card_dit, "", core_mask, vae_core_mask,
+                           cb, user, err, err_len);
+}
+
+qi_qwen_session* qi_qwen_open_ex3(const char* model_dir, const char* card_te,
+                                  const char* card_dit, const char* card_vae,
+                                  uint32_t core_mask,
+                                  uint32_t vae_core_mask, qi_progress_cb cb, void* user,
+                                  char* err, int err_len) {
   if (!model_dir) {
     set_err(err, err_len, "model_dir 为空");
     return nullptr;
+  }
+  // ---- 0. ⭐ **秒级**检查「VAE 有没有独占设备」----
+  //   为什么要放在最前面：VAE 的可用性**只取决于模型包里有没有那个文件**
+  //   （加上有没有第三张卡）。如果等到 TE(37 s) + DiT(60 s) 全部加载完才发现
+  //   VAE 缺失，用户要**白等 2 分钟**才知道开不了工。
+  //   这里只是几个 access()，~0 ms —— 不合格就立刻失败。
+  {
+    std::vector<std::string> vae2_probe = find_vae2_models(model_dir);
+    bool has_rknn3_vae = false;
+    if (card_vae && card_vae[0]) {
+      has_rknn3_vae = true;
+      for (int i = 0; i < 4; ++i) {
+        std::string p = qi::join_path(
+            model_dir, seg_name("vae_qwenimage21-512", i, ".1828.rknn"));
+        if (access(p.c_str(), R_OK) != 0) { has_rknn3_vae = false; break; }
+      }
+    }
+    if (vae2_probe.empty() && !has_rknn3_vae) {
+      set_err(err, err_len, kNoDedicatedVae);
+      return nullptr;
+    }
   }
   qi_qwen_session* s = new qi_qwen_session();
   s->model_dir = model_dir;
   s->card_te = card_te ? card_te : "";
   s->card_dit = card_dit ? card_dit : "";
+  s->card_vae = card_vae ? card_vae : "";
   s->core_mask = core_mask ? core_mask : 0xFF;
   s->vae_core_mask = vae_core_mask;
   // ⚠️ 进度回调必须在**加载模型之前**装上 —— 否则那 90 s 的 init
@@ -279,26 +351,59 @@ qi_qwen_session* qi_qwen_open_ex2(const char* model_dir, const char* card_te,
     return nullptr;
   }
 
-  // ---- 3. ⭐ VAE(rknn2)：跑在**本机 RK3588 的 NPU**上 ----
-  //   与 DiT（1828 协处理器）**物理分开** ⇒ DiT 全程常驻，零 model_init。
-  //   找不到 rknn2 模型 / 没装 rknn2 runtime ⇒ 退回 rknn3 的 VAE 链
-  //   （与改造前行为完全一致）。
+  // ---- 3. ⭐ VAE：**必须独占一个 NPU 设备** ----
+  //   两种支持的拓扑（都由**模型包里的文件名**决定，不由运行时猜）：
+  //     A) 2×1828 + 3588：`.3588.rknn`（rknn2）⇒ VAE 跑**本机 RK3588 的 NPU**
+  //        ⇒ 与 DiT 物理分开，DiT 全程常驻。
+  //     B) 3×1828：`.seg{0..3}.1828.rknn`（rknn3）⇒ VAE 独占**第三张卡**。
+  //   ⚠️ **不再支持「VAE 与 DiT 共卡」** —— 那要求推理前释放 DiT、推理后重建，
+  //      每批图多 39 s model_init。现在没有独占设备就在 open 阶段**明确失败**。
   {
     std::vector<std::string> vae2_models = find_vae2_models(s->model_dir);
     if (!vae2_models.empty()) {
       emit_progress(s, "init", 3, 3);
       int r2 = s->vae2.init(vae2_models, s->vae_core_mask, /*prefer_resident=*/true);
-      if (r2 == 0) {
-        s->vae2_ready = true;
-        printf("[qi] ⭐ VAE 走本机 rknn2（RK3588 NPU，%zu 段）⇒ DiT 全程常驻\n",
-               vae2_models.size());
-      } else {
-        printf("[qi] ⚠️ rknn2 VAE 初始化失败（%s）⇒ 退回 rknn3 VAE 链\n",
-               s->vae2.error().c_str());
+      if (r2 != 0) {
+        set_err(err, err_len,
+                std::string("rknn2 VAE 初始化失败（") + s->vae2.error() +
+                    "）⇒ 本机 3588 的 NPU 跑不了这个 VAE；"
+                    "请检查 rknn2-runtime（apt install rknn2-runtime）是否装好");
         s->vae2.release();
+        delete s;
+        return nullptr;
       }
+      s->vae2_ready = true;
+      printf("[qi] ⭐ VAE 走本机 rknn2（RK3588 NPU，%zu 段）⇒ DiT 全程常驻\n",
+             vae2_models.size());
+    } else if (!s->card_vae.empty()) {
+      // ---- 拓扑 B：3×1828，VAE 独占第三张卡 ----
+      emit_progress(s, "init", 3, 3);
+      std::vector<std::string> vae_models, vae_weights;
+      for (int i = 0; i < 4; ++i) {
+        vae_models.push_back(
+            qi::join_path(s->model_dir, seg_name("vae_qwenimage21-512", i, ".1828.rknn")));
+        vae_weights.push_back(
+            qi::join_path(s->model_dir, seg_name("vae_qwenimage21-512", i, ".weight")));
+      }
+      int rv = s->vae.init(vae_models, vae_weights, s->core_mask,
+                            s->card_vae.c_str(), /*prefer_resident=*/true);
+      if (rv != 0) {
+        set_err(err, err_len,
+                std::string("rknn3 VAE（独占第三张卡 ") + s->card_vae +
+                    "）初始化失败：" + s->vae.error());
+        s->vae.release();
+        delete s;
+        return nullptr;
+      }
+      s->vae_ready = true;
+      s->vae_resident = true;
+      printf("[qi] ⭐ VAE 走第三张 1828 卡（%s）⇒ 与 DiT 互不干扰，全程常驻\n",
+             s->card_vae.c_str());
     } else {
-      printf("[qi] ℹ️ 模型包里没有 rknn2 的 VAE ⇒ 用 rknn3 VAE 链（DiT 与 VAE 共卡）\n");
+      // （理论上走不到 —— open 开头的秒级检查已经拦下了；留作兜底）
+      set_err(err, err_len, kNoDedicatedVae);
+      delete s;
+      return nullptr;
     }
   }
   emit_progress(s, "init", 3, 3);
@@ -361,10 +466,19 @@ int qi_qwen_generate_batch(qi_qwen_session* s, int n_images,
     return 1;
   }
   if (!s->dit_ready) {
-    // 上一批图结束后 DiT 被释放（不能与 VAE 共卡）⇒ 这里重新 init
-    if (init_dit(s, err, err_len) != 0) {
-      return 1;
-    }
+    // ⚠️ **不允许在推理过程中卸载/重装载模型**。
+    //    正常情况下 open 阶段就把 TE / DiT / VAE 全部装好并常驻，
+    //    这里只可能是因为上一轮有人手动释放过 ⇒ 直接报错，不偷偷重建。
+    set_err(err, err_len,
+            "DiT 不在常驻状态（dit_ready=false）—— **拒绝推理中重建模型**。"
+            "请重新打开会话（open 阶段会一次性把 TE/DiT/VAE 全部装好）。");
+    return 1;
+  }
+  if (!s->vae2_ready && !s->vae_ready) {
+    set_err(err, err_len,
+            "VAE 不在常驻状态（既没有 rknn2 的 3588 VAE，也没有独占卡的 rknn3 VAE）"
+            "—— **拒绝推理中重建模型**。");
+    return 1;
   }
   const bool debug_dump = getenv("QI_DEBUG_DUMP") != nullptr;
 
@@ -507,33 +621,20 @@ int qi_qwen_generate_batch(qi_qwen_session* s, int n_images,
     return 0;
   }
 
-  // ---- B) rknn3 老路径：释放 DiT → VAE 4 段流式 ----
-  begin_stage(s, "release");
-  emit_progress(s, "release", 1, 1);
-  s->dit.release();
-  s->dit_ready = false;
-
-  std::vector<std::string> vae_models, vae_weights;
-  for (int i = 0; i < 4; ++i) {
-    vae_models.push_back(qi::join_path(s->model_dir, seg_name("vae_qwenimage21-512", i, ".1828.rknn")));
-    vae_weights.push_back(qi::join_path(s->model_dir, seg_name("vae_qwenimage21-512", i, ".weight")));
-  }
-  int ret = s->vae.init(vae_models, vae_weights, s->core_mask,
-                        s->card_dit.empty() ? nullptr : s->card_dit.c_str(),
-                        /*prefer_resident=*/false);
-  if (ret != 0) {
-    set_err(err, err_len, "VAE 初始化失败: " + s->vae.error());
+  // ---- B) rknn3 路径：VAE 独占第三张 1828 卡，**open 阶段就已常驻** ----
+  //   ⚠️ 这里**不再**释放 DiT、**不再**init VAE —— 全部在 open 阶段做完。
+  //   推理过程中一律不卸载/重装载模型。
+  if (!s->vae_ready) {
+    set_err(err, err_len, "rknn3 VAE 链不可用（open 阶段应已初始化并常驻）");
     qi_qwen_free(all_rgb);
     return 1;
   }
-  s->vae_ready = true;
-  begin_stage(s, "vae_init");
-  emit_progress(s, "vae_init", 1, 1);
 
   for (int img = 0; img < n_images; ++img) {
     char pref[256];
     snprintf(pref, sizeof(pref), "%s/img%02d", s->work_dir.c_str(), img + 1);
     double ms = 0.0;
+    int ret = 0;
     begin_stage(s, "vae");
     ret = s->vae.decode(latents[(size_t)img], /*channels=*/0, s->work_dir, pref, &ms);
     if (ret != 0) {
@@ -592,8 +693,8 @@ int qi_qwen_generate_batch(qi_qwen_session* s, int n_images,
     }
   }
   *out_rgb = all_rgb;
-  s->vae.release();
-  s->vae_ready = false;
+  // ⭐ **不释放 VAE** —— 它独占第三张卡，与 DiT 互不干扰 ⇒ 下一批直接用，
+  //    整个会话生命周期内**零 model_init**。
   begin_stage(s, "done");
   emit_progress(s, "done", 1, 1);
   return 0;

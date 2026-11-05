@@ -67,6 +67,31 @@ qi_qwen_session* qi_qwen_open_ex2(const char* model_dir,
                                   qi_progress_cb cb, void* user,
                                   char* err, int err_len);
 
+/* 同 qi_qwen_open_ex2，但多一个 **VAE 独占卡**（``card_vae``，PCI BDF 文本）。
+ *
+ * ⭐ 两种支持的拓扑（**全部模型一次性装好并全程常驻**，推理过程中
+ *   **不卸载 / 不重装载**任何模型）：
+ *
+ *   A) **2×1828 + 3588** —— 模型包里有 ``vae_qwenimage21-512.3588.rknn``
+ *      ⇒ VAE 跑**本机 RK3588 的 NPU**（rknn2 / librknnrt），
+ *      与 DiT（1828）**物理分开**。``card_vae`` 传空即可。
+ *   B) **3×1828** —— 没有 3588 的 rknn2 VAE，但有第三张 1828 卡
+ *      ⇒ ``card_vae`` 传那张卡的 BDF，VAE(rknn3 4 段) **独占**它，
+ *      与 DiT 互不干扰、同样常驻。
+ *
+ * ⚠️ 两者都没有 ⇒ **open 直接失败**并给出中文原因。
+ *    **不再退回「VAE 与 DiT 共卡」** —— 那要求推理前释放 DiT、推理后重建，
+ *    每批图多 39 s model_init，与「全程常驻」的目标冲突。
+ */
+qi_qwen_session* qi_qwen_open_ex3(const char* model_dir,
+                                  const char* card_te,
+                                  const char* card_dit,
+                                  const char* card_vae,
+                                  uint32_t core_mask,
+                                  uint32_t vae_core_mask,
+                                  qi_progress_cb cb, void* user,
+                                  char* err, int err_len);
+
 void qi_qwen_close(qi_qwen_session* s);
 
 /* 装进度回调（可选；不装就是现在的行为 —— 一行日志都不多打）。
