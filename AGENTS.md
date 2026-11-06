@@ -879,6 +879,12 @@ grounding 链路定义在 `src/wdnai/grounding.py`（独立模块，**不**耦�
   已经固化在 **cshim（C 侧）** 里 —— 用 `src/wdnai/_cshim/` 那份，
   **别在 Python 里重写一遍**（纯 Python 版试过：能对齐，但要额外复刻
   FMA 收缩、fp16 次正规数的怪癖、libstdc++ 的 mt19937，容易踩 1 ULP 的坑）。
+- **不要给 Qwen-Image 的卡号写默认值**：`backends/image.py::_ep_card_ids()`
+  是**唯一**的卡号来源（运行时枚举本机 EP 协卡，按 PCI BDF 升序）⇒
+  `card0` / `card1` / `card2` 的默认值是 `None`（留空 = 交给枚举），
+  `QwenImageShim` 的 `card_te` / `card_dit` **必填**。写死某个 PCI 地址在
+  别的板子上必然失败（`rknn3_init` 报 device id not found ⇒ 「TE 初始化失败」）。
+  枚举不到且没显式给值 ⇒ **直接报错**，不拿猜的地址去初始化。
 - ⭐⭐⭐ **图生图缺 VAE 编码器时必须报错，绝不能退化成文生图**（2026-11-06）：
   编码器是**可选件**（模型包里没有 `vae_qwenimage21-512.encoder.3588.rknn`
   是合法状态）⇒ `run_images()` 要**明确抛错**说明缺哪个文件，

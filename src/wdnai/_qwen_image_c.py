@@ -188,9 +188,13 @@ class QwenImageShim:
         ⭐ 第三十六轮起**包里只有模型**：初始噪声由 cshim 现场生成
         （numpy 兼容的 PCG64 + ziggurat），不再需要 ``reference_512/``。
     card_te:
-        **TE + DiT 头**所在卡（如 ``b"0000:01:00.0"``）
+        **TE + DiT 头**所在卡的 PCI BDF（如 ``b"0001:11:00.0"``）—— 必填
     card_dit:
-        **DiT 4 段**所在卡（如 ``b"0003:31:00.0"``）
+        **DiT 4 段**所在卡的 PCI BDF（如 ``b"0003:31:00.0"``）—— 必填
+
+        ⚠️ 两张卡**没有默认值** ⇒ 传错/漏传会在构造时立刻报错，
+           而不是拿着别的板子的 BDF 去 ``rknn3_init``（报「device id not found」）。
+           调用方用 ``wdnai.backends.image._ep_card_ids()`` 现枚举本机 EP 协卡。
     card_vae:
         ⭐ **VAE 独占卡**（PCI BDF，如 ``b"0006:xx:00.0"``）—— 只在
         **3×1828** 拓扑下需要：模型包里没有 ``vae_qwenimage21-512.3588.rknn``
@@ -232,8 +236,8 @@ class QwenImageShim:
         self,
         model_dir: os.PathLike | str,
         *,
-        card_te: bytes = b"0000:01:00.0",
-        card_dit: bytes = b"0003:31:00.0",
+        card_te: bytes,
+        card_dit: bytes,
         card_vae: bytes = b"",
         core_mask: int = 0xFF,
         vae_core_mask: int = 0,
@@ -245,7 +249,10 @@ class QwenImageShim:
         self._err = ctypes.create_string_buffer(512)
         # 进度回调的 CFUNCTYPE 实例必须**持有引用** —— 否则会被 GC，
         # C 侧再回调就是野指针。
-        self._progress_cb = None
+        # ⚠️ 空实例（`_PROGRESS_CB()`）= **NULL 指针** ⇒ C 侧判空后不回调。
+        #    直接传 None 会被 ctypes 拒掉（TypeError: expected CFunctionType
+        #    instance instead of NoneType）。
+        self._progress_cb = _PROGRESS_CB()
         if progress is not None:
             def _trampoline(_user, stage, step, total, elapsed_ms):
                 try:

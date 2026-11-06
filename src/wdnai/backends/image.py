@@ -119,11 +119,6 @@ _INT_LEDGER_NAME = "dit_qwenimage21-512hc.int_ledger"
 #: The 1024×1024 value (0.6935483871) is **wrong** here.
 _FM_MU_512 = "0.5387096774"
 
-#: Default board topology (2 × RK1828 behind the RK3588 host).
-#: ⚠️ 这两个只是**枚举失败时的兜底** —— 正常路径是 `_ep_card_ids()` 现枚举。
-_CARD0 = "0000:01:00.0"
-_CARD1 = "0003:31:00.0"
-
 #: PCIe BDF 形态（``0000:01:00.0``）—— 能跑 rknn 模型的卡。
 #: RGA/VPU（USB 序列号形态）不算。
 _PCI_BDF_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.\d+$")
@@ -134,7 +129,7 @@ def _ep_card_ids() -> List[str]:
 
     「卡号」的定义域：``_ep_card_ids()[i]`` 即第 i 张卡。
     枚举不到（没装 rknn3 runtime / 驱动异常）⇒ 返回空列表，
-    调用方退回兜底的硬编码地址。
+    调用方**直接报错** —— 没有可兜底的卡号。
     """
     try:
         from .._librknn import RKNN3Lite
@@ -375,16 +370,19 @@ class ImageBackend:
         #     B) 3×1828       ⇒ VAE(rknn3 4 段) 独占 card2
         #   全部模型在 open 阶段一次装好并全程常驻，**推理过程中不卸载/不重装载**。
         eps = _ep_card_ids()
+        card_te = opts.get("card0") or ""
+        card_dit = opts.get("card1") or ""
+        card_vae = opts.get("card2") or ""
         if eps:
-            card_te = opts.get("card0") or eps[0]
-            card_dit = opts.get("card1") or (eps[1] if len(eps) > 1 else eps[0])
-            card_vae = opts.get("card2") or (eps[2] if len(eps) > 2 else "")
-        else:
-            # 枚举不到 ⇒ 退回兜底（只够 2×1828 + 3588 这一种布局）
-            card_te = opts.get("card0") or _CARD0
-            card_dit = opts.get("card1") or _CARD1
-            card_vae = opts.get("card2") or ""
-            _log("  ⚠️ 枚举不到 EP 协卡 ⇒ 用兜底地址（VAE 只能走本机 3588）")
+            card_te = card_te or eps[0]
+            card_dit = card_dit or (eps[1] if len(eps) > 1 else eps[0])
+            card_vae = card_vae or (eps[2] if len(eps) > 2 else "")
+        elif not (card_te and card_dit):
+            # 枚举不到 ⇒ 只有**显式指定**的卡号可用；没有就报错（没有兜底地址）
+            raise RuntimeError(
+                "枚举不到本机 EP 协卡（RK1828），且未显式指定 card0/card1 —— "
+                "无法确定 TE / DiT 落在哪张卡。请检查 rknn3 runtime / 驱动是否正常。"
+            )
         self._shim = QwenImageShim(
             self.model_dir,
             card_te=str(card_te).encode(),
@@ -687,9 +685,10 @@ class ImageBackend:
             # ⭐ 图生图：保留原图的程度（0~1）。只对 run_images 有意义，
             #    文生图完全忽略它。
             "strength": 0.75,
-            "card0": _CARD0,
-            "card1": _CARD1,
-            "card2": "",
+            # ⭐ 卡号留空 ⇒ `_ensure_shim` 按**运行时枚举**分配；显式给值才覆盖。
+            "card0": None,
+            "card1": None,
+            "card2": None,
             "vae_core_mask": _VAE_CORE_MASK,
             "output_dir": None,
             "work_dir": None,

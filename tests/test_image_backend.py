@@ -360,3 +360,141 @@ def test_progress_message_does_not_touch_the_npu():
     backend.sink.add_observer(seen.append)
     backend._on_cshim_progress("vae", 2, 4, 2228.0)
     assert "stage=vae" in seen[0]
+
+
+# --------------------------------------------------------------------------- #
+# 选卡：按**运行时枚举**分配（不占 NPU）
+# --------------------------------------------------------------------------- #
+def _bare_backend(tmp_path):
+    """造一个不碰 NPU / 不起 proxy 的 ImageBackend。"""
+    backend = ImageBackend.__new__(ImageBackend)
+    backend.spec = ModelSpec(name="x", kind="image", variant="qwen-image-2.1")
+    backend.model_dir = tmp_path
+    backend.sink = image_mod._ProgressSink()
+    backend._shim = None
+    backend._ensure_proxy = lambda: None      # 别真去起 transfer proxy
+    return backend
+
+
+def _fake_shim(monkeypatch):
+    """把 QwenImageShim 换成记录参数的假货，返回记录 dict。"""
+    seen = {}
+
+    class _FakeShim:
+        def __init__(self, model_dir, **kw):
+            seen.update(kw)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("wdnai._qwen_image_c.QwenImageShim", _FakeShim)
+    return seen
+
+
+def test_default_options_leave_cards_to_runtime_enumeration():
+    """⭐ 卡号默认留空 ⇒ 交给**运行时枚举**，不写死任何 PCI 地址。"""
+    backend = _bare_backend(Path("/tmp"))
+    opts = backend._options({})
+    assert opts["card0"] is None
+    assert opts["card1"] is None
+    assert opts["card2"] is None
+
+
+def test_cards_come_from_runtime_enumeration(monkeypatch, tmp_path):
+    """⭐ 卡号必须来自 `_ep_card_ids()` 的**现枚举**结果。"""
+    eps = ["aaaa:11:00.0", "bbbb:31:00.0"]
+    monkeypatch.setattr(image_mod, "_ep_card_ids", lambda: list(eps))
+    seen = _fake_shim(monkeypatch)
+
+    backend = _bare_backend(tmp_path)
+    backend._ensure_shim(backend._options({}))
+
+    assert seen["card_te"] == b"aaaa:11:00.0"
+    assert seen["card_dit"] == b"bbbb:31:00.0"
+    assert seen["card_vae"] == b""          # 两张卡 ⇒ VAE 走本机 3588
+
+
+def test_third_card_takes_the_vae(monkeypatch, tmp_path):
+    """三张卡 ⇒ 第三张独占给 VAE(rknn3)。"""
+    monkeypatch.setattr(
+        image_mod, "_ep_card_ids",
+        lambda: ["aaaa:11:00.0", "bbbb:31:00.0", "cccc:31:00.0"],
+    )
+    seen = _fake_shim(monkeypatch)
+
+    backend = _bare_backend(tmp_path)
+    backend._ensure_shim(backend._options({}))
+
+    assert seen["card_te"] == b"aaaa:11:00.0"
+    assert seen["card_dit"] == b"bbbb:31:00.0"
+    assert seen["card_vae"] == b"cccc:31:00.0"
+
+
+def test_explicit_card_override_wins(monkeypatch, tmp_path):
+    """显式指定的卡号仍然优先于枚举结果。"""
+    monkeypatch.setattr(
+        image_mod, "_ep_card_ids", lambda: ["aaaa:11:00.0", "bbbb:31:00.0"],
+    )
+    seen = _fake_shim(monkeypatch)
+
+    backend = _bare_backend(tmp_path)
+    opts = backend._options({"card0": "cccc:00:00.0", "card1": "dddd:00:00.0"})
+    backend._ensure_shim(opts)
+
+    assert seen["card_te"] == b"cccc:00:00.0"
+    assert seen["card_dit"] == b"dddd:00:00.0"
+
+
+def test_enumeration_failure_raises_instead_of_guessing(monkeypatch, tmp_path):
+    """⭐ 枚举不到 ⇒ **报错**，不许拿一个猜的地址去初始化。"""
+    monkeypatch.setattr(image_mod, "_ep_card_ids", lambda: [])
+    _fake_shim(monkeypatch)
+
+    backend = _bare_backend(tmp_path)
+    with pytest.raises(RuntimeError) as exc:
+        backend._ensure_shim(backend._options({}))
+    assert "枚举不到" in str(exc.value)
+
+
+def test_qwen_image_shim_requires_explicit_cards():
+    """⭐ 卡号**必填** —— 漏传要在构造时立刻炸。"""
+    import inspect
+
+    from wdnai._qwen_image_c import QwenImageShim
+
+    params = inspect.signature(QwenImageShim.__init__).parameters
+    assert params["card_te"].default is inspect.Parameter.empty
+    assert params["card_dit"].default is inspect.Parameter.empty
+
+
+def test_progress_none_passes_a_null_callback(monkeypatch, tmp_path):
+    """⭐ ``progress=None`` ⇒ 传**空回调实例**（NULL 指针），不能传 None。
+
+    直接传 None 会被 ctypes 拒掉：
+    ``TypeError: expected CFunctionType instance instead of NoneType``。
+    """
+    import wdnai._qwen_image_c as qic
+
+    class _FakeLib:
+        def __init__(self):
+            self.open_args = None
+
+        def qi_qwen_open_ex3(self, *args):
+            self.open_args = args
+            return 1                    # 非 NULL 句柄
+
+        def qi_qwen_version(self):
+            return b"fake"
+
+    lib = _FakeLib()
+    monkeypatch.setattr(qic, "_load", lambda: lib)
+    monkeypatch.setattr(
+        "wdnai.gguf_tokenizer.load_tokenizer_from_gguf", lambda p: None,
+    )
+
+    qic.QwenImageShim(tmp_path, card_te=b"a", card_dit=b"b", progress=None)
+
+    cb = lib.open_args[6]              # arg7 = 进度回调
+    assert cb is not None
+    assert not bool(cb)                # NULL 函数指针
+

@@ -23,7 +23,7 @@ int TeEncoder::open(const std::string& model_path, const std::string& weight_pat
                     device_id);
   if (ret != RKNN3_SUCCESS) {
     printf("[te] 模型初始化失败 ret=%d\n", ret);
-    return 2;
+    return ret;   // ⭐ 原样回传 rknn3 错误码（调用方要靠它区分「卡地址不对」）
   }
   m_.print_info();
 

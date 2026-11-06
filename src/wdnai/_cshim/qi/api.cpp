@@ -190,6 +190,24 @@ static void begin_stage(qi_qwen_session* s, const char* stage) {
   qi_progress_stage(&s->prog, stage);
 }
 
+// rknn3 错误码 → 短说明（只列最常撞的几个；nullptr = 没收录）
+static const char* rknn3_err_text(int ret) {
+  switch (ret) {
+    case RKNN3_ERR_DEVICE_UNAVAILABLE:
+      return "设备不可用（PCI 地址不对 / 驱动没认到这张卡）";
+    case RKNN3_ERR_DEVICE_UNMATCH:
+      return "设备不匹配";
+    case RKNN3_ERR_OUT_OF_MEMORY:
+      return "显存不足";
+    case RKNN3_ERR_MODEL_INVALID:
+      return "模型无效";
+    case RKNN3_ERR_COMMUNICATION:
+      return "与卡端通信失败";
+    default:
+      return nullptr;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 把 DiT 链 init 起来（**只在 open 阶段调用一次**）
 //
@@ -342,7 +360,17 @@ qi_qwen_session* qi_qwen_open_ex3(const char* model_dir, const char* card_te,
                        qi::join_path(s->model_dir, kTeEmbed), s->core_mask,
                        s->card_te.empty() ? nullptr : s->card_te.c_str(), "", 0);
   if (ret != 0) {
-    set_err(err, err_len, "TE 初始化失败");
+    // ⭐ 带上 **rknn3 原始 ret 码 + device_id** —— 只说「TE 初始化失败」
+    //    的话，排查的人只能靠复现猜是哪张卡、哪一步炸的。
+    char msg[320];
+    const char* dev = s->card_te.empty() ? "(默认 device[0])" : s->card_te.c_str();
+    const char* why = rknn3_err_text(ret);
+    if (why) {
+      snprintf(msg, sizeof(msg), "TE 初始化失败：ret=%d（%s），device_id=%s", ret, why, dev);
+    } else {
+      snprintf(msg, sizeof(msg), "TE 初始化失败：ret=%d，device_id=%s", ret, dev);
+    }
+    set_err(err, err_len, msg);
     delete s;
     return nullptr;
   }
