@@ -107,7 +107,7 @@ def test_model_package_ships_no_closed_source_binary():
     """⭐ 用户硬要求：发布包里**不得**有不开源的 bin / so。"""
     from wdnai._qwen_image_c import cshim_path
 
-    pkg = Path("/home/rockchip/models/qwenimage21")
+    pkg = Path("/home/rockchip/models/Qwen-Image-2.1")
     if not pkg.is_dir():
         pytest.skip("板端模型包不在本机")
     assert not (pkg / "runtime" / "qwen_image_rknn").exists()
@@ -311,7 +311,8 @@ def test_preset_shape():
     try:
         spec = SystemLanguageModel.qwen_image_21_512()
     except FileNotFoundError as exc:
-        assert "qwenimage21" in str(exc)
+        # 目录名 = HF 仓库名（Qwen-Image-2.1）；旧名 qwenimage21 仍可能被兜底命中
+        assert ("Qwen-Image-2.1" in str(exc)) or ("qwenimage21" in str(exc))
         return
     assert spec.kind == "image"
     assert spec.variant == "qwen-image-2.1"

@@ -1047,12 +1047,14 @@ def _qwen_image_21_dir() -> Path:
 
     Override via the ``WDNAI_QWEN_IMAGE_21_DIR`` env var (full path) or
     ``QI_MODEL_DIR`` (same name the deploy-side ``test.sh`` uses);
-    otherwise ``$WDNAI_MODELS_DIR/qwenimage21`` (which itself defaults to
-    ``/userdata/models/qwenimage21``) and finally the board location
-    ``/home/rockchip/models/qwenimage21``.
+    otherwise ``$WDNAI_MODELS_DIR/Qwen-Image-2.1`` (which itself defaults to
+    ``/userdata/models/Qwen-Image-2.1``) and finally the board location
+    ``/home/rockchip/models/Qwen-Image-2.1``.
 
     The first **existing** candidate wins, so a board that keeps the
     package under ``/home/rockchip/models`` works without any env var.
+    The legacy ``qwenimage21`` directory name is kept as a last-resort
+    fallback for boards that have not renamed their package yet.
     """
     candidates = []
     for env_key in ("WDNAI_QWEN_IMAGE_21_DIR", "QI_MODEL_DIR"):
@@ -1060,6 +1062,11 @@ def _qwen_image_21_dir() -> Path:
         if value:
             candidates.append(Path(value))
     root = _os.environ.get("WDNAI_MODELS_DIR")
+    if root:
+        candidates.append(Path(root) / "Qwen-Image-2.1")
+    candidates.append(Path("/home/rockchip/models/Qwen-Image-2.1"))
+    candidates.append(_models_root() / "Qwen-Image-2.1")
+    # 旧目录名兜底（还没改名的板子）
     if root:
         candidates.append(Path(root) / "qwenimage21")
     candidates.append(Path("/home/rockchip/models/qwenimage21"))
@@ -1146,9 +1153,9 @@ class SystemLanguageModel:
                                     root via ``WDNAI_MODELS_DIR`` or pin a custom path
                                     via ``WDNAI_LOCATE_ANYTHING_DIR``).
     - ``qwen_image_21_512()``   — Qwen-Image-2.1 (text→image, 512×512) bound to
-                                    ``$WDNAI_MODELS_DIR/qwenimage21`` (default
-                                    ``/userdata/models/qwenimage21``; also picked up
-                                    from ``/home/rockchip/models/qwenimage21``;
+                                    ``$WDNAI_MODELS_DIR/Qwen-Image-2.1`` (default
+                                    ``/userdata/models/Qwen-Image-2.1``; also picked up
+                                    from ``/home/rockchip/models/Qwen-Image-2.1``;
                                     override via ``WDNAI_QWEN_IMAGE_21_DIR``).
     """
 
@@ -1432,9 +1439,9 @@ class SystemLanguageModel:
 
         Text-to-image model (prompt-in, 512×512 image-out) for RKNN3 /
         rk1820. The package is expected at
-        ``$WDNAI_MODELS_DIR/qwenimage21`` (default
-        ``/userdata/models/qwenimage21``; also picked up automatically
-        from ``/home/rockchip/models/qwenimage21``). Override with
+        ``$WDNAI_MODELS_DIR/Qwen-Image-2.1`` (default
+        ``/userdata/models/Qwen-Image-2.1``; also picked up automatically
+        from ``/home/rockchip/models/Qwen-Image-2.1``). Override with
         ``WDNAI_QWEN_IMAGE_21_DIR`` (or ``QI_MODEL_DIR``). Missing files
         raise :class:`FileNotFoundError` listing them.
 
