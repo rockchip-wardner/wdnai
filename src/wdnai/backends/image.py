@@ -53,7 +53,7 @@ staging. Measured: the ``load`` (weight registration) time is identical
 either way; the only cost is ~3.6 s per segment inside ``model_init``
 (a one-off ~14 s for the 4 DiT segments).
 
-Layout of the model package (see ``/home/rockchip/models/qwenimage21``)::
+Layout of the model package (see ``/home/rockchip/models/Qwen-Image-2.1``)::
 
     llm_qwenimage21-te.1828.rknn / .weight
     qwenimage21-te.embed.bin / .tokenizer.gguf
@@ -98,7 +98,7 @@ __all__ = ["ImageBackend"]
 
 
 # --------------------------------------------------------------------------- #
-# Model-package layout (mirrors /home/rockchip/models/qwenimage21)
+# Model-package layout (mirrors /home/rockchip/models/Qwen-Image-2.1)
 # --------------------------------------------------------------------------- #
 _TE_RKNN = "llm_qwenimage21-te.1828.rknn"
 _TE_WEIGHT = "llm_qwenimage21-te.weight"
@@ -162,7 +162,16 @@ def _ep_card_ids() -> List[str]:
 _VAE_CORE_MASK = 0
 
 #: Candidate model-package directories, in priority order.
+#:
+#: ⭐ 目录名 = **HF 仓库名**（``Qwen/Qwen-Image-2.1`` ⇒ ``Qwen-Image-2.1``），
+#: 与 ``/mnt/oem/models/`` 下其它包（``Qwen3-VL-4B`` / ``Qwen3-TTS`` /
+#: ``LocateAnything-3B``）同规则。真正的定位靠 ``WDNAI_QWEN_IMAGE_21_DIR``
+#: （webui 按 worker manifest 的 ``model_dir_env`` 注入，指向 manifest
+#: 所在目录）⇒ **目录可以任意改名**，下面只是无 env 时的兜底。
+#: 末尾保留旧的 ``qwenimage21`` 目录名：给还没改名的板子兜底。
 _MODEL_DIR_CANDIDATES = (
+    "/home/rockchip/models/Qwen-Image-2.1",
+    "/userdata/models/Qwen-Image-2.1",
     "/home/rockchip/models/qwenimage21",
     "/userdata/models/qwenimage21",
 )
@@ -549,11 +558,102 @@ class ImageBackend:
             if self._owns_workdir and not opts.get("keep_artifacts"):
                 shutil.rmtree(work, ignore_errors=True)
 
-    def run_images(self, prompt: str, images: list, **overrides: Any) -> str:
-        """Not supported — Qwen-Image-2.1 is a text-to-image model."""
-        raise NotImplementedError(
-            "Qwen-Image-2.1 是文生图模型，不接受图像输入（img2img 未实现）"
-        )
+    def run_images(self, prompt: str, images: list, **overrides: Any) -> Tuple[str, List[Attachment]]:
+        """⭐ **图生图**：输入图 + 提示词 → 新图。
+
+        ``images`` 是 **BGR ndarray 的列表** —— ``wdnai`` 的 session 会把
+        图像附件**展平**后路由到这里（见 ``wdnai/session.py`` 的
+        ``_dispatch_sync``：``images.extend(att.images)``）。
+        （也兼容直接传 :class:`wdnai.attachment.ImageAttachment` 对象。）
+
+        流程（板端 cshim）::
+
+            输入图 --[VAE 编码器]--> z₀ --[加噪到起步点]--> x
+                   --[flow-match]--> z --[VAE 解码器]--> 新图
+
+        与文生图的**唯一**差别是起步点：不是「纯噪声 σ=1」，而是
+        「原图潜变量加噪到 σ[k₀]」—— ``strength`` 越大越早起步。
+
+        ⚠️ VAE 的输入尺寸是**固定 512×512** ⇒ 这里的缩放走 **wdnav 的
+        RGA**（不做软件缩放）。
+        """
+        src_bgr = None
+        for item in (images or []):
+            # session 传进来的是**展平后的 ndarray 列表**；也兼容直接给
+            # ImageAttachment 对象（本地调用 / 别的 transport）。
+            if isinstance(item, np.ndarray):
+                src_bgr = item
+                break
+            arrs = getattr(item, "images", None)
+            if arrs:
+                src_bgr = arrs[0]
+                break
+        if src_bgr is None:
+            raise ValueError("图生图需要一张输入图（BGR ndarray）")
+
+        # ---- BGR → RGB，缩到 512×512（**走 RGA**）----
+        rgb = np.ascontiguousarray(src_bgr[:, :, ::-1])
+        if rgb.shape[0] != 512 or rgb.shape[1] != 512:
+            from wdnav.rga import resize_bgr
+            rgb = resize_bgr(np.ascontiguousarray(src_bgr), 512, 512)[:, :, ::-1]
+            rgb = np.ascontiguousarray(rgb)
+
+        opts = self._options(overrides)
+        work = self._make_workdir(opts)
+        self._keep_artifacts = bool(opts.get("keep_artifacts"))
+        out_dir = work / "out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        self.sink.reset()
+        t_start = time.perf_counter()
+        try:
+            shim = self._ensure_shim(opts)
+            self.sink.emit("[Qwen-Image-2.1] 图生图中 …")
+            t0 = time.perf_counter()
+            images_out = shim.generate_img2img(
+                [prompt],
+                rgb,
+                steps=int(opts["steps"]),
+                mu=float(opts["fm_mu"]),
+                shift_terminal=float(opts.get("shift_terminal", 0.02)),
+                noise="fresh" if opts.get("noise_fresh", True) else "fixed",
+                seed=int(opts.get("noise_seed", 0) or 0),
+                strength=float(opts.get("strength", 0.75)),
+            )
+            gen_ms = (time.perf_counter() - t0) * 1000.0
+
+            out_rgb = images_out[0]
+            png_path = out_dir / "img01.png"
+            _write_png(png_path, out_rgb)
+            bgr = np.ascontiguousarray(out_rgb[:, :, ::-1])
+
+            copy_dir = opts.get("output_dir")
+            if copy_dir:
+                dst_dir = Path(str(copy_dir))
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(str(png_path), str(dst_dir / png_path.name))
+
+            total_ms = (time.perf_counter() - t_start) * 1000.0
+            self.sink.emit("qi|stage=save|step=1|total=1|elapsed_ms=0.0")
+            self.sink.perf.update({
+                "te_ms": 0.0,
+                "generate_ms": gen_ms,
+                "total_ms": total_ms,
+                "steps": int(opts["steps"]),
+                "count": 1,
+                "strength": float(opts.get("strength", 0.75)),
+            })
+            self.last_artifacts = {
+                "png": str(png_path),
+                "out_dir": str(out_dir),
+            }
+            self.sink.emit(
+                "[Qwen-Image-2.1] 图生图完成（{:.1f} s）".format(total_ms / 1000.0)
+            )
+            return (prompt, [ImageAttachment(bgr)])
+        finally:
+            if self._owns_workdir and not opts.get("keep_artifacts"):
+                shutil.rmtree(work, ignore_errors=True)
 
     def close(self) -> None:
         """Release the cshim session and drop the scratch directory.
@@ -584,6 +684,9 @@ class ImageBackend:
             "shift_terminal": 0.02,
             "noise_fresh": True,
             "noise_seed": 0,
+            # ⭐ 图生图：保留原图的程度（0~1）。只对 run_images 有意义，
+            #    文生图完全忽略它。
+            "strength": 0.75,
             "card0": _CARD0,
             "card1": _CARD1,
             "card2": "",
@@ -662,7 +765,8 @@ def _resolve_model_dir(spec) -> Path:
 
     Order: an explicit ``spec.image_model_dir`` (strict — a wrong path is
     an error, not a reason to silently use another one) → env override →
-    ``$WDNAI_MODELS_DIR/qwenimage21`` → the well-known board locations.
+    ``$WDNAI_MODELS_DIR/Qwen-Image-2.1`` → the well-known board locations
+    (the legacy ``qwenimage21`` name is still accepted as a last resort).
     """
     explicit = str(getattr(spec, "image_model_dir", "") or "")
     if explicit:

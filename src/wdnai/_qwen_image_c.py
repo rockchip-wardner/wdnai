@@ -149,6 +149,20 @@ def _load() -> ctypes.CDLL:
     ]
     lib.qi_qwen_free.restype = None
     lib.qi_qwen_free.argtypes = [ctypes.c_void_p]
+    # ⭐ 图生图（img2img）：输入图 + 提示词 → 新图
+    lib.qi_qwen_img2img_batch.restype = ctypes.c_int
+    lib.qi_qwen_img2img_batch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+        ctypes.c_int, ctypes.c_double, ctypes.c_double,
+        ctypes.c_int, ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint8), ctypes.c_int, ctypes.c_int,
+        ctypes.c_double,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)), ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_char_p, ctypes.c_int,
+    ]
     lib.qi_qwen_fixed_noise.restype = ctypes.c_int
     lib.qi_qwen_fixed_noise.argtypes = [
         ctypes.POINTER(ctypes.POINTER(ctypes.c_uint16)), ctypes.POINTER(ctypes.c_int),
@@ -376,6 +390,76 @@ class QwenImageShim:
         from .backends.image import _write_png
 
         _write_png(Path(path), rgb)
+
+    # -- 图生图 ------------------------------------------------------------ #
+    def generate_img2img(
+        self,
+        prompts: Sequence[str],
+        source_rgb: np.ndarray,
+        *,
+        steps: int = 8,
+        mu: float = 0.5387096774,
+        shift_terminal: float = 0.02,
+        noise: str = "fixed",
+        seed: int = 0,
+        strength: float = 0.75,
+    ) -> List[np.ndarray]:
+        """⭐ **图生图**：输入图 + 提示词 → N 张新图。
+
+        ``source_rgb`` 必须是 **512×512 的 uint8 RGB**（VAE 的输入尺寸固定，
+        缩放由调用方用 RGA 做）。``strength`` = 保留原图的程度（0~1）：
+
+        * 1.0 ⇒ 从纯噪声起步 ⇒ 与文生图**逐字节一致**；
+        * 0.75 ⇒ 从 25% 的进度起步 ⇒ 原图结构保留、但被文本描述改写。
+
+        返回 N 张 ``uint8 RGB [512, 512, 3]``。
+        """
+        if not prompts:
+            return []
+        mode = NOISE_FRESH if noise == "fresh" else NOISE_FIXED
+        if mode == NOISE_FIXED and noise != "fixed":
+            raise ValueError(f"未知噪声模式 {noise!r}（fixed / fresh）")
+
+        src = np.ascontiguousarray(source_rgb, dtype=np.uint8)
+        if src.ndim != 3 or src.shape[2] != 3:
+            raise ValueError(f"输入图必须是 H×W×3 的 RGB，实际 {src.shape}")
+        if src.shape[0] != 512 or src.shape[1] != 512:
+            raise ValueError(
+                f"输入图必须是 512×512，实际 {src.shape[1]}×{src.shape[0]}")
+
+        token_lists = [self.tokenize(p) for p in prompts]
+        lens = [len(t) for t in token_lists]
+        flat: List[int] = []
+        for t in token_lists:
+            flat.extend(t)
+        n = len(flat)
+
+        p_tok = (ctypes.c_int32 * n)(*flat)
+        p_len = (ctypes.c_int32 * len(lens))(*lens)
+        p_src = (ctypes.c_uint8 * src.size).from_buffer(
+            np.ascontiguousarray(src).reshape(-1).view(np.uint8))
+        p_rgb = ctypes.POINTER(ctypes.c_uint8)()
+        w = ctypes.c_int(0)
+        h = ctypes.c_int(0)
+        rc = self._lib.qi_qwen_img2img_batch(
+            self._h,
+            ctypes.c_int(len(prompts)),
+            p_tok, p_len,
+            ctypes.c_int(steps), ctypes.c_double(mu), ctypes.c_double(shift_terminal),
+            ctypes.c_int(mode), ctypes.c_uint32(seed),
+            p_src, ctypes.c_int(src.shape[1]), ctypes.c_int(src.shape[0]),
+            ctypes.c_double(float(strength)),
+            ctypes.byref(p_rgb), ctypes.byref(w), ctypes.byref(h),
+            self._err, ctypes.c_int(len(self._err)),
+        )
+        if rc != 0:
+            raise RuntimeError("图生图失败：" + self._err.value.decode("utf-8", "replace"))
+        px = w.value * h.value * 3
+        buf = np.ctypeslib.as_array(p_rgb, shape=(px * len(prompts),)).copy()
+        self._lib.qi_qwen_free(p_rgb)
+        return [
+            buf[i * px:(i + 1) * px].reshape(h.value, w.value, 3) for i in range(len(prompts))
+        ]
 
 
 # --------------------------------------------------------------------------- #
