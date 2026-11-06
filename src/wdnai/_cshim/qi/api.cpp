@@ -23,6 +23,7 @@
 #include "resident_chain.h"
 #include "te_encoder.h"
 #include "util.h"
+#include "vae_stats.h"
 #include "vae_chain.h"
 #include "vae_rknn2.h"
 
@@ -158,6 +159,7 @@ struct qi_qwen_session {
   qi::ResidentChain dit;
   qi::VaeChain vae;      // rknn3 的 VAE 链（1828 上，**独占第三张卡** ⇒ 与 DiT 互不干扰）
   qi::VaeChain2 vae2;    // rknn2 的 VAE 链（**本机 RK3588 NPU** ⇒ 与 DiT 物理分开）
+  qi::ModelRunner2 vae_enc;  // ⭐ VAE **编码器**（rknn2，本机 NPU）—— 图生图用
   std::string model_dir;
   std::string work_dir;
   std::string card_te;
@@ -169,6 +171,7 @@ struct qi_qwen_session {
   bool vae_ready = false;
   bool vae2_ready = false;      // ⭐ rknn2 VAE 可用 ⇒ DiT 全程常驻
   bool vae_resident = false;    // rknn3 VAE 链也常驻（独占第三张卡时）
+  bool vae_enc_ready = false;   // ⭐ VAE 编码器可用 ⇒ 支持图生图
 
   // ---- 进度回调（可选）----
   // ⚠️ 一个会话只有**一个** qi_progress_ctx —— 各层共享它 ⇒ elapsed 口径全局一致
@@ -407,6 +410,31 @@ qi_qwen_session* qi_qwen_open_ex3(const char* model_dir, const char* card_te,
     }
   }
   emit_progress(s, "init", 3, 3);
+
+  // ---- 4. ⭐ VAE **编码器**（图生图用；**可选**）----
+  //   模型包里有 `vae_qwenimage21-512.encoder.3588.rknn` 才装 ——
+  //   没有它**不影响文生图**（只是图生图不可用）。
+  //   ⚠️ 它和解码器**同在本机 3588 的 NPU** 上，但实测**能同时常驻**
+  //   （解码器 2311 MiB + 编码器 ≈ 0.9 GiB < 4 GiB 池）。
+  {
+    const std::string enc_path =
+        qi::join_path(s->model_dir, "vae_qwenimage21-512.encoder.3588.rknn");
+    std::vector<unsigned char> probe;
+    if (qi::read_whole_file(enc_path, &probe)) {
+      emit_progress(s, "init", 3, 3);
+      int re = s->vae_enc.init(enc_path, s->vae_core_mask);
+      if (re != 0) {
+        // ⚠️ **不致命** —— 编码器装不上只是「图生图不可用」，
+        //    文生图必须照常能跑（别因为一个可选件把整张卡拖死）。
+        printf("[qi] ⚠️ VAE 编码器初始化失败（%s）⇒ 本机不支持图生图\n",
+               s->vae_enc.error().c_str());
+        s->vae_enc.release();
+      } else {
+        s->vae_enc_ready = true;
+        printf("[qi] ⭐ VAE 编码器就绪（本机 rknn2）⇒ 支持图生图\n");
+      }
+    }
+  }
   return s;
 }
 
@@ -416,6 +444,7 @@ void qi_qwen_close(qi_qwen_session* s) {
   s->dit.release();
   s->vae.release();
   s->vae2.release();
+  s->vae_enc.release();
   delete s;
 }
 
@@ -695,6 +724,234 @@ int qi_qwen_generate_batch(qi_qwen_session* s, int n_images,
   *out_rgb = all_rgb;
   // ⭐ **不释放 VAE** —— 它独占第三张卡，与 DiT 互不干扰 ⇒ 下一批直接用，
   //    整个会话生命周期内**零 model_init**。
+  begin_stage(s, "done");
+  emit_progress(s, "done", 1, 1);
+  return 0;
+}
+
+// ===========================================================================
+// ⭐⭐ 图生图（img2img）
+//
+//   输入图 --[VAE 编码器]--> z₀ --[加噪到起步点]--> x --[flow-match]--> z
+//          --[VAE 解码器]--> 新图
+//
+//   ⚠️ 与文生图的**唯一**差别：flow-match 的**起步点**不是「纯噪声 σ=1」，
+//      而是「原图潜变量加噪到 σ[k₀]」。
+// ===========================================================================
+
+// 把输入图编码成潜变量 z₀（**token 主序 fp16**，与 hidden_states 同布局）
+static bool encode_source_image(qi_qwen_session* s, const uint8_t* rgb, int w, int h,
+                                 std::vector<unsigned char>* z0_fp16,
+                                 char* err, int err_len) {
+  if (!s->vae_enc_ready) {
+    set_err(err, err_len,
+            "本机不支持图生图：模型包里没有 VAE **编码器**"
+            "（vae_qwenimage21-512.encoder.3588.rknn）");
+    return false;
+  }
+  if (w != 512 || h != 512) {
+    set_err(err, err_len,
+            "输入图必须是 512×512（VAE 的输入尺寸固定；缩放由调用方用 RGA 做）");
+    return false;
+  }
+  // ---- RGB888 → RGBA（alpha=1）→ fp32 [-1,1] → [1,4,1,512,512] ----
+  // ⚠️ 模型的输入张量是 **4 通道**（Qwen-Image-2.1 的 VAE 是 RGBA 原生的），
+  //    布局 NCDHW ⇒ 内存里是「逐通道连续」⇒ 按通道分段填正好对上。
+  const size_t px = (size_t)512 * 512;
+  std::vector<float> pix(4 * px);
+  for (size_t i = 0; i < px; ++i) {
+    pix[0 * px + i] = rgb[i * 3 + 0] / 255.0f * 2.0f - 1.0f;
+    pix[1 * px + i] = rgb[i * 3 + 1] / 255.0f * 2.0f - 1.0f;
+    pix[2 * px + i] = rgb[i * 3 + 2] / 255.0f * 2.0f - 1.0f;
+    pix[3 * px + i] = 1.0f;   // alpha = 不透明
+  }
+  int ret = s->vae_enc.set_input("pixel_values", pix.data(),
+                                 pix.size() * sizeof(float), RKNN_TENSOR_FLOAT32);
+  if (ret != 0) {
+    set_err(err, err_len, "VAE 编码器 set_input 失败: " + s->vae_enc.error());
+    return false;
+  }
+  double ms = 0.0;
+  begin_stage(s, "encode");
+  emit_progress(s, "encode", 1, 1);
+  ret = s->vae_enc.run(&ms);
+  if (ret != 0) {
+    set_err(err, err_len, "VAE 编码器推理失败: " + s->vae_enc.error());
+    return false;
+  }
+  std::vector<unsigned char> raw;
+  rknn_tensor_type dt = RKNN_TENSOR_FLOAT16;
+  if (!s->vae_enc.get_output("latents", &raw, &dt)) {
+    set_err(err, err_len, "VAE 编码器输出读取失败: " + s->vae_enc.error());
+    return false;
+  }
+  const size_t n_elem = 1024 * 64;   // 1024 token × 64 通道
+  if (raw.size() != n_elem * 2) {
+    set_err(err, err_len, "VAE 编码器输出大小不对");
+    return false;
+  }
+  // fp16 → fp32
+  std::vector<float> f32(n_elem);
+  if (!qi::ModelRunner::convert(raw.data(), RKNN3_TENSOR_FLOAT16,
+                                (void*)f32.data(), RKNN3_TENSOR_FLOAT32,
+                                (uint32_t)n_elem)) {
+    set_err(err, err_len, "VAE 编码器输出类型转换失败");
+    return false;
+  }
+  // ---- 通道主序 (C=64, T=1024) → 归一化 → token 主序 (T=1024, C=64) ----
+  // 归一化：z = (raw − mean) / std（解码器那边是它的逆：v·std + mean）
+  std::vector<float> norm(n_elem);
+  for (int t = 0; t < 1024; ++t) {
+    for (int c = 0; c < 64; ++c) {
+      float raw_v = f32[(size_t)c * 1024 + (size_t)t];
+      norm[(size_t)t * 64 + (size_t)c] =
+          (raw_v - qi::kVaeLatentsMean[c]) / qi::kVaeLatentsStd[c];
+    }
+  }
+  z0_fp16->resize(n_elem * 2);
+  if (!qi::ModelRunner::convert(norm.data(), RKNN3_TENSOR_FLOAT32,
+                                z0_fp16->data(), RKNN3_TENSOR_FLOAT16,
+                                (uint32_t)n_elem)) {
+    set_err(err, err_len, "潜变量转 fp16 失败");
+    return false;
+  }
+  printf("[qi] VAE 编码器完成（%.1f ms）⇒ z₀ 已就绪\n", ms);
+  return true;
+}
+
+int qi_qwen_img2img_batch(qi_qwen_session* s, int n_images,
+                           const int32_t* all_tokens, const int32_t* all_n_tokens,
+                           int steps, double mu, double shift_terminal, int noise_mode,
+                           uint32_t seed, const uint8_t* src_rgb, int src_w, int src_h,
+                           double strength, uint8_t** out_rgb, int* out_w, int* out_h,
+                           char* err, int err_len) {
+  if (!s || n_images <= 0 || !all_tokens || !all_n_tokens || !src_rgb) {
+    set_err(err, err_len, "参数错误");
+    return 1;
+  }
+  if (!s->dit_ready) {
+    set_err(err, err_len, "DiT 不在常驻状态（dit_ready=false）—— 拒绝推理中重建模型");
+    return 1;
+  }
+  if (!s->vae2_ready) {
+    set_err(err, err_len, "图生图只支持 rknn2 的本机 VAE（本板布局）");
+    return 1;
+  }
+  if (steps <= 0) steps = 1;
+  if (strength < 0.0) strength = 0.0;
+  if (strength > 1.0) strength = 1.0;
+
+  // ---- ① 输入图 → z₀（token 主序 fp16）----
+  std::vector<unsigned char> z0;
+  if (!encode_source_image(s, src_rgb, src_w, src_h, &z0, err, err_len)) {
+    return 1;
+  }
+
+  // ---- 起步点：strength 越大 ⇒ 起步越早 ⇒ 越接近纯文生图 ----
+  // （与 diffusers 的 img2img 同一口径：t_start = steps − int(steps·strength)）
+  int start_step = steps - (int)std::lround((double)steps * strength);
+  if (start_step < 0) start_step = 0;
+  if (start_step > steps - 1) start_step = steps - 1;
+
+  // ---- ② 逐张：TE 编码 + flow-match（从 start_step 起步）----
+  std::vector<std::vector<unsigned char>> latents((size_t)n_images);
+  int64_t tok_off = 0;
+  for (int img = 0; img < n_images; ++img) {
+    int n_tok = all_n_tokens[img];
+    const int32_t* toks = all_tokens + tok_off;
+    tok_off += n_tok;
+
+    uint16_t* ehs = nullptr;
+    uint8_t* mask = nullptr;
+    int ehs_n = 0, mask_n = 0;
+    begin_stage(s, "te");
+    if (qi_qwen_te_encode(s, toks, n_tok, &ehs, &ehs_n, &mask, &mask_n, err, err_len) != 0) {
+      return 1;
+    }
+    emit_progress(s, "te", img + 1, n_images);
+
+    char sub[256];
+    snprintf(sub, sizeof(sub), "/img%02d", img + 1);
+    std::string dir = s->work_dir + sub;
+    std::string mk = "mkdir -p '" + dir + "'";
+    if (system(mk.c_str()) != 0) {
+      set_err(err, err_len, "创建图片工作目录失败");
+      qi_qwen_free(ehs); qi_qwen_free(mask);
+      return 1;
+    }
+    qi::write_file(qi::join_path(dir, "encoder_hidden_states.bin"), ehs,
+                   (size_t)ehs_n * sizeof(uint16_t));
+    qi::write_file(qi::join_path(dir, "encoder_hidden_states_mask.bin"), mask,
+                   (size_t)mask_n);
+    qi_qwen_free(ehs);
+    qi_qwen_free(mask);
+
+    // 原图潜变量 z₀（token 主序 fp16）
+    qi::write_file(qi::join_path(dir, "z0.bin"), z0.data(), z0.size());
+
+    // 初始噪声 ε（固定 / 现场随机 —— 与文生图完全同一套）
+    const size_t n_elem = 1024 * 64;
+    std::string x_path = qi::join_path(dir, "hidden_states.bin");
+    if (noise_mode == QI_NOISE_FRESH) {
+      std::vector<uint16_t> h = fresh_noise(n_elem, seed + (uint32_t)img);
+      qi::write_file(x_path, h.data(), h.size() * sizeof(uint16_t));
+    } else {
+      std::vector<uint16_t> h;
+      if (!qi::np_fixed_noise_512(&h)) {
+        set_err(err, err_len, "生成固定噪声失败");
+        return 1;
+      }
+      qi::write_file(x_path, h.data(), h.size() * sizeof(uint16_t));
+    }
+
+    begin_stage(s, "flow");
+    std::string lat_path = qi::join_path(dir, "latents.bin");
+    int ret = s->dit.run_flowmatch(dir, steps, mu, shift_terminal, x_path, lat_path,
+                                   std::string(), start_step,
+                                   qi::join_path(dir, "z0.bin"));
+    if (ret != 0) {
+      set_err(err, err_len, "flow-match 失败");
+      return 1;
+    }
+    if (!qi::read_whole_file(lat_path, &latents[(size_t)img])) {
+      set_err(err, err_len, "读潜变量失败");
+      return 1;
+    }
+  }
+
+  // ---- ③ VAE 解码（与文生图同一条路）----
+  const size_t px = (size_t)512 * 512 * 3;
+  uint8_t* all_rgb = (uint8_t*)malloc(px * (size_t)n_images);
+  if (!all_rgb) {
+    set_err(err, err_len, "内存不足");
+    return 1;
+  }
+  for (int img = 0; img < n_images; ++img) {
+    std::vector<unsigned char> rgb;
+    int w = 0, h = 0;
+    double ms = 0.0;
+    begin_stage(s, "vae");
+    emit_progress(s, "vae", 0, 1);
+    int r2 = s->vae2.decode(latents[(size_t)img], /*channels=*/64, &rgb, &w, &h, &ms);
+    if (r2 != 0) {
+      set_err(err, err_len, "VAE(rknn2) 解码失败: " + s->vae2.error());
+      qi_qwen_free(all_rgb);
+      return 1;
+    }
+    uint8_t* dst = all_rgb + px * (size_t)img;
+    if ((size_t)w * h * 3 == rgb.size()) {
+      memcpy(dst, rgb.data(), rgb.size());
+    } else {
+      set_err(err, err_len, "VAE(rknn2) 输出尺寸异常");
+      qi_qwen_free(all_rgb);
+      return 1;
+    }
+    if (img + 1 == n_images) {
+      *out_w = w;
+      *out_h = h;
+    }
+  }
+  *out_rgb = all_rgb;
   begin_stage(s, "done");
   emit_progress(s, "done", 1, 1);
   return 0;

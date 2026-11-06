@@ -117,9 +117,22 @@ class ResidentChain {
   //   → concat([..., 0])。
   //
   // 返回 0 = 成功；非 0 = 失败。
+  //
+  // ⭐ **图生图（img2img）**：`start_step` > 0 时不是从纯噪声起步，而是
+  // 从「**原图潜变量加噪到第 start_step 步的噪声水平**」起步：
+  //
+  //     x = (1 − σ[start_step])·z₀ + σ[start_step]·ε
+  //
+  // 其中 z₀ 来自 ``z0_path``（**token 主序 fp16**，与 x 同一布局），
+  // ε 是 ``x_path`` 里那份初始噪声（固定 / 现场随机都一样）。
+  // σ[] 就是上面那个 sigma 序列 ⇒ 起步点的噪声水平与官方调度器**一致**。
+  //
+  // 循环从 ``k = start_step`` 开始 ⇒ strength 越大 ⇒ 起步越早 ⇒ 越接近
+  // 纯文生图（strength=1 ⇒ start_step=0 ⇒ 与文生图**逐字节一致**）。
   int run_flowmatch(const std::string& input_dir, int steps, double mu, double shift_terminal,
                     const std::string& x_path, const std::string& out_latents_path,
-                    const std::string& dump_dir);
+                    const std::string& dump_dir,
+                    int start_step = 0, const std::string& z0_path = std::string());
 
   // ⭐⭐⭐ 主动释放全部段（模型 + 共享 internal）⇒ **卡池回收**
   //   用途：512 的 DiT 常驻（每核 ~451 MiB）与 512 的 VAE 分段链

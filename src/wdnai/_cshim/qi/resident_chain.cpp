@@ -15,6 +15,8 @@
 
 #include "resident_chain.h"
 
+#include "util.h"
+
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -793,7 +795,8 @@ uint16_t f32_to_f16_rne(float f) {
 int ResidentChain::run_flowmatch(const std::string& input_dir, int steps, double mu,
                                  double shift_terminal, const std::string& x_path,
                                  const std::string& out_latents_path,
-                                 const std::string& dump_dir) {
+                                 const std::string& dump_dir,
+                                 int start_step, const std::string& z0_path) {
   // ---- 前置检查：必须全部常驻，否则仍有 load/init ----
   for (size_t i = 0; i < stream_.size(); ++i) {
     if (stream_[i]) {
@@ -870,6 +873,52 @@ int ResidentChain::run_flowmatch(const std::string& input_dir, int steps, double
   std::vector<float> x(n_elem);
   memcpy(x.data(), xbuf.data(), n_elem * 4);
 
+  // ==================================================================
+  // ⭐ **图生图**：从「原图潜变量加噪到起步点的噪声水平」起步
+  //
+  //     x = (1 − σ[k₀])·z₀ + σ[k₀]·ε
+  //
+  // z₀ 与 x 同一布局（token 主序 fp16）；ε 就是上面读进来的初始噪声。
+  // start_step=0 ⇒ 完全不做这件事 ⇒ 与文生图**逐字节一致**。
+  // ==================================================================
+  if (start_step > 0 && !z0_path.empty()) {
+    if (start_step >= steps) start_step = steps - 1;
+    const double sigma0 = sig[(size_t)start_step];
+    std::vector<unsigned char> zbuf;
+    if (!qi::read_whole_file(z0_path, &zbuf) || zbuf.size() != n_elem * 2) {
+      printf("[错误] 读原图潜变量失败: %s\n", z0_path.c_str());
+      return 3;
+    }
+    const uint16_t* zh = (const uint16_t*)zbuf.data();
+    double zrms = 0.0;
+    for (size_t i = 0; i < n_elem; ++i) {
+      uint32_t s = (zh[i] >> 15) & 1u, e = (zh[i] >> 10) & 0x1Fu, m = zh[i] & 0x3FFu;
+      uint32_t out;
+      if (e == 0) {
+        if (m == 0) { out = s << 31; }
+        else {
+          int sh = 0;
+          while (!(m & 0x400u)) { m <<= 1; ++sh; }
+          m &= 0x3FFu;
+          uint32_t fe = (uint32_t)(127 - 15 - sh);
+          out = (s << 31) | (fe << 23) | (m << 13);
+        }
+      } else if (e == 31) {
+        out = (s << 31) | 0x7F800000u | (m << 13);
+      } else {
+        out = (s << 31) | ((uint32_t)(e + 112) << 23) | (m << 13);
+      }
+      float zf;
+      memcpy(&zf, &out, 4);
+      x[i] = (float)(1.0 - sigma0) * zf + (float)sigma0 * x[i];
+      zrms += (double)x[i] * x[i];
+    }
+    printf("[flowmatch] ⭐ 图生图：从第 %d 步起步（σ=%.6f），"
+           "x = (1−σ)·z₀ + σ·ε，|x|rms=%.5f\n",
+           start_step, sigma0, sqrt(zrms / n_elem));
+    fflush(stdout);
+  }
+
   std::map<std::string, std::vector<unsigned char>> carry;
   const std::string ts_path = input_dir + "/timestep.bin";
 
@@ -880,7 +929,10 @@ int ResidentChain::run_flowmatch(const std::string& input_dir, int steps, double
   }
 
   // 进度计时：t_prev_step = 上一步跑完的时刻（第一步 = flow 阶段开始）
-  for (int k = 0; k < steps; ++k) {
+  // ⭐ 图生图：从 start_step 起步（前面的步**不算**进这次生成）
+  if (start_step < 0) start_step = 0;
+  if (start_step > steps - 1) start_step = steps - 1;
+  for (int k = start_step; k < steps; ++k) {
     double sigma = sig[k], sigma_next = sig[k + 1];
 
     // ---- 写 x（fp16 RNE）到输入缓冲 ----

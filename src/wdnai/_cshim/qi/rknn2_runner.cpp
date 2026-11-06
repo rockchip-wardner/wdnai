@@ -343,6 +343,24 @@ bool rknn2_to_logical_nchw(const TensorAttr2& attr, const unsigned char* src,
     return true;
   }
 
+  if (attr.fmt == RKNN_TENSOR_UNDEFINED) {
+    // ⚠️ **UNDEFINED = runtime 给的就是逻辑布局**（零拷贝）。
+    //
+    // 什么时候会看到它：VAE **编码器**（`vae_qwenimage21-512.encoder.*.rknn`）
+    // 的输出张量 `latents` 的 attr.fmt 就是 UNDEFINED（3），而解码器的
+    // `image` 是 NCHW（0）。
+    //
+    // 「UNDEFINED 是不是逻辑布局」不是猜的 —— 板端实测过：同一张图，
+    // 编码器输出按 [1,64,1,32,32]（NCDHW）解释，与 119 的 PyTorch 金标准
+    // rel_L2 = **0.0071**（fp16 精度）⇒ 顺序就是 NCDHW，零拷贝是对的。
+    //
+    // ⚠️ 走这条分支时**只支持 4D/5D**（NCHW / NCDHW）—— 更高维的模型
+    //    本来也不该走 rknn2 这条路（VAE 是 4D/5D）。
+    if (attr.n_dims != 4 && attr.n_dims != 5) return false;
+    dst->assign(src, src + (size_t)attr.n_elems * elem);
+    return true;
+  }
+
   // 未知布局 ⇒ 原样返回（调用方负责）
   dst->assign(src, src + (size_t)attr.n_elems * elem);
   return false;

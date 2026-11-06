@@ -130,6 +130,33 @@ int qi_qwen_generate_batch(qi_qwen_session* s,
                            uint8_t** out_rgb, int* out_w, int* out_h,
                            char* err, int err_len);
 
+/* ⭐⭐ **图生图（img2img）**：输入图 + 提示词 → 新图。
+ *
+ *   src_rgb / src_w / src_h：**RGB888** 的输入图（512×512，行主序）。
+ *       ⚠️ 必须是 **512×512**（VAE 的输入尺寸是固定的；缩放由调用方做，
+ *          板端走 wdnav 的 RGA）。
+ *   strength：**保留原图的程度**（0~1）。
+ *       1.0 ⇒ 等价于纯文生图（从纯噪声起步）；
+ *       越小 ⇒ 起步越晚 ⇒ 原图保留得越多。
+ *
+ * 流程：
+ *   ① VAE **编码器**（vae_qwenimage21-512.encoder.3588.rknn，本机 3588
+ *      的 NPU）把输入图变成潜变量 z₀（token 主序 fp16）
+ *   ② flow-match **从中间步起步**：x = (1−σ[k₀])·z₀ + σ[k₀]·ε
+ *   ③ VAE 解码器出图（与文生图同一条路）
+ *
+ * ⚠️ 模型包里**必须**有编码器，否则本函数直接报错（不偷偷退化成文生图）。
+ */
+int qi_qwen_img2img_batch(qi_qwen_session* s,
+                          int n_images,
+                          const int32_t* all_tokens, const int32_t* all_n_tokens,
+                          int steps, double mu, double shift_terminal,
+                          int noise_mode, uint32_t seed,
+                          const uint8_t* src_rgb, int src_w, int src_h,
+                          double strength,
+                          uint8_t** out_rgb, int* out_w, int* out_h,
+                          char* err, int err_len);
+
 /* 释放 C API 分配的内存（ehs / mask / rgb） */
 void qi_qwen_free(void* p);
 
