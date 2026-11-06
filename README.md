@@ -295,7 +295,7 @@ spec = spec.with_options(temperature=0.2, top_p=0.9)
 | `qwen3_asr` | `Qwen3-ASR/` | 语音 → 文本 |
 | `qwen3_vl_embedding` | `Qwen3-VL-Embedding-2B/` | 检索向量 |
 | `locate_anything` | `LocateAnything-3B/` | 目标定位（bbox） |
-| `qwen_image_21_512` | `qwenimage21/` | 文生图（512×512） |
+| `qwen_image_21_512` | `Qwen-Image-2.1/` | 文生图（512×512） |
 
 preset 会在**构造时**检查文件是否齐全，缺文件抛 `FileNotFoundError` 并列出
 缺哪些 —— 不会等到推理时才炸。
@@ -326,7 +326,7 @@ preset 会在**构造时**检查文件是否齐全，缺文件抛 `FileNotFoundE
 |---|---|
 | `WDNAI_MODELS_DIR` | 模型根目录（默认 `/userdata/models`） |
 | `WDNAI_QWEN3_VL_4B_DIR` / `WDNAI_QWEN3_4B_DIR` / `WDNAI_QWEN3_5_4B_VL_DIR` / `WDNAI_QWEN_2_5_OMNI_3B_DIR` / `WDNAI_LOCATE_ANYTHING_DIR` | 单个模型的目录覆盖 |
-| `WDNAI_QWEN_IMAGE_21_DIR` / `QI_MODEL_DIR` | Qwen-Image-2.1 模型包目录（默认 `$WDNAI_MODELS_DIR/qwenimage21`，板上实际在 `/home/rockchip/models/qwenimage21`） |
+| `WDNAI_QWEN_IMAGE_21_DIR` / `QI_MODEL_DIR` | Qwen-Image-2.1 模型包目录（默认 `$WDNAI_MODELS_DIR/Qwen-Image-2.1`，板上实际在 `/home/rockchip/models/Qwen-Image-2.1`） |
 | `QI_SPREAD_IO` / `QI_SPREAD_IO_IN` | cshim 内部默认 `0` / `1`（输出 IO 绝不能分散） |
 | `WDNAI_LIBRKNN3_API` | `librknn3_api.so` 路径 |
 | `WDNAI_LIBRKNNSMI` | `librknnsmi.so` 路径 |

@@ -378,7 +378,36 @@ name `wdnai`, distribution name `wdnai`.
   **只链系统自带的 `librknn3_api.so`**（门面会 dlopen 系统自带的 rkcp）
   ⇒ 模型包里**不需要任何 .so 或可执行文件**。
   C ABI（Python 只碰这几个）：`qi_qwen_open` / `qi_qwen_te_encode` /
-  `qi_qwen_generate_batch` / `qi_qwen_fixed_noise` / `qi_qwen_free` / `qi_qwen_close`。
+  `qi_qwen_generate_batch` / `qi_qwen_fixed_noise` / `qi_qwen_free` / `qi_qwen_close`
+  \+ **图生图**：`qi_qwen_img2img_batch`（见下面「图生图」那条）。
+- ⭐⭐⭐ **图生图（img2img）＝ VAE 编码器 + 从中间步起步**（2026-11-06）：
+  - **模型包里必须多一个文件**：`vae_qwenimage21-512.encoder.3588.rknn`
+    （205 MB，跑在本机 RK3588 的 NPU 上，**与解码器同设备但可同时常驻**：
+    解码器 2311 MiB + 编码器 ≈0.9 GiB < 4 GiB 池）。
+    ⚠️ **解码器转好了 ≠ 图生图能用** —— 解码器 = latents→图，
+    编码器 = 图→latents，是**两个不同的模型文件**。
+    编码器是**可选件**：没有它 ⇒ 图生图**明确报错**，**不偷偷退化成文生图**。
+  - 走的是**经典 SDEdit 式 img2img**，**不是**官方那种「DiT 加图像条件输入」
+    ⇒ **DiT 一个字节都不用改**：
+    `z₀ = Encoder(图)` → `x = (1−σ[k₀])·z₀ + σ[k₀]·ε` →
+    DiT 从 `k₀` 跑到末步 → VAE 解码。
+    `k₀ = steps − round(steps·strength)`，**与 diffusers img2img 同一口径**；
+    `strength=1 ⇒ k₀=0 ⇒ 与文生图逐字节一致`。
+  - C 侧：`qi/api.cpp::encode_source_image()`（RGB888→RGBA→fp32[-1,1]→
+    `set_input("pixel_values")`→`run`→取 `latents`→归一化→**转 token 主序 fp16**）
+    \+ `qi_qwen_img2img_batch()`；
+    `qi/resident_chain.cpp::run_flowmatch()` 新增 `start_step` / `z0_path` 两个参数
+    （`start_step=0` ⇒ 完全不做加噪 ⇒ 与文生图**逐字节一致**）。
+  - ⚠️ **VAE 是 RGBA 4 通道原生**（不是 RGB）⇒ 编码时 alpha 填 1.0；
+    输入尺寸固定 512×512（**缩放由调用方做**，板端走 wdnav 的 RGA）。
+  - ⚠️ `rknn2_to_logical_nchw` 原来只认 NCHW/NHWC/NC1HWC2，而编码器输出
+    的 fmt=3（`RKNN_TENSOR_UNDEFINED`）⇒ 已加 **UNDEFINED → 零拷贝**分支
+    （板端实测 UNDEFINED 输出就是逻辑 NCDHW）。
+  - ⚠️ 编码器**输出**是通道主序（C=64, T=1024），DiT 的 `hidden_states` 是
+    **token 主序**（T=1024, C=64）⇒ 两者要互转（解码器侧的
+    `latent_to_nchw_f32` 是同口径参考）。
+  - 归一化常数在 `qi/vae_stats.h`（`qi::kVaeLatentsMean/Std`）：
+    解码 `v·std + mean`，编码 `(raw − mean)/std`。
 - `src/wdnai/_cshim/qi/np_noise.{h,cpp}` + `np_zig_tables.h` — ⭐ **固定初始噪声
   现场生成**（⇒ 模型包里**不用再带** `reference_512/hidden_states.bin`）。
   里面是 **numpy 兼容的 PCG64（XSL-RR 128/64）+ ziggurat**：
@@ -397,6 +426,10 @@ name `wdnai`, distribution name `wdnai`.
   `"<" + "|im_start|>"` 拼，**别写字面量**（会被工具链吞掉）。
   另有 `fixed_noise()`：返回固定初始噪声（fp16），md5 恒为
   `b808cf7ecd34338323b783704c516128`（单测守着）。
+  另有 `generate_img2img(prompts, source_rgb, steps, mu, shift_terminal,
+  noise, seed, strength)`：图生图的 ctypes 入口（调 `qi_qwen_img2img_batch`），
+  `source_rgb` 必须是 **512×512 RGB888**（缩放由调用方用 RGA 做），
+  `strength` = 保留原图的程度（0~1）。
 - `src/wdnai/backends/image.py` — `ImageBackend`（kind=`image`，文生图
   Qwen-Image-2.1 / RKNN3 rk1820，512×512）。**不再起子进程** ⇒ 改成
   **进程内调 cshim**（`_qwen_image_c.QwenImageShim`）。
@@ -409,8 +442,16 @@ name `wdnai`, distribution name `wdnai`.
   否则 VAE 第 3 段 `create_mem` 失败）。
   `run_text()` 返回 `(prompt_str, [ImageAttachment])`；图片是 **BGR
   uint8**（cshim 直接给 RGB，SDK 转 BGR），PNG 由 SDK 用纯标准库写。
-  模型包默认 `/home/rockchip/models/qwenimage21`（`WDNAI_QWEN_IMAGE_21_DIR`
+  模型包默认 `/home/rockchip/models/Qwen-Image-2.1`（`WDNAI_QWEN_IMAGE_21_DIR`
   / `QI_MODEL_DIR` 可覆盖），**包里只剩模型**（无 .so、无可执行文件）。
+  ⭐⭐ **2026-11-06：`run_images()` 从 `NotImplementedError` 变成真实现**
+  （图生图）：BGR→RGB、**用 wdnav 的 RGA 缩放到 512×512**（不许软件 resize）、
+  调 `generate_img2img`、写 PNG、复制到 `output_dir`，
+  返回 `(prompt, [ImageAttachment(bgr)])`；`_options()` 里加 `"strength": 0.75`。
+  ⚠️ **附件形态**：session 的 `_dispatch_sync` 会把附件**展平成 ndarray 列表**
+  （`images.extend(att.images)`）⇒ `run_images` 收到的是**裸 ndarray**，
+  不是 `ImageAttachment` ⇒ 取图要 `isinstance(item, np.ndarray)` 分支
+  （第一版按 `.images` 取，第一版直接报「图生图需要一张输入图」）。
   ⭐ **第三十七轮新增 `warmup()` 钩子**：cshim 会话是**懒加载**的
   （构造 backend 不碰 NPU），于是「第一次推理」= 90 s init + 34 s 生成
   = 124 s，**超过 webui 的 120 s RPC 推理超时** ⇒ 第一次出图必然超时。
@@ -838,6 +879,12 @@ grounding 链路定义在 `src/wdnai/grounding.py`（独立模块，**不**耦�
   已经固化在 **cshim（C 侧）** 里 —— 用 `src/wdnai/_cshim/` 那份，
   **别在 Python 里重写一遍**（纯 Python 版试过：能对齐，但要额外复刻
   FMA 收缩、fp16 次正规数的怪癖、libstdc++ 的 mt19937，容易踩 1 ULP 的坑）。
+- ⭐⭐⭐ **图生图缺 VAE 编码器时必须报错，绝不能退化成文生图**（2026-11-06）：
+  编码器是**可选件**（模型包里没有 `vae_qwenimage21-512.encoder.3588.rknn`
+  是合法状态）⇒ `run_images()` 要**明确抛错**说明缺哪个文件，
+  **不能**悄悄走 `run_text()` 的文生图路径 —— 悄悄换个语义比报错更糟
+  （用户传了图、拿回一张毫不相干的图，还以为「模型效果差」）。
+  ⇒ 同理，**编码器装不上只记 warning**，不能影响文生图。
 
 ## Known limits
 

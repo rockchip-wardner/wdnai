@@ -27,8 +27,8 @@ flow-match + VAE ≈ 34 s::
 
     imgs = await session.generate_images(["a cat", "a dog"])
 
-模型布局（默认 ``$WDNAI_MODELS_DIR/qwenimage21``，板上实际在
-``/home/rockchip/models/qwenimage21``；可用 ``WDNAI_QWEN_IMAGE_21_DIR``
+模型布局（默认 ``$WDNAI_MODELS_DIR/Qwen-Image-2.1``，板上实际在
+``/home/rockchip/models/Qwen-Image-2.1``；可用 ``WDNAI_QWEN_IMAGE_21_DIR``
 或 ``QI_MODEL_DIR`` 覆盖）::
 
     llm_qwenimage21-te.1828.rknn + .weight       text encoder
@@ -109,7 +109,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
                    default=Path("/tmp/qi21"),
                    help="输出**目录** ⇒ 产物为 img01.png / img02.png …")
     p.add_argument("--model-dir", type=Path, default=None,
-                   help="覆盖模型包目录；默认自动解析 $WDNAI_MODELS_DIR/qwenimage21")
+                   help="覆盖模型包目录；默认自动解析 $WDNAI_MODELS_DIR/Qwen-Image-2.1")
     p.add_argument("--seed", type=int, default=0,
                    help="初始噪声种子（只在 --fresh 下有意义：每张图用 seed+图序号）")
     p.add_argument("--fixed", dest="fixed", action="store_true",

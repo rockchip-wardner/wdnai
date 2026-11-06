@@ -542,7 +542,7 @@ model-zoo 的 `da3_export/head.py` 只返回 `output.depth` 和 `output.depth_co
 
 ### 怎么跑
 
-前置条件：模型包已在 `/home/rockchip/models/qwenimage21/`（见「坑」第 3 条）。
+前置条件：模型包已在 `/home/rockchip/models/Qwen-Image-2.1/`（见「坑」第 3 条）。
 
 ```bash
 cd /home/rockchip/wdnwebui
@@ -579,7 +579,7 @@ cd /home/rockchip/wdnwebui
 | `prompt`（位置参数，或 `--prompt`） | **必填** | 要画的提示词（中英文都行）。用 `\|` 分隔多个 ⇒ **批量**（一个进程跑完 N 张） |
 | `steps`（位置参数，或 `--steps`） | `8` | flow-match 步数。8 步 ≈ 34 s/张；20 步 ≈ 55 s/张。**纯运行时参数，模型不重建** |
 | `--out` / `--output` / `-o` | `/tmp/qi21` | 输出**目录** ⇒ 产物为 `img01.png` / `img02.png`…；也可以给 `.png` 文件路径（单张直接改名过去） |
-| `--model-dir` | 自动解析 | 覆盖模型包目录；默认 `$WDNAI_MODELS_DIR/qwenimage21`，板上实际在 `/home/rockchip/models/qwenimage21` |
+| `--model-dir` | 自动解析 | 覆盖模型包目录；默认 `$WDNAI_MODELS_DIR/Qwen-Image-2.1`，板上实际在 `/home/rockchip/models/Qwen-Image-2.1` |
 | `--seed` | `0` | 初始噪声种子（**只在 `--fresh` 下有意义**：每张图用 seed+图序号） |
 | `--fixed` | 关 | 用固定噪声（cshim 现场生成，与历史基线逐字节一致 ⇒ 可对拍 md5） |
 | `--fresh` | **默认** | 每张图用随机噪声 |
