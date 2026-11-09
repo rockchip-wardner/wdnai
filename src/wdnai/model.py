@@ -976,6 +976,31 @@ def _qwen3_tts_dir() -> Path:
     return Path(override) if override else _models_root() / _QWEN3_TTS_DIR_NAME
 
 
+#: Directory name the Qwen3-ASR weights live in, under the models root.
+_QWEN3_ASR_DIR_NAME = "Qwen3-ASR"
+
+
+def _qwen3_asr_dir() -> Path:
+    """Resolve the Qwen3-ASR model directory.
+
+    Override via the ``WDNAI_QWEN3_ASR_DIR`` env var (full path); fallback
+    ``$WDNAI_MODELS_DIR/Qwen3-ASR`` (which itself defaults to
+    ``/userdata/models/Qwen3-ASR`` when ``WDNAI_MODELS_DIR`` is unset).
+    Mirrors ``_qwen3_tts_dir`` so every model dir honors the same
+    ``WDNAI_MODELS_DIR`` root — the folder name is a *default*, not a
+    requirement.
+
+    This matters for wdnwebui: the worker manifest declares
+    ``model_dir_env: "WDNAI_QWEN3_ASR_DIR"``, and the service sets it to
+    the directory the manifest was found in. Without the override the SDK
+    would look in ``$WDNAI_MODELS_DIR/Qwen3-ASR`` and the service's
+    "model files live next to the manifest" invariant would silently
+    break for any other folder name.
+    """
+    override = _os.environ.get("WDNAI_QWEN3_ASR_DIR")
+    return Path(override) if override else _models_root() / _QWEN3_ASR_DIR_NAME
+
+
 def _verify_depth_anything_v3_files() -> None:
     """Raise :class:`FileNotFoundError` listing any missing DA3 files.
 
@@ -1324,7 +1349,9 @@ class SystemLanguageModel:
         """Return a :class:`ModelSpec` bound to the on-device Qwen3-ASR files.
 
         Model dir defaults to ``$WDNAI_MODELS_DIR/Qwen3-ASR/``
-        (resolves to ``/userdata/models/Qwen3-ASR/``). Layout::
+        (resolves to ``/userdata/models/Qwen3-ASR/``), overridable via
+        the ``WDNAI_QWEN3_ASR_DIR`` env var — mirrors every other model
+        dir so the folder name is *not* load-bearing. Layout::
 
             encoder.1828.rknn            + encoder.weight         (offline)
             encoder_online.1828.rknn     + encoder_online.weight  (online / streaming)
@@ -1336,7 +1363,7 @@ class SystemLanguageModel:
         Set ``options["use_online_encoder"] = True`` to switch to the
         streaming encoder (see ``ASRBackend.run_audio``).
         """
-        d = _models_root() / "Qwen3-ASR"
+        d = _qwen3_asr_dir()
         return ModelSpec(
             name="qwen3-asr",
             kind="asr",
@@ -1356,11 +1383,30 @@ class SystemLanguageModel:
                 "temperature": 1.0,
                 "repeat_penalty": 1.2,
                 # Streaming knobs (only used when use_online_encoder=True).
-                "use_online_encoder": False,
+                #
+                # ``use_online_encoder`` defaults to **True**: the deployed
+                # Qwen3-ASR model folder ships the *streaming* encoder
+                # (``encoder_online.1828.rknn``) and the whole point of the
+                # card is incremental decoding. The encoder choice is a
+                # **load-time** decision (which RKNN file to put on the
+                # NPU), so it cannot be switched per request — the flag
+                # lives here, in the SDK, and the worker manifest only says
+                # "this is the qwen3_asr model".
+                #
+                # Set ``use_online_encoder=False`` to use the one-shot
+                # ``encoder.1828.rknn`` instead (offline mode, whole file
+                # in one pass, no incremental output).
+                "use_online_encoder": True,
                 "online_chunk_seconds": 1.0,
                 "online_max_new_tokens": 50,
                 "online_rollback_tokens": 5,
                 "online_rollback_rounds": 4,
+                # Idle TTL for an **incremental** streaming session
+                # (``asr_stream_id``). The worker is a long-lived process,
+                # so a session whose caller stopped feeding would keep
+                # its audio embedding history alive forever; this is how
+                # it gets reaped.
+                "asr_stream_ttl_sec": 120.0,
             },
         )
 

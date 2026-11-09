@@ -111,6 +111,20 @@ class StreamSink:
             self.first_token_time = time.perf_counter()
         self._notify(delta)
 
+    def publish(self, delta: str) -> None:
+        """Fan ``delta`` out to observers **without** touching :attr:`text`.
+
+        For backends whose observable output is not the model's own token
+        stream — the ASR backend publishes one payload per *streaming
+        round* (committed text + speculative tail) rather than per token.
+        Those payloads must not pollute ``self.text``, which those
+        backends use for their own bookkeeping (the ASR backend resets
+        the sink per round and reads ``tokens`` back out of it).
+        """
+        if not delta:
+            return
+        self._notify(delta)
+
     def add_observer(self, cb: Callable[[str], None]) -> None:
         """Register ``cb(delta)``. No-op for ``None``; ignores duplicates."""
         if cb is not None and cb not in self._observers:

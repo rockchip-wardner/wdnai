@@ -61,6 +61,14 @@ class SoftwareCapability(str, Enum):
     VISION_GROUNDING = "swcap_vision_grounding"
     #: 音频 → 文本。
     AUDIO_CHAT = "swcap_audio_chat"
+    #: 音频 → 文本（**语音识别**：含语种自动识别）。
+    #: 与 ``AUDIO_CHAT`` 分开是必要的：Omni 那条通路是「通用音频理解」
+    #: （wav-in→text-out 的一次性问答），而 Qwen3-ASR 是**专用**的流式
+    #: 语音识别通路（1 秒一块增量解码 + 回退确认 + 语种头）。两者
+    #: 「输入」相同但「契约」不同 —— 共用一个能力名会让
+    #: ``get_session("swcap_audio_chat")`` 在两台机器都装了模型时
+    #: 取决于卡号排列，调用方没法指名要 ASR。
+    AUDIO_ASR = "swcap_audio_asr"
     #: 图像 → 向量。供向量检索 / 相似度反查。
     VISION_EMBEDDING = "swcap_vision_embedding"
     #: 图像 → 逐像素深度图 + 置信度。需专用 depth encoder

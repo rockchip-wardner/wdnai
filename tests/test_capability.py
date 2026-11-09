@@ -30,6 +30,10 @@ EXPECTED = (
     "swcap_vision_chat",
     "swcap_vision_grounding",
     "swcap_audio_chat",
+    # Qwen3-ASR streaming: added with the ASR backend; sits right after
+    # the other audio capability because that is where the enum declares
+    # it (the order is asserted verbatim below).
+    "swcap_audio_asr",
     "swcap_vision_embedding",
     "swcap_vision_depth",
     "swcap_text_to_speech",

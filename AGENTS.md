@@ -980,3 +980,22 @@ grounding 链路定义在 `src/wdnai/grounding.py`（独立模块，**不**耦�
   Mock ``_FakeRknn.inference`` 也必须保持 2-D ``(n_patches, dim)``
   输出——改回 1-D 会让 ``test_image_qwen3vl`` 等端到端测试
   静默退化（1-D 源不会触发 numpy broadcast）。
+
+- **ASR 的「最后一块」必须够长（≥ `N_FFT + HOP_LENGTH`）**，否则
+  ``_log_mel_spectrogram`` 会在反射填充处越界：
+  - ``_log_mel_spectrogram`` 按 C 的语义把音频裁到
+    ``n_frame * hop_length``（1 帧 → **160** 采样），再做**反射填充**
+    （需要 ``n_fft // 2`` = **200** 采样）。块长 < ``N_FFT + HOP``
+    （560 @ 16 kHz）时裁完不足 200 → numpy 抛
+    ``ValueError: could not broadcast input array from shape (160,)
+    into shape (200,)`` → worker 报错 → **整场识别报废**。
+  - C 的 ``reflect_pad``（``utils/audio_utils.cc:111``）在同一个位置是
+    **越界读**（UB）——numpy 移植把「C 没定义的地方」翻译成了**硬失败**。
+    官方 Python ``demo_streaming.py`` 则**从不**喂短块（``/api/finish``
+    直接丢弃尾巴），所以两条参考路径都踩不到。
+  - 修复有两层：``_reflect_pad`` 只反射**实际存在**的采样
+    （``w = min(pad_width, n)``，越界处补 0）；``_run_online_block`` 的
+    块长下限从 ``N_FFT`` 提到 ``N_FFT + HOP_LENGTH``（保证裁完还够
+    反射填充）。正常块（16000 采样）的 mel 形状**逐字节不变**。
+  - **末块的长度是调用方无法控制的事**（= 总采样数 mod 块长），所以
+    **保证块够长是块切割方（SDK）的责任**，不是调用方的。

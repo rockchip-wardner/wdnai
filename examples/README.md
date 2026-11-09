@@ -16,7 +16,7 @@
 | sample | 模型 / 能力 | 状态 |
 |---|---|---|
 | [`depth_anything_v3.py`](depth_anything_v3.py) | Depth Anything V3 单目深度估计 | ✅ 已记录 |
-| [`audio_to_text.py`](audio_to_text.py) | Qwen3-ASR 语音转文字 | 待补 |
+| [`Qwen3_ASR/streaming_asr.py`](Qwen3_ASR/streaming_asr.py) | Qwen3-ASR 流式语音识别 | ✅ 已记录 |
 | [`audio_understanding.py`](audio_understanding.py) | Qwen2.5-Omni-3B 音频理解 | 待补 |
 | [`detect_image.py`](detect_image.py) | Qwen3-VL-4B 图像推理 | 待补 |
 | [`detect_video.py`](detect_video.py) | Qwen3-VL-4B 视频流推理 | 待补 |
@@ -646,3 +646,193 @@ cd /home/rockchip/wdnwebui
 7. **别在跑图的过程中 reset / rescan / 烧固件 / 重启板子。**
    这些是把 RK1820 弄坏的真凶（详见 `deploy/debug.md` §69）。
    本 sample 自己不碰卡的状态：proxy 已在跑就不重启，权重只读不写。
+
+---
+
+## Qwen3_ASR —— Qwen3-ASR 流式语音识别（1 秒一块增量解码）
+
+> 本 sample 是**流式** ASR：音频按 1 秒切块，每块过一次 LLM，
+> 每轮吐出「已确认文本」+「未确认尾巴」，和 C++ 参考实现
+> （`rknn3-model-zoo/examples/Qwen3_ASR/cpp/online_main.cc`）**逐轮对齐**。
+>
+> C demo 的两种输出方式，本 sample 一一对应：
+>
+> | C demo | 本 sample |
+> |---|---|
+> | 默认（每轮打印 commit/unfix） | `--mode rounds`（默认） |
+> | `-s`（单行原地刷新，未确认文本蓝色） | `--mode single` |
+>
+> 两种模式吃的是**同一份数据**（每轮的 committed / unfixed），只是渲染不同 ——
+> 和 C demo 一样。
+
+> **目录形态说明**：本 sample 是**多文件**（主 sample + 与 C demo 的自动比对工具
+> + 素材），所以按用户要求放在 `examples/Qwen3_ASR/` 目录下，而不是
+> 「一个 `.py` + 一个同名素材目录」。素材（`asr_en.wav`）就在本目录里。
+
+### 怎么跑
+
+前置条件：模型文件已在 `/userdata/models/Qwen3-ASR/`（见「坑」第 5 条）。
+
+```bash
+cd /userdata/wdnwebui
+
+# 默认：逐轮明细（对应 C demo 的默认输出）
+.venv/bin/python .venv/src/wdnai/examples/Qwen3_ASR/streaming_asr.py
+
+# 单行实时刷新（对应 C demo 的 -s）
+.venv/bin/python .venv/src/wdnai/examples/Qwen3_ASR/streaming_asr.py --mode single
+
+# 换音频 / 换模型目录 / 换 NPU 卡
+.venv/bin/python .venv/src/wdnai/examples/Qwen3_ASR/streaming_asr.py --wav /path/to/other.wav
+.venv/bin/python .venv/src/wdnai/examples/Qwen3_ASR/streaming_asr.py --model-dir /userdata/models/Qwen3-ASR
+.venv/bin/python .venv/src/wdnai/examples/Qwen3_ASR/streaming_asr.py --npu 1
+
+# 把逐轮结果存成 JSON
+.venv/bin/python .venv/src/wdnai/examples/Qwen3_ASR/streaming_asr.py --save-json /tmp/rounds.json
+
+# 与 C++ demo 自动比对（最终结果必须逐字节相同）
+.venv/bin/python .venv/src/wdnai/examples/Qwen3_ASR/compare_with_c_demo.py
+```
+
+- **耗时**：**首次约 19~21 s**（几乎全是模型加载），**15.05 s 音频的推理约 2.1 s**。
+  分阶段实测见下方「性能实测」。
+- **占 NPU**：是。**同一个模型占满一张卡的全部 8 个 182x 核** ——
+  和 webui 里已启用的 ASR worker 不能抢同一张卡。
+- **一致性回归**：`compare_with_c_demo.py` 会跑 C demo 和本 sample 并**逐轮 diff**。
+  C demo 是确定性的（同一二进制/模型/wav 重复跑逐字节相同），所以也可以
+  `--c-baseline <已保存的 C 输出>` 直接对着固化基线比。
+
+### 输入
+
+#### 命令行参数
+
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `--wav` | `Qwen3_ASR/asr_en.wav` | 输入 wav。支持 PCM s16/s24/s32 与 IEEE float32 |
+| `--model-dir` | 无 | 覆盖模型目录，等价于设环境变量 `WDNAI_QWEN3_ASR_DIR` |
+| `--npu` | 无（= 第一张） | NPU 卡索引，对应 `RKNN3Lite.get_devices_id()` 的下标。**0/1/2 是三张 PCIe 协卡，3~5 是板载 SoC 核** |
+| `--mode` | `rounds` | `rounds`=逐轮明细（C 默认）；`single`=单行原地刷新（C 的 `-s`） |
+| `--chunk-seconds` | `1.0` | 流式分块长度（秒），对齐 C 的 `ONLINE_CHUNK_MS` |
+| `--max-new-tokens` | `50` | 每块 LLM 最多生成多少 token，对齐 C 的 `ONLINE_MAX_NEW_TOKENS` |
+| `--rollback-tokens` | `5` | 每轮回退末尾几个 token，对齐 C 的 `ONLINE_ROLLBACK_TOKENS` |
+| `--rollback-rounds` | `4` | 前几轮不提交，对齐 C 的 `ONLINE_ROLLBACK_ROUNDS` |
+| `--save-json` | 无 | 把逐轮结果写成 JSON |
+| `-v/--verbose` | 关 | 打开 SDK 的 DEBUG 日志 |
+
+#### 素材
+
+```
+examples/Qwen3_ASR/
+├── streaming_asr.py        # 主 sample（本节）
+├── compare_with_c_demo.py  # 与 C++ demo 的自动比对工具
+└── asr_en.wav              # 素材（md5 f50189de8aa94fb9cd1e5dbfa1b6939e，
+                            #   与 model-zoo 的 rknn_Qwen3_ASR_demo/asr_en.wav 一致）
+```
+
+#### 硬性约束
+
+- **音频时长 ≤ 60 s**（C 的 `ONLINE_MAX_AUDIO_SECONDS`）。
+- **模型目录必须包含实际选中的那套 encoder**：
+  默认流式模式只要 `encoder_online.*`；`use_online_encoder=False` 时才要
+  `encoder_offline.*`。
+- **必须用流式 encoder** 才是流式；离线 encoder 一次吃掉整段音频。
+
+### 输出
+
+#### stdout 各行
+
+| 行 | 含义 |
+|---|---|
+| `wav: <path> sr=48000 ch=1 width=3 bytes=… (15.05s)` | 输入音频的实际参数。`width=3` 是 **24-bit**（字节/采样） |
+| `model loaded in 18.49s (npu=1)` | **模型加载耗时**（含权重上传），不是推理耗时 |
+| `================ Online Round N ================` | 第 N 轮开始 |
+| `commit_add_text:` / 下一行 | **本轮新增**的已确认文本（前 4 轮为空 —— 回退策略还没开始提交） |
+| `unfix_text:` / 下一行 | 本轮**还没确认**的尾巴，下一轮可能被改写 |
+| `================ Final Commit Result ================` | 收尾块 |
+| 下一行 | **最终转写正文**（不含 `language English` 头，那行在 SDK 的返回值里） |
+| `rounds=16 wall=2.11s` | 轮数与**纯推理**耗时（不含加载） |
+
+`--mode single` 下不打印逐轮块，改成一行原地刷新：已确认文本正常色，
+未确认尾巴**蓝色**，行尾 `\033[K` 擦除 —— 与 C 的 `print_single_line_result()`
+逐字节同构。
+
+#### 基准数值（自带素材，与 C++ demo **逐字节相同**）
+
+```
+Uh huh. Oh yeah, yeah! He wasn't even that big when I started listening to him,
+but in his solo music, didn't do overly well, but he did very well when he started
+writing for other people.
+```
+
+（上面是**换行后的排版**；实际是**一行**。`compare_with_c_demo.py` 比的是逐字节。）
+
+### 容易踩的坑
+
+1. **mel 频谱的帧数必须复刻 C 的截断。**
+   C 的 `audio_preprocess` 按 `n_frame = (len - n_fft) / hop + 1` 算帧数，
+   并把音频**截断到 `n_frame * hop`**。1 秒块 = 16000 采样 → 截到 15680
+   → **98 列** mel。不做这个截断，Python 侧会算成 **100 列** ——
+   模型输入宽度对不上，**第 1 轮就分叉**（实测从「嗯哼。」变成「Uh-huh」）。
+
+2. **重采样器别换成 Kaiser-sinc。**
+   C demo 用 miniaudio 的带限 FIR（实测冲激响应是单位直流增益的窗函数 sinc，
+   DC≈1.0002），本 SDK 用**线性插值**。两者在 mel 频谱的**末位比特**上有差异，
+   经 int8 量化偶尔会让某一个 token 选到不同分支。
+   实测换成 sinc 会把转写改成 `"Oh yeah, he wasn't even that big…"`（丢掉
+   「Uh huh.」）—— **线性插值才是与 C 一致的那个**。
+
+3. **解码必须 `skip_special_tokens=True`。**
+   C 侧走 llama.cpp 的 `TokenToPiece`，它对控制 token 返回 **0 字节**。
+   Python 侧若不过滤，尾部会漏出 `<|im_end|>`。
+
+4. **C demo 与 SDK 不要在**同一张卡**上背靠背跑。**
+   C demo 的 `rknn3_init(&ctx, NULL)` 走驱动枚举的**第一张卡**，且 `0xff`
+   占满该卡全部 8 个 182x 核。同一张卡上「C demo 退出 → 立刻建新 context」
+   会触发 RKNN3 PCIe transfer proxy 的**驱动级 hang**（proxy 卡在 `ioctl()`，
+   要 `kill -9` 手动救，而且 supervisor **不会**自动把它拉回来）。
+   ⇒ `compare_with_c_demo.py` 默认**自动给 SDK 选一张和 C demo 不同的卡**。
+
+5. **模型目录名可以任意命名。**
+   模型目录里的 `<model_id>.json`（worker manifest）声明
+   `model_dir_env`，SDK 通过该 env 跟随 manifest 所在目录 ——
+   所以目录**不必**叫 `Qwen3-ASR`，但 env 名要对得上。
+
+6. **文件检查只要求实际选中的那套 encoder。**
+   改造前强制要求 offline + online 两套都在，流式部署（只装 online）根本
+   加载不了。
+
+7. **别在跑推理的过程中 reset / rescan / 烧固件 / 重启 proxy。**
+   这些是把 RK1820 弄坏的真凶。本 sample 自己不碰卡的状态。
+
+### 性能实测
+
+> 平台：RK3588（8 核 NPU）+ PCIe 协卡，权重约 **1.1 GB**
+> （`encoder_online.*` + `llm.*` + `llm.embed.bin` + tokenizer）。
+> 音频：自带 `asr_en.wav`，48 kHz / 单声道 / 24-bit / **15.05 s**。
+
+#### 模型加载（一次性）
+
+| 阶段 | 耗时 | 说明 |
+|---|---|---|
+| 模型加载合计 | **18.49 s** | webui worker 侧实测（`load_time_sec`）；裸 sample 侧同样量级 |
+| **纯推理** | **2.11 s** | 16 轮 LLM + 16 次 audio encoder |
+
+⇒ 端到端（加载 + 推理）约 **20.6 s**；**纯推理 ≈ 7× 实时**。
+
+#### 单轮耗时（对齐 C 的 `perf:` 行）
+
+C demo 每轮打印 `audio=… ms, prefill_tokens=…, decode_tokens=…,
+ttft=… ms, decode=… ms`。SDK 的单轮耗时与 C 同量级：
+**audio encoder 约 18~32 ms**，LLM 的 ttft 约 **32~54 ms**、
+decode 约 **37~142 ms**（随该轮生成 token 数变化）。
+
+#### 流式特性
+
+- 每 **1 秒**音频产生**一轮**输出 ⇒ 15.05 s 音频 = **16 轮**。
+- 前 **4 轮**（`--rollback-rounds`）**不提交**任何已确认文本 ——
+  这期间只有 `unfix_text` 在动，这是回退策略的设计。
+- 「已确认文本」是**单调增长**的；「未确认尾巴」每轮可能被整体改写。
+
+> **模型给出的语种在头几轮会猜错**（15 s 音频的第 1 轮报 `Chinese`，
+> 第 2 轮才纠正成 `English`）—— 音频上下文太短时语种判定不准。
+> **最终语种**取自完整 committed token 流，比逐轮的猜测可靠。
