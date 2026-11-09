@@ -6,7 +6,7 @@ for **LLM / VLM / TTS** inference on Rockchip NPUs (RK1828); import
 name `wdnai`, distribution name `wdnai`.
 
 > Vendored in-tree as `.venv/src/wdnai/` (editable install from
-> `git@10.10.10.10/wardner/wdnai.git`). It is *not* on PyPI. See
+> `git@github.com:rockchip-wardner/wdnai.git`). It is *not* on PyPI. See
 > `wdnwebui/AGENTS.md` "One-time setup" for the install command.
 
 > **As of v0.4.x**, wdnai no longer depends on the `rknn3lite` Python
@@ -18,7 +18,7 @@ name `wdnai`, distribution name `wdnai`.
 
 ## Repo map (one-line each)
 
-- `README.md` — 面向**使用者**的说明：安装（内网 Git editable）、文本/视觉/
+- `README.md` — 面向**使用者**的说明：安装（GitHub editable）、文本/视觉/
   结构化输出/工具调用的快速上手、能力词表、`RknnSmi` 遥测、`ModelSpec`
   字段与 preset 速查、模型文件布局与环境变量、已知限制。
   `pyproject.toml` 的 `readme = "README.md"` 指向的就是它 —— **别删**，

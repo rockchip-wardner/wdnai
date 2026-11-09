@@ -10,7 +10,7 @@ Python wheel。
 - **遥测同源**：`wdnai.RknnSmi` 是 `rknn-smi` CLI 背后那套 C ABI 的进程内封装，
   高频轮询不用 fork 子进程。
 
-> 本包**不在 PyPI**，只在公司内网 Git 上，按下面的「安装」从 SSH 装 editable。
+> 本包**不在 PyPI**，按下面的「安装」从 GitHub 装 editable。
 
 ---
 
@@ -21,11 +21,11 @@ Python wheel。
 用到对应能力时才报错。
 
 ```bash
-# 从内网 Git 装 editable（推荐）
-pip install -e "git+ssh://git@10.10.10.10/wardner/wdnai.git#egg=wdnai"
+# 从 GitHub 装 editable（推荐）
+pip install -e "git+ssh://git@github.com/rockchip-wardner/wdnai.git#egg=wdnai"
 
 # 或者先 clone 到本地再装
-git clone ssh://git@10.10.10.10/wardner/wdnai.git
+git clone ssh://git@github.com/rockchip-wardner/wdnai.git
 pip install -e ./wdnai
 ```
 
