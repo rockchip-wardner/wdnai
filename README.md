@@ -1,24 +1,30 @@
+[English](README.md) | [简体中文](README_CN.md)
 # wdnai
 
-RK 芯片（RK3588 + PCIe AI 协处理器 RK1828）上的 **LLM / VLM / TTS / ASR / Embedding**
-访问 SDK —— 基于 `librknn3_api.so` 的 **ctypes 直连**，不依赖 `rknn3-toolkit-lite`
-Python wheel。
+**LLM / VLM / TTS / ASR / Embedding** access SDK for RK chips (RK3588 + PCIe AI
+coprocessor RK1828) — a direct **ctypes binding** to `librknn3_api.so`, with no
+dependency on the `rknn3-toolkit-lite` Python wheel.
 
-- **纯 Python + ctypes**：只绑定 SDK 真正用到的那部分 RKNN3 ABI，`import wdnai`
-  不会打开 `.so`（库是惰性加载的，避免和 compute worker 抢设备）。
-- **能力词表收归 SDK**：`swcap_*` 是全仓唯一权威定义（见 `wdnai.capability`）。
-- **遥测同源**：`wdnai.RknnSmi` 是 `rknn-smi` CLI 背后那套 C ABI 的进程内封装，
-  高频轮询不用 fork 子进程。
+- **Pure Python + ctypes**: binds only the part of the RKNN3 ABI the SDK actually
+  uses; `import wdnai` does not open the `.so` (the library is lazily loaded, which
+  keeps it from competing with the compute worker for the device).
+- **Capability vocabulary lives in the SDK**: `swcap_*` is the single authoritative
+  definition for the whole repo (see `wdnai.capability`).
+- **Telemetry from the same source**: `wdnai.RknnSmi` is an in-process wrapper around
+  the C ABI behind the `rknn-smi` CLI, so high-frequency polling needs no forked
+  child process.
 
-> 本包**不在 PyPI**，按下面的「安装」从 GitHub 装 editable。
+> This package is **not on PyPI** — install it editable from GitHub, as described under
+> "Installation" below.
 
 ---
 
-## 安装
+## Installation
 
-前提：设备上要有 Rockchip 运行时 —— `/usr/lib/librknn3_api.so`（推理）与
-`/usr/lib/librknnsmi.so`（遥测）；两者都不在时 `import wdnai` 仍然安全，只是
-用到对应能力时才报错。
+Prerequisites: the device needs the Rockchip runtime — `/usr/lib/librknn3_api.so`
+(inference) and `/usr/lib/librknnsmi.so` (telemetry). When neither is present,
+`import wdnai` is still safe; it only fails when the corresponding capability is
+actually used.
 
 ```bash
 # 从 GitHub 装 editable（推荐）
@@ -29,21 +35,22 @@ git clone ssh://git@github.com/rockchip-wardner/wdnai.git
 pip install -e ./wdnai
 ```
 
-Python 要求 **>= 3.9**。运行期依赖：`numpy`、`transformers`、`tokenizers`、
-`pydantic`、`opencv-python`、`gguf`。
+Python **>= 3.9** is required. Runtime dependencies: `numpy`, `transformers`,
+`tokenizers`, `pydantic`, `opencv-python`, `gguf`.
 
-> **注意**：`transformers` / `tokenizers` / `gguf` 是**模型加载的必经之路**，
-> 不是可选传递依赖 —— RKNN 模型自带 `*.tokenizer.gguf`，加载时要靠它们解析
-> tokenizer。若用 `pip install --no-deps` 装本包，请自行把这几个包补齐，
-> 否则模型加载会报 `ModuleNotFoundError: No module named 'tokenizers'`。
+> **Note**: `transformers` / `tokenizers` / `gguf` are **required for model loading**,
+> not optional transitive dependencies — RKNN models ship their own
+> `*.tokenizer.gguf`, and loading needs them to parse the tokenizer. If you install
+> this package with `pip install --no-deps`, add these packages yourself; otherwise
+> model loading fails with `ModuleNotFoundError: No module named 'tokenizers'`.
 
-开发/测试额外依赖：`pip install -e ".[dev]"`（pytest + build）。
+Extra dependencies for development/testing: `pip install -e ".[dev]"` (pytest + build).
 
 ---
 
-## 快速上手
+## Quick start
 
-### 文本对话
+### Text chat
 
 ```python
 import asyncio
@@ -60,11 +67,12 @@ async def main():
 asyncio.run(main())
 ```
 
-> `LLMSession(model=...)` 是**旧写法**（现在会发 `DeprecationWarning`，内部
-> 其实返回 `LLMLocalSession`）。进程内推理请直接用 `LLMLocalSession`；
-> 跨进程 / 跨机走 DDS RPC 的话用 `wdndds.LLMRPCSession` —— 两者接口一致。
+> `LLMSession(model=...)` is the **old form** (it now raises a `DeprecationWarning`;
+> internally it returns an `LLMLocalSession`). Use `LLMLocalSession` directly for
+> in-process inference; for cross-process / cross-machine work over DDS RPC use
+> `wdndds.LLMRPCSession` — the two have the same interface.
 
-### 视觉：图片 / 视频帧
+### Vision: images / video frames
 
 ```python
 import cv2
@@ -78,11 +86,13 @@ text = await session.respond(
 )
 ```
 
-- 视频**不用**特殊类型：自己按帧采样，把帧列表交给 `ImageAttachment([f0, f1, ...])`。
-- 目录里同时有 384×384 与 768×768 两套 vision 模型时，SDK 会**两个都加载**，
-  并按输入图的最长边自动挑最接近的那一套（命名约定见 `src/wdnai/models/README.md`）。
+- Video needs **no** special type: sample the frames yourself and hand the frame list
+  to `ImageAttachment([f0, f1, ...])`.
+- When the directory holds both a 384×384 and a 768×768 vision model, the SDK loads
+  **both** and automatically picks the one closest to the longest edge of the input
+  image (naming conventions see `src/wdnai/models/README.md`).
 
-### 结构化输出（`generating=`）
+### Structured output (`generating=`)
 
 ```python
 from typing import Literal
@@ -100,10 +110,11 @@ else:
     print(result)        # 模型没吐出符合 schema 的 JSON → 拿到的是原文
 ```
 
-`generating=` 的 schema 由 SDK 拼进 prompt；返回值经 pydantic 校验，
-校验不过时**不抛异常**，而是把模型原文返回给你（见上面 `else` 分支）。
+The schema of `generating=` is assembled into the prompt by the SDK; the return value
+is validated by pydantic, and when validation fails it **does not raise** — instead
+you get the model's raw text back (see the `else` branch above).
 
-### 工具调用（`tools=`）
+### Tool calls (`tools=`)
 
 ```python
 from wdnai import Callable
@@ -116,10 +127,10 @@ def alarm(parm: Event):
 await session.respond(prompt="检查危险行为", attachment=[img], generating=Event, tools=[alarm])
 ```
 
-`@Callable` 装饰的函数会被注册成「模型可调用的工具」；`@Generable` 的 schema
-是它的入参类型。
+Functions decorated with `@Callable` are registered as "tools the model can call";
+the `@Generable` schema is their parameter type.
 
-### 流式 / 多轮 / 其它
+### Streaming / multi-turn / misc
 
 ```python
 await session.respond(prompt="...", on_delta=lambda chunk: print(chunk, end=""))
@@ -133,10 +144,11 @@ await session.embed_text("要检索的文本")          # embedding 模型
 
 ---
 
-### 文生图（Qwen-Image-2.1）
+### Text-to-image (Qwen-Image-2.1)
 
-`kind="image"` 的模型走 `wdnai.backends.image.ImageBackend`：文本 → 512×512
-图像。**输出是图像不是文本**，所以要用能带附件的入口拿图。
+Models with `kind="image"` go through `wdnai.backends.image.ImageBackend`: text →
+512×512 image. **The output is an image, not text**, so use an entry point that
+accepts attachments to get the picture.
 
 ```python
 from wdnai import LLMLocalSession, SystemLanguageModel
@@ -156,39 +168,42 @@ out = await session.respond("a cute cat", generating=LMOutput)
 bgr = out.attachment[0].images[0]
 ```
 
-⚠️ `respond()` **不带** `generating=` 时只返回文本，图片会丢 —— 那是
-`respond` 的契约（它承诺给调用方一个**文本**结果），要图就用上面三条之一。
+⚠️ When `respond()` is called **without** `generating=` it returns text only and the
+image is dropped — that is the contract of `respond` (it promises the caller a
+**text** result); use one of the three ways above when you want the image.
 
-⭐⭐⭐ **运行时是 wdnai 自己的 C shim**（`src/wdnai/_cshim/libqi_qwen.so`，
-**源码随包发布**）—— 不是外部二进制、也不是任何 Rockchip 的闭源产物。
-它只链**系统自带**的 `librknn3_api.so` ⇒
-模型包里**只有模型**，不含任何 `.so` / 可执行文件。
-⭐ 连「固定初始噪声」也是 cshim **现场生成**的（numpy 兼容的 PCG64 + ziggurat，
-与历史基线**逐字节一致**）⇒ 包里**连数据文件都不用带**。
+⭐⭐⭐ **The runtime is wdnai's own C shim** (`src/wdnai/_cshim/libqi_qwen.so`,
+**source shipped with the package**) — not an external binary, and not a closed-source
+Rockchip artifact. It links only against the **system-provided** `librknn3_api.so` ⇒
+the model package holds **only the model**, with no `.so` / executable of any kind.
+⭐ Even the "fixed initial noise" is **generated on the fly** by the cshim
+(numpy-compatible PCG64 + ziggurat, **byte-for-byte identical** to the historical
+baseline) ⇒ the package does not even have to carry a data file.
 
 ```bash
 # cshim 在 pip install 时自动编译；也可手动：
 cd src/wdnai/_cshim && make          # 或 bash tools/build_cshim.sh
 ```
 
-⚠️ 编译需要 C++ 编译器（板上 `/usr/bin/g++` 已有）；缺编译器时安装不会失败，
-只是文生图不可用（其它后端不受影响）。
+⚠️ Compiling requires a C++ compiler (`/usr/bin/g++` is already present on the
+board); when the compiler is missing the install does not fail, only text-to-image is
+unavailable (the other backends are unaffected).
 
-运行时参数（可写进 `spec.options` 或逐次传）：
+Runtime parameters (can be written into `spec.options` or passed per call):
 
-| 参数 | 默认 | 说明 |
+| Parameter | Default | Description |
 |---|---|---|
-| `steps` | `8` | flow-match 步数。8 步 ≈ 94 s；20 步更清晰 ≈ 125 s；40 步 = 上游默认 |
-| `fm_mu` | `0.5387096774` | 512 路线的调度系数（**不能**用 1024 路的 0.6935483871） |
-| `noise_fresh` | `True` | 每次换随机初始噪声；`False` ⇒ 固定噪声（可复现 / 可与金标准对拍） |
-| `keep_artifacts` | `False` | 保留中间产物（潜变量 / VAE 原始张量） |
-| `work_dir` | 临时目录 | 指定工作目录（产物落在这里） |
+| `steps` | `8` | flow-match step count. 8 steps ≈ 94 s; 20 steps is sharper ≈ 125 s; 40 steps = upstream default |
+| `fm_mu` | `0.5387096774` | scheduling coefficient for the 512 route (**must not** use the 1024 route's 0.6935483871) |
+| `noise_fresh` | `True` | draw a fresh random initial noise each time; `False` ⇒ fixed noise (reproducible / comparable against a golden reference) |
+| `keep_artifacts` | `False` | keep intermediate artifacts (latent variables / raw VAE tensors) |
+| `work_dir` | temp dir | working directory to use (artifacts land here) |
 
-⏱ 板端实测（RK3588 + 2×RK1828，8 步）：**TE 与 DiT 都常驻**
-（卡 0 = TE + 头，卡 1 = DiT 4 段 → VAE）⇒ 一次性 init ≈ 78 s，
-之后**每张图 ≈ 34 s**（flow-match 21 s + VAE 11 s，TE 编码只要 0.16 s）。
+⏱ Measured on the board (RK3588 + 2×RK1828, 8 steps): **both TE and DiT stay
+resident** (card 0 = TE + head, card 1 = DiT 4 segments → VAE) ⇒ one-time init ≈ 78 s,
+after that **≈ 34 s per image** (flow-match 21 s + VAE 11 s, TE encoding only 0.16 s).
 
-命令行等价物（不写 Python 也能出图）：
+Command-line equivalent (you can generate images without writing Python):
 
 ```bash
 .venv/bin/python .venv/src/wdnai/examples/qwen_image_21.py \
@@ -201,21 +216,22 @@ cd src/wdnai/_cshim && make          # 或 bash tools/build_cshim.sh
 
 ---
 
-## 能力词表 `SoftwareCapability`
+## Capability vocabulary `SoftwareCapability`
 
-`swcap_*` 描述的是「**这个模型实例在本机实际能做什么**」，不是「哪个业务用它」。
-定义收在 `wdnai.capability`，manifest 校验和运行时取 session 都用它。
+`swcap_*` describes "**what this model instance can actually do on this machine**",
+not "which business uses it". The definitions live in `wdnai.capability`, and both
+manifest validation and runtime session lookup use them.
 
-| 能力串 | 含义 |
+| Capability string | Meaning |
 |---|---|
-| `swcap_text_chat` | 文本 → 文本（多轮 + 流式） |
-| `swcap_vision_chat` | 图像 → 文本（描述 / 检测描述） |
-| `swcap_vision_grounding` | 图像 → 0–1000 归一化 bbox + 文本（需 LocateAnything） |
-| `swcap_vision_embedding` | 图像/视频 → 检索向量 |
-| `swcap_audio_chat` | 音频 → 文本 |
-| `swcap_text_to_speech` | 文本 → 语音 |
-| `swcap_text_to_image` | 文本 → 图像（Qwen-Image-2.1，512×512） |
-| `swcap_tool_call` | 函数 / 工具调用 |
+| `swcap_text_chat` | text → text (multi-turn + streaming) |
+| `swcap_vision_chat` | image → text (description / detection description) |
+| `swcap_vision_grounding` | image → 0–1000 normalized bbox + text (requires LocateAnything) |
+| `swcap_vision_embedding` | image/video → retrieval vector |
+| `swcap_audio_chat` | audio → text |
+| `swcap_text_to_speech` | text → speech |
+| `swcap_text_to_image` | text → image (Qwen-Image-2.1, 512×512) |
+| `swcap_tool_call` | function / tool calling |
 
 ```python
 from wdnai import SoftwareCapability, migrate_legacy
@@ -225,13 +241,14 @@ migrate_legacy("video_describe")            # → (SoftwareCapability.VISION_CHA
 migrate_legacy("swcap_not_a_thing")         # → ValueError
 ```
 
-`migrate_legacy()` 负责**读老配置**：裸旧名（`video_describe`）和上一版
-`swcap_*` 名都能迁；已下线的能力（`video_query` / `video_analyse`）抛
-`RetiredCapabilityError` 而不是静默映射成一个没人声明的名字。
+`migrate_legacy()` is responsible for **reading old configuration**: both the bare
+legacy names (`video_describe`) and the previous generation of `swcap_*` names can be
+migrated; retired capabilities (`video_query` / `video_analyse`) raise
+`RetiredCapabilityError` instead of being silently mapped to a name nobody declares.
 
 ---
 
-## 遥测 `RknnSmi`
+## Telemetry `RknnSmi`
 
 ```python
 from wdnai import RknnSmi
@@ -241,70 +258,72 @@ for dev in smi.get_device_list():
     print(dev["index"], dev["mode"], smi.get_device_temperature(dev["index"]))
 ```
 
-- 设备列表 / 型号 / PCIe BDF / 温度 / 功耗 / 电压 / 电流 / NPU 利用率 /
-  显存 / 健康状态 / 版本 / 复位。
-- 温度单位是 **°C**。设备级温度命令在部分 EP 固件上没人应答（RK1828），
-  `get_device_temperature()` 会**自动回退到 chip 级**并记住，后续不再触发
-  失败的 PCIe 命令 —— 调用方无须关心两级差异。
-- 需要 root 才能拿到 `/tmp/rknnsmi.lock` 的 flock（同一时刻另起
-  `rknn-smi` CLI 会因此 init 失败）。
+- Device list / model / PCIe BDF / temperature / power / voltage / current / NPU
+  utilization / memory / health status / version / reset.
+- The temperature unit is **°C**. The device-level temperature command is not
+  answered on some EP firmwares (RK1828), so `get_device_temperature()` **falls back
+  to chip level automatically** and remembers it, no longer issuing the failing PCIe
+  command — callers need not care about the two-level difference.
+- Root is required to take the flock on `/tmp/rknnsmi.lock` (starting another
+  `rknn-smi` CLI at the same moment therefore fails to init).
 
 ---
 
-## ModelSpec 速查
+## ModelSpec quick reference
 
-一个 `ModelSpec` = **一个模型实例的全部静态配置**。
+One `ModelSpec` = **all the static configuration of one model instance**.
 
-| 字段 | 说明 |
+| Field | Description |
 |---|---|
-| `name` | 模型名，如 `qwen3-vl-4b` |
+| `name` | model name, e.g. `qwen3-vl-4b` |
 | `kind` | `llm` / `vlm` / `tts` / `omni` / `asr` / `embedding` |
-| `variant` | 权重族：`qwen3` / `qwen3-vl` / `qwen2.5-omni` / `qwen3-tts` / … |
-| `rknn_path` / `weight_path` | LLM 的 RKNN 与权重文件 |
-| `rknn_llm_path` / `rknn_vision_path` | VLM 的两套 RKNN（+ 各自的 `weight_*`） |
-| `tts_model_dir` / `omni_model_dir` / `asr_model_dir` | 按目录组织的模型（TTS / Omni / ASR） |
-| `embed_path` / `tokenizer_path` | embedding 向量文件 / tokenizer 文件 |
-| `vocab_size` | 词表大小（Qwen3.5-VL 是 **248320**，别照抄 Qwen3 的 151936） |
-| `special_eos_id` | 特殊 EOS id（Qwen3.5-VL 是 **248046**） |
-| `max_context_len` | 上下文长度 |
-| `image_size` | 视觉输入边长（384 / 576 / 768 …） |
-| `use_prune` | 是否启用剪枝 |
-| `target` / `core_mask` | `rk1820` / `rk1828`；`core_mask` 选 NPU 核心 |
-| `verbose` | 运行时日志 |
-| `options` | 采样参数（`temperature` / `top_p` / `top_k` / `repeat_penalty` …），会并进 `init_runtime` |
+| `variant` | weight family: `qwen3` / `qwen3-vl` / `qwen2.5-omni` / `qwen3-tts` / … |
+| `rknn_path` / `weight_path` | the RKNN and weight files of an LLM |
+| `rknn_llm_path` / `rknn_vision_path` | the two RKNNS of a VLM (+ their respective `weight_*`) |
+| `tts_model_dir` / `omni_model_dir` / `asr_model_dir` | directory-organized models (TTS / Omni / ASR) |
+| `embed_path` / `tokenizer_path` | embedding vector file / tokenizer file |
+| `vocab_size` | vocabulary size (Qwen3.5-VL is **248320**, do not copy Qwen3's 151936) |
+| `special_eos_id` | special EOS id (Qwen3.5-VL is **248046**) |
+| `max_context_len` | context length |
+| `image_size` | vision input edge length (384 / 576 / 768 …) |
+| `use_prune` | whether pruning is enabled |
+| `target` / `core_mask` | `rk1820` / `rk1828`; `core_mask` selects the NPU cores |
+| `verbose` | runtime logging |
+| `options` | sampling parameters (`temperature` / `top_p` / `top_k` / `repeat_penalty` …), merged into `init_runtime` |
 
-改路径 / 改采样：
+Change paths / change sampling:
 
 ```python
 spec = SystemLanguageModel.qwen3_vl_4b().with_paths(rknn_llm_path="/tmp/x.rknn")
 spec = spec.with_options(temperature=0.2, top_p=0.9)
 ```
 
-### 现成 preset
+### Ready-made presets
 
-`SystemLanguageModel.<preset>()`：
+`SystemLanguageModel.<preset>()`:
 
-| preset | 模型目录（`$WDNAI_MODELS_DIR` 下） | 能力 |
+| preset | model directory (under `$WDNAI_MODELS_DIR`) | capability |
 |---|---|---|
-| `qwen2_5_0_5b` / `qwen3_1_7b` / `qwen3_4b` | `Qwen3-4B/` 等 | 文本对话 |
-| `qwen2_5_vl_3b` / `qwen2_5_vl_7b` | `Qwen2.5-VL-*` | 视觉对话 |
-| `qwen3_vl_2b` / `qwen3_vl_4b` / `qwen3_vl_4b_template` | `Qwen3-VL-4B/` | 视觉对话（template 版不绑默认路径） |
-| `qwen3_5_vl_4b` | `Qwen3.5-4B/` | 视觉对话 + 工具调用 |
-| `qwen2_5_omni_3b` | `Qwen2.5-Omni-3B/` | 音频 → 文本 |
-| `qwen3_tts` | `Qwen3-TTS/` | 文本 → 语音 |
-| `qwen3_asr` | `Qwen3-ASR/` | 语音 → 文本 |
-| `qwen3_vl_embedding` | `Qwen3-VL-Embedding-2B/` | 检索向量 |
-| `locate_anything` | `LocateAnything-3B/` | 目标定位（bbox） |
-| `qwen_image_21_512` | `Qwen-Image-2.1/` | 文生图（512×512） |
+| `qwen2_5_0_5b` / `qwen3_1_7b` / `qwen3_4b` | `Qwen3-4B/` etc. | text chat |
+| `qwen2_5_vl_3b` / `qwen2_5_vl_7b` | `Qwen2.5-VL-*` | vision chat |
+| `qwen3_vl_2b` / `qwen3_vl_4b` / `qwen3_vl_4b_template` | `Qwen3-VL-4B/` | vision chat (the template variant binds no default path) |
+| `qwen3_5_vl_4b` | `Qwen3.5-4B/` | vision chat + tool calling |
+| `qwen_2_5_omni_3b` | `Qwen2.5-Omni-3B/` | audio → text |
+| `qwen3_tts` | `Qwen3-TTS/` | text → speech |
+| `qwen3_asr` | `Qwen3-ASR/` | speech → text |
+| `qwen3_vl_embedding` | `Qwen3-VL-Embedding-2B/` | retrieval vector |
+| `locate_anything` | `LocateAnything-3B/` | object grounding (bbox) |
+| `qwen_image_21_512` | `Qwen-Image-2.1/` | text-to-image (512×512) |
 
-preset 会在**构造时**检查文件是否齐全，缺文件抛 `FileNotFoundError` 并列出
-缺哪些 —— 不会等到推理时才炸。
+A preset checks that all files are present **at construction time** and raises
+`FileNotFoundError` listing what is missing — it will not blow up only at inference
+time.
 
 ---
 
-## 模型文件放哪
+## Where model files go
 
-默认根目录 `/userdata/models/`（可用 `WDNAI_MODELS_DIR` 改）：
+Default root `/userdata/models/` (changeable via `WDNAI_MODELS_DIR`):
 
 ```
 /userdata/models/Qwen3-VL-4B/
@@ -318,52 +337,55 @@ preset 会在**构造时**检查文件是否齐全，缺文件抛 `FileNotFoundE
 └── Qwen3-VL-4B.tokenizer.gguf        # RKNN 自带的 GGUF tokenizer
 ```
 
-命名约定与各模型的完整文件表见 [`src/wdnai/models/README.md`](src/wdnai/models/README.md)。
+Naming conventions and the complete per-model file tables are in
+[`src/wdnai/models/README.md`](src/wdnai/models/README.md).
 
-### 环境变量
+### Environment variables
 
-| 变量 | 作用 |
+| Variable | Purpose |
 |---|---|
-| `WDNAI_MODELS_DIR` | 模型根目录（默认 `/userdata/models`） |
-| `WDNAI_QWEN3_VL_4B_DIR` / `WDNAI_QWEN3_4B_DIR` / `WDNAI_QWEN3_5_4B_VL_DIR` / `WDNAI_QWEN_2_5_OMNI_3B_DIR` / `WDNAI_LOCATE_ANYTHING_DIR` | 单个模型的目录覆盖 |
-| `WDNAI_QWEN_IMAGE_21_DIR` / `QI_MODEL_DIR` | Qwen-Image-2.1 模型包目录（默认 `$WDNAI_MODELS_DIR/Qwen-Image-2.1`，板上实际在 `/home/rockchip/models/Qwen-Image-2.1`） |
-| `QI_SPREAD_IO` / `QI_SPREAD_IO_IN` | cshim 内部默认 `0` / `1`（输出 IO 绝不能分散） |
-| `WDNAI_LIBRKNN3_API` | `librknn3_api.so` 路径 |
-| `WDNAI_LIBRKNNSMI` | `librknnsmi.so` 路径 |
-| `WDNAI_TRACE_PROMPT` | 打印每次推理实际发出的 prompt（排查 prompt 污染用） |
+| `WDNAI_MODELS_DIR` | model root directory (default `/userdata/models`) |
+| `WDNAI_QWEN3_VL_4B_DIR` / `WDNAI_QWEN3_4B_DIR` / `WDNAI_QWEN3_5_4B_VL_DIR` / `WDNAI_QWEN_2_5_OMNI_3B_DIR` / `WDNAI_LOCATE_ANYTHING_DIR` | per-model directory override |
+| `WDNAI_QWEN_IMAGE_21_DIR` / `QI_MODEL_DIR` | Qwen-Image-2.1 model package directory (default `$WDNAI_MODELS_DIR/Qwen-Image-2.1`; on the board it is actually at `/home/rockchip/models/Qwen-Image-2.1`) |
+| `QI_SPREAD_IO` / `QI_SPREAD_IO_IN` | cshim internal defaults `0` / `1` (output IO must never be spread) |
+| `WDNAI_LIBRKNN3_API` | path to `librknn3_api.so` |
+| `WDNAI_LIBRKNNSMI` | path to `librknnsmi.so` |
+| `WDNAI_TRACE_PROMPT` | print the prompt actually sent on each inference (for debugging prompt contamination) |
 
 ---
 
-## 已知限制
+## Known limitations
 
-- **同一个模型句柄不可重入**：一次 `respond()` 没结束就别再发第二次；SDK 内部
-  用单 worker 线程串行化，但跨进程要靠调用方自己保证。
-- **显存是硬约束**：一张 RK1828 5 GB，装不下两个 4B VLM。模型常驻后别再在同一张
-  卡上启第二个。
-- **`Enum.__contains__` 的版本差异**：`migrate_legacy()` 已改成「按值查表」，
-  在 Python 3.9 ~ 3.12 上语义一致（3.11 的 `Enum.__contains__` 对非枚举成员
-  抛 TypeError，不能用 `value in SoftwareCapability` 判成员）。
-- **chip 级温度与设备级温度单位不同**（整度 vs 毫度），SDK 内部各自换算，
-  对外都是 °C。
+- **One model handle is not re-entrant**: do not start a second `respond()` before the
+  first one finishes; the SDK serializes them internally with a single worker
+  thread, but across processes the caller has to guarantee that.
+- **Memory is a hard constraint**: one RK1828 has 5 GB, which cannot hold two 4B
+  VLMs. Once a model stays resident, do not start a second one on the same card.
+- **Version differences in `Enum.__contains__`**: `migrate_legacy()` was changed to
+  "look up by value", with consistent semantics on Python 3.9 ~ 3.12 (3.11's
+  `Enum.__contains__` raises TypeError for non-enum members, so
+  `value in SoftwareCapability` cannot be used to test membership).
+- **Chip-level and device-level temperatures use different units** (whole degrees vs.
+  millidegrees); the SDK converts each internally, and both are exposed as °C.
 
 ---
 
-## 目录导航
+## Repository map
 
-| 路径 | 内容 |
+| Path | Contents |
 |---|---|
-| `src/wdnai/session.py` | `LLMSession` 抽象接口 + `LLMLocalSession` 进程内实现 |
-| `src/wdnai/model.py` | `ModelSpec` + `SystemLanguageModel` preset 目录 |
-| `src/wdnai/capability.py` | `swcap_*` 词表 + 迁移表 |
+| `src/wdnai/session.py` | `LLMSession` abstract interface + in-process `LLMLocalSession` implementation |
+| `src/wdnai/model.py` | `ModelSpec` + the `SystemLanguageModel` preset catalog |
+| `src/wdnai/capability.py` | the `swcap_*` vocabulary + migration table |
 | `src/wdnai/attachment.py` | `TextAttachment` / `ImageAttachment` / `AudioAttachment` |
-| `src/wdnai/_generable.py` / `_callable.py` | 结构化输出与工具调用的装饰器 |
-| `src/wdnai/_librknn.py` | librknn3 的 ctypes 绑定 |
-| `src/wdnai/_librknnsmi.py` | librknnsmi 的 ctypes 绑定 + `RknnSmi` |
-| `src/wdnai/grounding.py` | LocateAnything 的 bbox schema |
-| `examples/` | 可直接跑的示例（图片检测、视频车牌、函数调用、TTS …） |
-| `tests/` | pytest（不占硬件） |
-| [`AGENTS.md`](AGENTS.md) | 给 AI / 维护者的详细内部约定（踩坑记录都在这） |
+| `src/wdnai/_generable.py` / `_callable.py` | decorators for structured output and tool calling |
+| `src/wdnai/_librknn.py` | ctypes bindings for librknn3 |
+| `src/wdnai/_librknnsmi.py` | ctypes bindings for librknnsmi + `RknnSmi` |
+| `src/wdnai/grounding.py` | the bbox schema of LocateAnything |
+| `examples/` | runnable samples (image detection, video license plates, function calls, TTS …) |
+| `tests/` | pytest (does not occupy the hardware) |
+| [`AGENTS.md`](AGENTS.md) | detailed internal conventions for AI / maintainers (the gotcha records live there) |
 
-## 许可
+## License
 
-Apache-2.0
+Apache-2.0. See [LICENSE](LICENSE).
