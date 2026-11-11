@@ -25,6 +25,17 @@ name `wdnai`, distribution name `wdnai`.
 `origin`，裸 `git pull` / `git push` 即为对主仓库操作。拉取最新代码只走局域网
 主仓库 —— 从 GitHub 拉的是「已发布出去的历史」，会让本地与主仓库分叉。
 
+## 提交信息规范（2026-11-11）
+
+**commit message 必须用英文。**
+
+- 格式：Conventional Commits —— `type(scope): subject`，正文（若有）也用英文。
+  例：`feat(asr): add a streaming session helper`
+- 原因：本仓发布到公开的 GitHub 镜像（发布镜像 = 国际可见），提交历史是给国际读者
+  看的 —— 中文提交信息让公开历史没法读。
+- **只约束提交信息**：代码注释、docstring、仓内文档（AGENTS.md / README）仍按各仓
+  现有的写法（中文没问题）。README 是中英双语，AGENTS.md 允许中文。
+
 > **As of v0.4.x**, wdnai no longer depends on the `rknn3lite` Python
 > wheel. The vendored `wdnai/_librknn.py` is a ctypes shim that
 > mirrors the subset of `rknn3lite.api` the SDK actually exercises,
