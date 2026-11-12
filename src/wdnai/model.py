@@ -354,9 +354,28 @@ def _qwen3_5_vl_9b_spec(**overrides) -> ModelSpec:
 
     Sampling follows the 9B example (``temperature=1.0``): this export
     is used for free-form chat, not schema-constrained bbox output.
-    ``max_new_tokens`` is ``max_context_len // 8`` per the model owner's
-    recommendation (106496 // 8 = 13312), keeping generation bounded
-    while still allowing long answers.
+
+    ``max_new_tokens`` was ``max_context_len // 8`` per the model owner's
+    recommendation (106496 // 8 = 13312). **It is now 1024**, because that
+    number is a runaway generator, not a "long answer" allowance:
+
+    * the decode is ``top_k=1`` — greedy — and the vendor pipeline hardcodes
+      the sampling params (see ``backends/_qwen35_vl_9b_vendor.py``), so
+      when the model degenerates into repeating itself it never emits
+      ``special_eos_id`` and the loop only stops at ``max_new_tokens``;
+    * measured on this board: the 9B decodes at ~30 token/s, so 13312
+      tokens is **~7 minutes** of NPU time — far past the worker's 60 s
+      inference budget;
+    * a worker that blows its budget does **not** interrupt the inference
+      (the thread is a daemon, it is only abandoned), so the NPU stays
+      occupied and every later request queues behind the runaway and dies
+      with the same timeout. One degenerate generation used to wedge the
+      whole card for good.
+
+    1024 tokens is ~34 s at the measured rate — still a generous answer,
+    and comfortably inside the 60 s budget. Callers that know better pass
+    their own value per request (the text chat uses 2048, the USB-HID
+    agent 512); this is only the **fallback** for callers that do not.
     """
     base = dict(
         name="qwen3.5-9b-vl",
@@ -371,7 +390,7 @@ def _qwen3_5_vl_9b_spec(**overrides) -> ModelSpec:
         stage_count=2,
         requires_cards=2,
         options={
-            "max_new_tokens": 13312,
+            "max_new_tokens": 1024,
             "top_k": 1,
             "top_p": 0.9,
             "temperature": 0.8,
