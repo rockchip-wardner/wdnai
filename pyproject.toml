@@ -25,6 +25,18 @@ dependencies = [
     "pydantic>=1.10",
     "opencv-python>=4.5",
     "gguf>=0.6",
+    # 多卡 VLM 后端（backends/vlm_multicard.py）在**模块级**写死
+    # `from jinja2 import Environment`，用它渲染 GGUF tokenizer 自带的 Jinja2
+    # chat template（多模态对话的 prompt）。缺包时 worker 侧 LLMSession 初始化
+    # 即炸：ModuleNotFoundError: No module named 'jinja2'，算力页表现为
+    # 「qwen3.5-vl-9b 启动失败」。只影响多卡 VLM —— 单卡 VLM 走别的后端，
+    # 不 import 这条路径。
+    # 之前**没有声明**，于是两道防线同时失效：装 SDK 的 --no-deps 装不进 venv，
+    # 而依赖审计（scripts/check_sdk_deps.py）只查本文件里声明过的依赖，
+    # 看不见它 —— 报错点离原因很远。
+    # 下界取 3.1.0（与 transformers 的 chat-template extra 一致），不设上界：
+    # Jinja2 的 Environment / from_string API 自 3.1 起稳定。
+    "jinja2>=3.1.0",
 ]
 
 [project.optional-dependencies]
