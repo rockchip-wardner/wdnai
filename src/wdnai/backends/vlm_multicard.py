@@ -281,12 +281,29 @@ class MultiCardVLMBackend:
         images: Optional[List[np.ndarray]] = None,
         enable_thinking: Optional[bool] = None,
         max_new_tokens: Optional[int] = None,
+        keep_history: Optional[bool] = None,
     ) -> str:
         if enable_thinking is None:
             enable_thinking = bool(self.spec.options.get("enable_thinking", False))
         if max_new_tokens is None:
             max_new_tokens = int(self.spec.options.get("max_new_tokens", 512))
         max_new_tokens = max(1, int(max_new_tokens))
+
+        # ``keep_history=False`` → 丢掉 C 会话里**上一轮**残留的 KV cache。
+        #
+        # 这个后端的会话级 ``llm_args["keep_history"] = 1`` 是 vendor 写死的
+        # （分段 pipeline 内部需要它：decode 步要接着 prefill 往下走），
+        # 代价是**跨请求**也会累积上下文。而应用层的每个提示都是自包含的
+        # （电脑控制是「任务 + 已执行动作 + 当前截图」，文本对话是完整
+        # ChatML 记录，全都在文本里），累积下来的历史纯属有害。
+        #
+        # 不清的后果实测过（2026-11-12）：让 9B「点击任务栏最左边的 Windows
+        # 开始按钮」，它 thought 里写的却是**上一轮**「打开记事本」的目标，
+        # 坐标也照着上一轮给（误差 60 px 起，落在隔壁图标上）。清一次 KV
+        # 之后同一个提示立刻答对任务、输出也从「复读 schema 外壳」变回
+        # 正常 JSON。
+        if keep_history is False:
+            self.reset()
 
         self._stop.clear()
         self.sink.reset()
@@ -348,6 +365,7 @@ class MultiCardVLMBackend:
             prompt,
             enable_thinking=overrides.get("enable_thinking"),
             max_new_tokens=overrides.get("max_new_tokens"),
+            keep_history=overrides.get("keep_history"),
         )
 
     def run(self, prompt: str, **overrides: Any) -> str:
@@ -361,6 +379,7 @@ class MultiCardVLMBackend:
             images=list(images),
             enable_thinking=overrides.get("enable_thinking"),
             max_new_tokens=overrides.get("max_new_tokens"),
+            keep_history=overrides.get("keep_history"),
         )
 
     def available_image_sizes(self) -> List[int]:

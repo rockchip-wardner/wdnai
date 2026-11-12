@@ -385,6 +385,19 @@ name `wdnai`, distribution name `wdnai`.
     模板**。单卡后端（4B）没有这个钩子，worker 那边会走
     `apply_chat_template(rknn)` 那条老路（4B 的模式确实锁在 C 会话里，
     只 `clear_kvcache` 不够，必须 reset + 重设模板）。
+  - ⚠️ **`keep_history=False` → 每轮生成前清掉 C 会话残留的 KV cache**
+    （2026-11-12）。这个后端的会话级 `llm_args["keep_history"] = 1` 是
+    vendor 写死的（分段 pipeline 内部需要：decode 步要接着 prefill 往下
+    走），代价是**跨请求**也累积上下文。而应用层的每个提示都是自包含
+    的（任务 + 历史 + 截图全在文本里），累积纯属有害。
+    **不清的实测后果**：让 9B「点击任务栏最左边的 Windows 开始按钮」，
+    它 thought 里写的却是**上一轮**「打开记事本」的目标，坐标也照着
+    上一轮给；输出还会从正常 JSON 退化成「复读 JSON Schema 外壳」。
+    传 `keep_history=False` 之后同一个提示立刻答对任务。
+    ⚠️ 注意**不能**把这个标志直接透给 vendor 的 `session_run` —— 那样
+    会连 pipeline 内部的 prefill→decode 衔接一起断掉（每步都从空 KV
+    开始，生成全是垃圾）。所以实现是：**生成开始前清一次**，pipeline
+    内部照旧 `keep_history=True`。
 - `src/wdnai/backends/tts.py` — `TTSBackend` + vendored
   `Qwen3TTSDriver` (1893 lines, originally in
   `rknn3-toolkit-lite/examples/Qwen3-TTS/qwen3_tts_demo.py` and
