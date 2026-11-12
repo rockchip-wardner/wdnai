@@ -366,6 +366,25 @@ name `wdnai`, distribution name `wdnai`.
   `_messages_from_prompt`）：真机 A/B 显示 C 侧 `set_chat_template` 在
   分段 stage0 上单轮可用，但多轮 bare transcript 会退化成 thinking
   dump（去掉 transcript 的 system 段也不行），所以 Jinja2 这层必须保留。
+  - ⚠️ **C 侧模板必须保持为空，别给 9B 套 ChatML**（2026-11-12 实测）。
+    这个后端**自己**拼完整的 ChatML prompt
+    （`<|im_start|>user\n…<|im_end|>\n<|im_start|>assistant\n`），
+    vendor 在 init 时 `set_chat_template("", "", "")` 清空、`reset()` 又清
+    一次，就是为了让 C 运行时**原样**把 prompt 送进模型。给它套上模板
+    = 把已经完整的 prompt 再套一遍，模型看到错位的对话 —— 后果是普通
+    问答还凑合、**结构化输出直接崩**（电脑控制的 agent 要 JSON，对话里
+    套着对话时模型只吐出一个裸词 `click`，JSON 外壳整个丢了）。
+    ⇒ `_StageHandle` **故意没有** `set_chat_template`：留成 AttributeError，
+    任何还走 `apply_chat_template(rknn)` 的老路径都会**大声失败**，而不是
+    悄悄给 9B 套上模板。
+  - `MultiCardVLMBackend.set_thinking_mode(enable_thinking)`：worker 的
+    `set_thinking_mode` 控制 op 用的**后端级钩子**。9B 的模式**不是**
+    锁存在 C 会话里的 —— 它**每次调用都带**（prompt 里的 think 块
+    `<think>\n` / `<think>\n\n</think>\n\n` + `session_run` 的
+    `enable_thinking` 标志），所以这个钩子只做「清 KV cache」，**不碰
+    模板**。单卡后端（4B）没有这个钩子，worker 那边会走
+    `apply_chat_template(rknn)` 那条老路（4B 的模式确实锁在 C 会话里，
+    只 `clear_kvcache` 不够，必须 reset + 重设模板）。
 - `src/wdnai/backends/tts.py` — `TTSBackend` + vendored
   `Qwen3TTSDriver` (1893 lines, originally in
   `rknn3-toolkit-lite/examples/Qwen3-TTS/qwen3_tts_demo.py` and

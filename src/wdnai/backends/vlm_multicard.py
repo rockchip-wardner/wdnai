@@ -44,6 +44,25 @@ class _StageHandle:
         self._owner.stop()
         return 0
 
+    # ⚠️ **这里故意没有 ``set_chat_template``。**
+    #
+    # 9B 的 C 会话**必须**保持「无模板」状态：vendor 在 init 时
+    # ``set_chat_template("", "", "")`` 清空模板，后端 ``reset()`` 又清一次
+    # —— 因为这个后端**自己**拼完整的 ChatML prompt（见 ``_build_prompt``：
+    # ``<|im_start|>user\n…<|im_end|>\n<|im_start|>assistant\n``），C 运行时
+    # 只负责原样送进模型。
+    #
+    # 如果给 9B 套上 ChatML 模板，C 运行时会把**已经完整**的 prompt 再套
+    # 一遍（``<|im_start|>user\n`` + 我们那段 + ``<|im_end|>…assistant\n``），
+    # 模型看到的是一段错位的对话。实测后果：普通问答还凑合，但**结构化
+    # 输出直接崩** —— 电脑控制的 agent 要的是 JSON，对话里套着对话时模型
+    # 只吐出一个裸词（``click``），JSON 外壳整个丢了。
+    #
+    # 所以这里**故意**留成 AttributeError：任何还走
+    # ``apply_chat_template(rknn)`` 的老路径都会**大声失败**，而不是悄悄
+    # 给 9B 套上模板。9B 自己的模式切换走
+    # ``MultiCardVLMBackend.set_thinking_mode()``（每次调用带模式，不锁存）。
+
 
 
 class MultiCardVLMBackend:
@@ -361,6 +380,29 @@ class MultiCardVLMBackend:
             self.pipeline.reset()
         except Exception:  # noqa: BLE001
             pass
+
+    def set_thinking_mode(self, enable_thinking: bool) -> int:
+        """Switch the thinking mode of this backend (worker control op).
+
+        Unlike the single-card backend, the 9B's mode is **not** latched
+        in the C session — it travels with **every call**:
+
+        * the prompt carries the think block (``<think>\\n`` to open it,
+          ``<think>\\n\\n</think>\\n\\n`` to close it immediately), and
+        * ``session_run(enable_thinking=…)`` carries the flag.
+
+        So there is nothing to *switch* here.  What this hook does is
+        drop the KV cache, so a previous turn's context (and any thinking
+        state it carried) cannot leak into the next one.
+
+        ⚠️ It deliberately does **not** apply the ChatML template.  This
+        backend builds a complete ChatML prompt itself and keeps the
+        C-side template empty; applying the template would wrap that
+        prompt a second time and break structured output.  See
+        :class:`_StageHandle` for the full story.
+        """
+        self.reset()
+        return 0
 
     def stop(self) -> None:
         self._stop.set()
