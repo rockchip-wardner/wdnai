@@ -118,7 +118,34 @@ name `wdnai`, distribution name `wdnai`.
   text-out with 0–1000 normalised bbox coords; binds to
   `/userdata/models/LocateAnything/`, override via
   `WDNAI_LOCATE_ANYTHING_DIR`; raises `FileNotFoundError` listing
-  missing files; capability key `swcap_vision_grounding`).
+  missing files; capability key `swcap_vision_grounding`),
+  `hy_mt_1_5()` (HY-MT1.5-1.8B 翻译模型 — text→text, **vocab_size=120818**,
+  **special_eos_id=120020**, **max_context_len=8192**; binds to
+  `/userdata/models/HY_MT_1_5/`, override via `WDNAI_HY_MT_1_5_DIR`;
+  raises `FileNotFoundError` listing missing files; capability key
+  `swcap_translate`; **prompt 模板不是 ChatML** —— 见 `HY_MT_CHAT_TEMPLATE`),
+  `intern_decision_4b()` (Intern-Decision-4B 结构化决策模型 — state→选项+概率,
+  **vocab_size=248320**, **special_eos_id=248046**, **max_context_len=4096**,
+  **image_size=384**; binds to `/userdata/models/Intern_Decision-4B/`, override
+  via `WDNAI_INTERN_DECISION_4B_DIR`; raises `FileNotFoundError` listing missing
+  files; capability key `swcap_decision`; **不生成文本** —— 每个决策字段输出
+  62 个候选符号的 logits，见 `wdnai/decision.py` 与
+  `wdnai/backends/intern_decision.py`).
+- `src/wdnai/model.py`（续）— `ModelSpec.chat_template`：**C 侧**会话用来
+  包住每条 prompt 的三元组（`system + prefix + <prompt> + postfix`）。
+  `None` = ChatML（所有 Qwen 系预置的默认）；HY-MT 用混元控制 token
+  （`HY_MT_CHAT_TEMPLATE`）。**自己拼完整 transcript 的后端**（9B 多卡的
+  `vlm_multicard.py`）必须**不设**它，并自己
+  `set_chat_template("", "", "")` 清空 C 侧模板 —— 否则 prompt 会被套两遍。
+- `src/wdnai/decision.py` — Intern-Decision 的**决策协议**（纯 CPU，不 import
+  librknn3）：候选符号表（62 个）、固定的 system prompt、任务 JSON 解析
+  （`choice` / `score` / `noul` 三种字段类型）、prompt 构造、概率校准
+  （softmax + 按 embedding 宽度查表的温度）。跑 NPU 的部分在
+  `backends/intern_decision.py`。
+- `src/wdnai/capability.py` — `swcap_*` 封闭词表（`SoftwareCapability`）。
+  新增能力时**必须**同步：① 本仓 `README.md` / `README_CN.md` 的能力表，
+  ② `wdnwebui` 的 `scripts/verify_capability_groups.py`（它断言枚举成员
+  集合与数量），③ `wdnwebui` 仓的 `AGENTS.md`。
 - `src/wdnai/_librknnsmi.py` — ctypes shim over `/usr/lib/librknnsmi.so`
   (the C ABI behind the `rknn-smi` CLI): device list, device/chip info,
   PCIe info, **temperature**, power/voltage/current, NPU util, memory,
@@ -200,6 +227,12 @@ name `wdnai`, distribution name `wdnai`.
   — without this, the ByteLevel pre-tokenizer would split each into
   ~7 regular tokens and `rknn3` session_run would never find the
   expected IDs.
+  **混元控制 token**（HY-MT1.5）同理注册：`<｜hy_User｜>`（120006）、
+  `<｜hy_Assistant｜>`（120007）等在词表里是**单 token**，但预分词器会拆成
+  ~5 个普通 token —— 实测拆开后 `encode()` 返回
+  `[36058, 9036, 62, 4610, 24945]` 而不是 `[120006]`。
+  ⚠️ 与 Qwen 那批**不同**：混元这批**只注册已在词表里的**（`in vocab`），
+  缺失的**不能** `add_tokens` —— 那会给模型一个它从没见过的 id，比拆开更糟。
 - `src/wdnai/backends/__init__.py` — `build_backend(spec)` factory:
   `{"llm": TextBackend, "vlm": VLMBackend, "tts": TTSBackend,
   "embedding": EmbeddingBackend, "grounding": LocateAnythingBackend}`
@@ -273,6 +306,12 @@ name `wdnai`, distribution name `wdnai`.
   `user\n` / `\nassistant\n`), `build_llm_args` (merges
   `spec.options` into the `llm_args[0]` dict), `printf_perf`
   (Prefill / Generate / vision / total latency table).
+  ⚠️ `apply_chat_template(rknn_llm, template=None)` —— **第二个参数是
+  `spec.chat_template`**（`wdnai.model.ChatTemplate`）。`None` = ChatML。
+  **不要**在这里写死模板：HY-MT 的混元控制 token
+  （`HY_MT_CHAT_TEMPLATE`）走的就是这条路，C 侧把 prompt 包成
+  `system + prefix + <prompt> + postfix`。真机实测：同一份权重套 ChatML
+  → **输出为空字符串**；套混元模板 → 翻译正常。
 - `src/wdnai/_librknn.py` — **vendored ctypes shim for librknn3**.
   Public surface: `RKNN3Lite` (mirrors the slice of
   `rknn3lite.api.RKNN3Lite` wdnai uses), `RKNN3Image` /
@@ -303,6 +342,9 @@ name `wdnai`, distribution name `wdnai`.
   `enable_thinking` / `keep_history` are passed straight to
   `rknn.session_run` (the shim's session_run takes the same kwarg
   names as rknn3lite did).
+  `apply_chat_template(self.rknn, spec.chat_template)` —— 模板**按模型族**
+  走：Qwen 系 = ChatML（`spec.chat_template` 为 `None`），HY-MT = 混元控制
+  token。**同一个 `TextBackend` 同时服务两类模型**，差别只在 spec。
 - `src/wdnai/backends/vlm.py` — `VLMBackend`: one `RKNN3Lite` LLM
   handle + **N** vision handles (one per discovered native resolution
   variant). At init, `_load_vision_variants` calls
@@ -850,6 +892,121 @@ async with LLMSession(model=model, npu=0) as sess:
     # result.level     -> "Normal" | "Warning"
     sess.reset()
 ```
+
+### 结构化决策 (Intern-Decision)
+
+Intern-Decision（`swcap_decision`）**不是对话模型**：它不生成文本。对每个
+决策字段，它输出的是 **62 个候选符号**（`A-Z` + `a-z` + `0-9`）的 logits，
+由 CPU 侧换算成选项概率。三种字段类型：
+
+- `choice` —— 从若干选项里选一个（客服分流：account / payment / other）。
+- `score` —— 选项键是**数字字符串**（"0" / "1" / "2"），输出概率加权评分。
+- `noul` —— 是否判断（yes / no），输出「肯定概率」。
+
+协议层在 `src/wdnai/decision.py`（纯 CPU，不 import librknn3，可以脱离
+NPU 单测），跑 NPU 的部分在 `src/wdnai/backends/intern_decision.py`。
+
+```python
+import json
+from wdnai import LLMSession, SystemLanguageModel, parse_decision_task
+
+task = parse_decision_task(json.load(open("customer_service.json")))
+model = SystemLanguageModel.intern_decision_4b()
+async with LLMSession(model=model, npu=1) as sess:
+    text, atts = await sess.run_prompt(
+        "我无法登录账号，请帮我恢复访问。",
+        task=task,                       # 任务配置走 override
+    )
+    print(text)   # {"category": "account", "urgency": 0.7676316499710083}
+```
+
+`text` 是**合法 JSON 对象**（字段名 → 值），所以 `respond(generating=…)`
+可以直接校验它；完整概率 / 原始 logits 随一条 `TextAttachment` 回传。
+
+#### 与官方 C++ demo 逐位对拍（真机，2026-11-13）
+
+`rknn3_model_zoo/examples/Intern_Decision/cpp/main.cpp` 是这个模型的**官方
+参考实现**（吃同一份 .rknn / .weight）。把它在本板编译起来（官方 demo 只有
+x86_64 版，参考主机没有 NPU，所以是本地 aarch64 编译），用**同一个任务
+JSON + 同一句话**对拍：
+
+| 对拍项 | 文本决策 | 图文决策（bus.jpg） |
+|---|---|---|
+| prompt 字节 | 1063 = 1063 ✅ | 2861 = 2861 ✅ |
+| token id 序列 | 251 = 251 ✅ | 374 = 374 ✅ |
+| 原始 logits | **逐位一致** ✅ | **逐位一致** ✅ |
+| 校准概率 / 评分 | **逐位一致** ✅ | **逐位一致** ✅ |
+| 校准温度 | 1.9924182891845703 ✅ | 同左 ✅ |
+
+文本决策的官方 / SDK 输出**完全一样**：
+
+```
+category  account  p=0.9871750473976135   logits=[31.84375, 22.515625, 20.703125]
+urgency   "1"      p=0.6921776533126831   logits=[24.90625, 26.78125, 20.984375]
+          score=0.7676316499710083        temperature=1.9924182891845703
+```
+
+图文决策喂**官方自己解码的像素**时也逐位一致；喂 SDK 自己解码的像素
+（OpenCV/libjpeg，官方用 stb_image）时只剩 **JPEG 解码器差异**（逐像素 ±3），
+概率差 ≤0.03pp、结论完全相同。
+
+**这一节同时是踩坑清单** —— 对拍过程中一共揪出 4 个真 bug（每一个都会让
+概率偏掉，且都不会报错，只会「答案看着还行但就是不对」）：
+
+1. **prompt 里的 ChatML 标记是「写进文本」的，不是模板**。完整形态是
+   `<|im_start|>system\n…<|im_end|>\n<|im_start|>user\n…<|im_end|>\n`
+   `<|im_start|>assistant\n<think>\n\n</think>\n\n{骨架}<|im_end|>\n`。
+   少写这 6 个标记就少 **66 字节 / 6 个 token**，token 位置整体错位。
+   C 侧 chat template 必须**显式清空**（`set_chat_template("", "", "")`）——
+   官方 demo 从不调 `set_chat_template`，它默认就是空的。
+2. **预分词正则必须按 `tokenizer.ggml.pre` 选**。这个 GGUF 是 `qwen35`，
+   正则是 `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+…`；ByteLevel 自带的 **GPT-2**
+   正则会把 `e.g.` 切成 4 个 token 而不是 3 个 → token id 整体错位
+   （文本决策 248 vs 251 个 token）。`wdnai.gguf_tokenizer` 现在按 `pre`
+   分发（`qwen2` / `qwen35`），其余类型仍走 ByteLevel 默认。
+3. **noul 字段的 criteria 要「覆盖」默认说明，不是「首次出现优先」**。任务
+   JSON 里写的是「没有人 / 有人」，参考实现是 `choices["no"] = value`
+   （赋值覆盖、位置不变）；写成 setdefault 会让默认英文说明留在 prompt 里。
+4. **没有文本时要回落 state**。参考实现
+   `row["state"] = text[0] ? text : "请根据图片回答问题。"`；不回落的话
+   prompt 里写的是 `null`，模型按「没有 state」解读，图文决策概率会偏。
+
+另外四个必须记住的坑（全部真机实测过）：
+
+5. **每个字段一次 prefill，且必须换 session**。模型有 linear-attention 层，
+   递归状态跨调用残留；`keep_history=0` 只清 KV cache，不清递归状态。
+   C++ 参考实现每个字段都 `rknn3_session_init` / `destroy`，SDK 用
+   `RKNN3Lite.recreate_llm_session()` 复刻（见 `_librknn.py`）。
+6. **控制 token 必须是单 token**，而且**追加** special 时**不能覆盖**已有的
+   `additional_special_tokens` —— `tokenizer.add_special_tokens(
+   {"additional_special_tokens": known})` 是**整体替换**，会把 Qwen 的
+   `<|vision_start|>` / `<|image_pad|>` 等多模态标记踢掉 → C 库定位不到
+   图片占位区 → 图文 prompt 被**少喂 6 个 token**。现在改成在构造器里合并。
+   `<decision>`=248077、`<think>`=248068、`</think>`=248069 只在
+   Intern-Decision 的 tokenizer 实例上注册（`load_tokenizer(...,
+   extra_special_tokens=...)`）—— Qwen 路径靠解码文本里的字面量切 thinking
+   通道，注册成 special 会被 `skip_special_tokens=True` 抹掉，所以**不动**
+   全局 tokenizer。
+7. **视觉预处理是整幅拉伸 resize** 到 384×384（不是 letterbox），归一化
+   已烙进模型 —— 只送原始 RGB 字节。缩放走 **RGA 硬件**
+   （`wdnai._rga`，ctypes 直调 `librga`），与官方 `image_utils.c` 的
+   `convert_image` 完全一致：RGA 的插值和 OpenCV 的 `INTER_LINEAR` 不是
+   同一个算法（同一张图缩出来像素最大差 136）。
+8. **概率校准温度不是采样温度**。校准温度按 embedding 宽度查表
+   （`wdnai.decision.CHECKPOINT_TEMPERATURES`，4B = 1.99241824），运行时
+   从 RKNN 内嵌的 LLM_CONFIG 读 `embedding_dim` 自动选；采样参数
+   （`temperature=1` / `top_k=1` / `top_p=1`）是另一回事，因为
+   `disable_sampling=True`，logits 是直接读出来的。
+   ⚠️ 校准的**每一步都要用 float32**（参考实现是 C 的 `float`），用 double
+   算最后一位会差 1e-8；`wdnai.decision.calibrate_probabilities` 已全程
+   float32，和官方逐位一致。
+
+**单卡能同驻留 LLM + vision**（真机实测，单张 RK1828）：文本模型
+（weight 2013MB + internal 44MB + kvcache 297MB）与视觉模型
+（weight 651MB + internal 65MB）**同时驻留**，每个 NPU 节点占用
+296MB → 383MB（节点总量 ~640MB）。所以视觉模型**按需加载**（只有带图的
+请求才加载）、编码完即释放（对齐 C++ 参考实现），
+`spec.options["keep_vision_resident"] = True` 可改成常驻。
 
 ### 输出 schema 形态
 

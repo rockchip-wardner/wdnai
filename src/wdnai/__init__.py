@@ -73,13 +73,29 @@ from .capability import (
     known_values,
     migrate_legacy,
 )
+from .decision import (
+    CHECKPOINT_TEMPERATURES,
+    DECISION_MARKER,
+    DECISION_SYMBOLS,
+    DECISION_SYSTEM_PROMPT,
+    DecisionField,
+    DecisionFieldResult,
+    DecisionOption,
+    DecisionResult,
+    DecisionTask,
+    build_decision_prompt,
+    calibrate_probabilities,
+    parse_decision_task,
+    weighted_score,
+)
 from .lm_output import LMOutput
-from .model import ModelSpec, SystemLanguageModel
+from .model import ChatTemplate, ModelSpec, SystemLanguageModel
 from .prompt import LocatePrompt, Prompt, build_chatml_prompt
 from .session import LLMLocalSession, LLMSession
 from .backends.image import ImageBackend
 from .backends.locate_anything import LocateAnythingBackend
 from .backends.depth_anything import DepthAnythingBackend, DepthResult
+from .backends.intern_decision import InternDecisionBackend
 
 __all__ = [
     "BaseModel",
@@ -98,6 +114,7 @@ __all__ = [
     "RETIRED_CAPABILITIES",
     "LMOutput",
     "ModelSpec",
+    "ChatTemplate",
     "SystemLanguageModel",
     "Prompt",
     "LocatePrompt",
@@ -108,6 +125,20 @@ __all__ = [
     "DepthAnythingBackend",
     "DepthResult",
     "ImageBackend",
+    "InternDecisionBackend",
+    "DECISION_SYMBOLS",
+    "DECISION_SYSTEM_PROMPT",
+    "DECISION_MARKER",
+    "CHECKPOINT_TEMPERATURES",
+    "DecisionOption",
+    "DecisionField",
+    "DecisionTask",
+    "DecisionFieldResult",
+    "DecisionResult",
+    "parse_decision_task",
+    "build_decision_prompt",
+    "calibrate_probabilities",
+    "weighted_score",
     "RknnSmi",
     "RknnSmiCallError",
     "RknnSmiError",

@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from .._librknn import build_llm_callback as _build_llm_callback_impl
+from ..model import ChatTemplate
 
 # Set the HF mirror at import time, matching the example scripts
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com/")
@@ -267,16 +268,23 @@ def make_result_callback(sink: StreamSink):
 # --------------------------------------------------------------------------- #
 # Tokenizer / embed loading
 # --------------------------------------------------------------------------- #
-def load_tokenizer(path: str):
+def load_tokenizer(path: str, extra_special_tokens=None):
     """Load a tokenizer.
 
     - ``.gguf`` — parse the GPT-2 BPE vocabulary + merges from RKNN's
       ``*.tokenizer.gguf`` file.
     - Otherwise — load as a HuggingFace model name or directory.
+
+    ``extra_special_tokens`` — optional per-instance extra control
+    tokens to register as non-splittable specials (see
+    :func:`wdnai.gguf_tokenizer.load_tokenizer_from_gguf`). Only
+    meaningful for the GGUF path.
     """
     if path.lower().endswith(".gguf"):
         from ..gguf_tokenizer import load_tokenizer_from_gguf  # noqa: WPS433
-        return load_tokenizer_from_gguf(path)
+        return load_tokenizer_from_gguf(
+            path, extra_special_tokens=extra_special_tokens,
+        )
     from transformers import AutoTokenizer  # noqa: WPS433
     return AutoTokenizer.from_pretrained(path)
 
@@ -313,17 +321,45 @@ def raise_for_session_run(ret: int, sink: StreamSink, what: str) -> None:
 # the bundle's C-side trampoline reads each token from the C
 # ``RKLLMResult`` and writes into ``sink``.
 # --------------------------------------------------------------------------- #
-def build_llm_callback(tokenizer, embeds_data: np.ndarray, sink: StreamSink):
+def build_llm_callback(
+    tokenizer,
+    embeds_data: np.ndarray,
+    sink: Optional[StreamSink] = None,
+    *,
+    result_cb: Optional[Callable[..., int]] = None,
+    output_cb: Optional[Callable[..., int]] = None,
+    output_tensors: Optional[Any] = None,
+):
     """Build the LLM callback bundle for ``init_runtime(llm_callback=...)``.
 
     Kept as a function for source compatibility with the previous
     rknn3lite version; the new shim handles ctypes userdata
     marshalling internally.
+
+    ``result_cb`` — a custom result callback. Defaults to the
+    :class:`StreamSink` adapter built from ``sink``; the C library
+    **refuses to run without one** (``no result_callback provided!``),
+    so a backend that does not consume a token stream (the
+    Intern-Decision decision model) must pass a no-op of its own.
+
+    ``output_cb`` / ``output_tensors`` — optional **output** callback
+    wiring. A backend that reads model *tensors* instead of a token
+    stream (the Intern-Decision decision model reads its 62 candidate
+    logits) passes a bound ``output_cb(userdata, outputs, state)`` plus
+    the pre-allocated tensor array from
+    :meth:`wdnai._librknn.RKNN3Lite.create_output_tensors`.
+
+    ``sink`` may be ``None`` when the caller does not consume a token
+    stream (the decision backend does not).
     """
+    if result_cb is None and sink is not None:
+        result_cb = make_result_callback(sink)
     return _build_llm_callback_impl(
-        result_cb=make_result_callback(sink),
+        result_cb=result_cb,
         tokenizer=tokenizer,
         embeds_data=embeds_data,
+        output_cb=output_cb,
+        output_tensors=output_tensors,
     )
 
 
@@ -349,9 +385,31 @@ CHATML_SYSTEM = f"{_IM_START}{CHATML_TURN_SYSTEM}You are a helpful assistant.{_I
 CHATML_USER = f"{_IM_START}{CHATML_TURN_USER}"
 CHATML_ASSISTANT = f"{_IM_END}\n{_IM_START}{CHATML_TURN_ASSISTANT}"
 
+#: The ChatML triple as a :class:`~wdnai.model.ChatTemplate`. This is the
+#: **default** for every backend that does not override it.
+CHATML_TEMPLATE = ChatTemplate(
+    system=CHATML_SYSTEM, prefix=CHATML_USER, postfix=CHATML_ASSISTANT,
+)
 
-def apply_chat_template(rknn_llm) -> None:
-    ret = rknn_llm.set_chat_template(CHATML_SYSTEM, CHATML_USER, CHATML_ASSISTANT)
+
+def apply_chat_template(rknn_llm, template: Optional[ChatTemplate] = None) -> None:
+    """Install the C-side chat template on ``rknn_llm``.
+
+    ``template`` is a :class:`~wdnai.model.ChatTemplate`; ``None`` selects
+    the ChatML default (every Qwen-family preset relies on it).
+
+    The C side composes ``system + prefix + <prompt> + postfix``, so a
+    model family with its own control tokens (HY-MT's Hunyuan markers)
+    only has to supply a different triple here — the **content** of the
+    prompt is never touched by this function.
+
+    A backend that assembles the whole transcript itself (the 9B
+    multi-card pipeline) must **not** call this: it clears the C-side
+    template instead (``set_chat_template("", "", "")``) so the prompt is
+    not wrapped twice.
+    """
+    tpl = template if template is not None else CHATML_TEMPLATE
+    ret = rknn_llm.set_chat_template(tpl.system, tpl.prefix, tpl.postfix)
     if ret != 0:
         raise RuntimeError(f"set_chat_template failed: ret={ret}")
 

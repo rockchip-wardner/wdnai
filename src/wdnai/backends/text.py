@@ -63,7 +63,10 @@ class TextBackend:
             device_id=resolved_device_id,
         ) != 0:
             raise RuntimeError("init_runtime failed")
-        apply_chat_template(self.rknn)
+        # The template is **per model family**: ChatML for the Qwen
+        # presets, the Hunyuan control tokens for HY-MT. ``None`` (the
+        # spec default) means ChatML — see ``wdnai.model.ChatTemplate``.
+        apply_chat_template(self.rknn, spec.chat_template)
 
     # ------------------------------------------------------------------ #
     def run(self, prompt: str, **overrides: Any) -> str:

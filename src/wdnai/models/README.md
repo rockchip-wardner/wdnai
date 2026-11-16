@@ -49,6 +49,21 @@ No network access is performed at any point; place the model files manually.
 │   ├── codec_embed.fp16.bin            # codec token 嵌入 (15 × 2048 × 2048 fp16, 120 MB)；code_predictor 查表用
 │   └── tokenizer.json                  # HuggingFace BPE tokenizer (11 MB)
 │
+├── HY_MT_1_5/                         # 混元 HY-MT1.5-1.8B 翻译模型（文本 → 文本）
+│   ├── HY-MT1.5-1.8B.1820.rknn         # LLM RKNN (23 MB)
+│   ├── HY-MT1.5-1.8B.weight            # LLM weights (1.1 GB)
+│   ├── HY-MT1.5-1.8B.embed.bin         # Token embedding table (472 MB, vocab 120818 × 2048-dim float16)
+│   ├── HY-MT1.5-1.8B.tokenizer.gguf    # GGUF tokenizer (4.8 MB; hunyuan-dense BPE)
+│   └── HY-MT1.5-1.8B.config.pkl        # 转换工具的回执（chat template + HF config）—— 运行期不读
+│
+├── Intern_Decision-4B/                # Intern-Decision-4B 结构化决策模型（状态 → 选项 + 概率）
+│   ├── Intern-Decision-4B-llm.rknn   # 文本 RKNN (25 MB)；输出是 62 个候选符号的 logits
+│   ├── Intern-Decision-4B-llm.weight # 文本权重 (2.1 GB)
+│   ├── Intern-Decision-4B-llm.embed.bin # Token embedding table (1.27 GB, vocab 248320 × 2560-dim float16)
+│   ├── Intern-Decision-4B-llm.tokenizer.gguf # GGUF tokenizer (11 MB; qwen3.5 BPE)
+│   ├── Intern-Decision-4B-vision.rknn # 视觉 RKNN (4.8 MB)；输入 uint8 NHWC 384×384
+│   └── Intern-Decision-4B-vision.weight # 视觉权重 (682 MB)
+│
 └── ... future model variants go here ...
 ```
 
@@ -188,3 +203,154 @@ fall through to the legacy single-file path automatically when no
 at 576×576 (matching the model's native input) and each video chunk
 contributes `FRAME_TOKENS` vision tokens (see
 `wdnai/backends/embedding.py`).
+
+### HY-MT1.5-1.8B (machine translation)
+
+A Hunyuan-Dense translation model — **text in, text out**, but *not* a
+general chat model: it is a translation specialist. The
+`SystemLanguageModel.hy_mt_1_5()` preset points to
+`$WDNAI_MODELS_DIR/HY_MT_1_5/` (default
+`/userdata/models/HY_MT_1_5/` when `WDNAI_MODELS_DIR` is unset; pin a
+custom path with `WDNAI_HY_MT_1_5_DIR`) and raises `FileNotFoundError`
+listing the missing files if the directory is incomplete.
+
+| File (`<root>/HY_MT_1_5/…`)      | Purpose                                            |
+| -------------------------------- | -------------------------------------------------- |
+| `HY-MT1.5-1.8B.1820.rknn`        | LLM RKNN (23 MB)                                   |
+| `HY-MT1.5-1.8B.weight`           | LLM weights (1.1 GB)                               |
+| `HY-MT1.5-1.8B.embed.bin`        | Token embedding table (120818 × 2048 fp16, 472 MB) |
+| `HY-MT1.5-1.8B.tokenizer.gguf`   | hunyuan-dense BPE tokenizer (4.8 MB)               |
+| `HY-MT1.5-1.8B.config.pkl`       | Conversion receipt — **not read at runtime**        |
+
+`vocab_size` is **120818** and `special_eos_id` is **120020**
+(`<｜hy_place▁holder▁no▁2｜>`), both read from the package rather than
+guessed. `max_context_len` is **8192** — the value baked into the
+export (the RKNN's embedded `hf_config_json` says
+`max_position_embeddings=8192`); the upstream checkpoint's 262144 is a
+training limit the export did not keep.
+
+**The prompt template is not ChatML.** HY-MT speaks the Hunyuan
+dialect — `<｜hy_begin▁of▁sentence｜>` / `<｜hy_User｜>` /
+`<｜hy_Assistant｜>` — so the preset carries its own
+`spec.chat_template` (`wdnai.model.HY_MT_CHAT_TEMPLATE`) and the
+backend installs that triple on the C session instead of the ChatML
+one. Measured on the board: with the ChatML template the model returns
+an **empty string**; with the Hunyuan template it translates normally.
+
+Two more measured facts worth keeping:
+
+* **The prompt must carry the translation instruction.** A bare source
+  sentence is answered as a chat turn ("The weather is very nice
+  today." → "Yes, that's true. It seems like we are in a pleasant
+  weather today."). Prefixing it with e.g. "Translate the following
+  text from English to Chinese:" produces the translation. The model is
+  insensitive to the exact wording.
+* **The three control tokens are single vocabulary entries** (120000 /
+  120006 / 120007), but the ByteLevel pre-tokenizer splits them into
+  ~5 regular tokens each. `wdnai.gguf_tokenizer` registers them as
+  `additional_special_tokens` (same trick as the Qwen multimodal
+  placeholders) so they survive decoding.
+
+Sampling is greedy (`top_k=1`, `temperature=1e-6`): a translation must
+stay faithful to the source.
+
+### Intern-Decision-4B (structured decision)
+
+Intern-Decision is **not** a chat model: it does not generate text.
+For every decision field it emits the logits of 62 candidate symbols
+(`A-Z` + `a-z` + `0-9`), which the CPU side turns into option
+probabilities (softmax + a checkpoint-specific temperature
+calibration). Three field types are supported — `choice` (pick one),
+`score` (the option keys are numbers; the output is the
+probability-weighted score) and `noul` (yes/no plus the affirmative
+probability).
+
+`SystemLanguageModel.intern_decision_4b()` points to
+`$WDNAI_MODELS_DIR/Intern_Decision-4B/` (default
+`/userdata/models/Intern_Decision-4B/` when `WDNAI_MODELS_DIR` is
+unset; pin a custom path with `WDNAI_INTERN_DECISION_4B_DIR`) and
+raises `FileNotFoundError` listing the missing files if the directory
+is incomplete.
+
+| File (`<root>/Intern_Decision-4B/…`)   | Purpose                                              |
+| -------------------------------------- | ---------------------------------------------------- |
+| `Intern-Decision-4B-llm.rknn`          | text RKNN (25 MB) — output: 62 candidate logits      |
+| `Intern-Decision-4B-llm.weight`        | text weights (2.1 GB)                                |
+| `Intern-Decision-4B-llm.embed.bin`     | token embedding table (248320 × 2560 fp16, 1.27 GB)  |
+| `Intern-Decision-4B-llm.tokenizer.gguf`| GGUF tokenizer (11 MB; qwen3.5 BPE)                  |
+| `Intern-Decision-4B-vision.rknn`       | vision RKNN (4.8 MB) — input: uint8 NHWC 384×384     |
+| `Intern-Decision-4B-vision.weight`     | vision weights (682 MB)                              |
+
+`vocab_size` is **248320**, `special_eos_id` is **248046**
+(`<|im_end|>`), `max_context_len` is **4096** (the value baked into
+the export). The **calibration** temperature is a different thing from
+the sampling temperature: it is looked up from the model's embedding
+width at runtime (`wdnai.decision.CHECKPOINT_TEMPERATURES` — 4B is
+`1.99241824`).
+
+Eight things that are easy to get wrong, all measured on the board — and
+all of them change the reported probabilities **without raising an error**:
+
+* **The ChatML markers live in the prompt text, not in a template.** The
+  full shape is `<|im_start|>system\n…<|im_end|>\n<|im_start|>user\n…`
+  `<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n{skeleton}`
+  `<|im_end|>\n`; dropping those six markers costs 66 bytes / 6 tokens and
+  shifts every token position. The backend therefore clears the C-side chat
+  template explicitly (`set_chat_template("", "", "")`) — the official demo
+  never calls `set_chat_template`, so its template is empty.
+* **The pre-tokenizer regex follows `tokenizer.ggml.pre`.** This GGUF is
+  `qwen35`, whose regex is `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+…`; ByteLevel's
+  built-in GPT-2 regex cuts `e.g.` into four tokens instead of three, so
+  every token id after it shifts (248 vs 251 tokens for the text task).
+  `wdnai.gguf_tokenizer` now dispatches on `pre` (`qwen2` / `qwen35`).
+* **A `noul` field's criteria *overwrite* the default descriptions.** The
+  task JSON says 「没有人 / 有人」; the reference does
+  `choices["no"] = value` (assign, position preserved) — a setdefault keeps
+  the English placeholder in the prompt instead.
+* **Without text the state falls back** to 「请根据图片回答问题。」 (the
+  reference does `row["state"] = text[0] ? text : …`). Otherwise the prompt
+  says `null` and the image decision drifts.
+* **One prefill per field, each on a *fresh* session.** The model has
+  linear-attention layers whose recurrent state survives inside a
+  session; `keep_history=0` clears the KV cache but *not* that state.
+  The C++ reference creates and destroys a session per field — the
+  SDK mirrors that with `RKNN3Lite.recreate_llm_session()`.
+* **The control tokens must be single tokens.** `<decision>` is
+  248077, `<think>` is 248068, `</think>` is 248069. The ByteLevel
+  pre-tokenizer splits them, so they are registered as specials **on
+  this model's tokenizer instance only** — the Qwen path needs the
+  literal `<think>` text back in its decoded output, so the global
+  tokenizer is left alone. When adding them, **merge** with the existing
+  `additional_special_tokens`: `add_special_tokens({"additional_special_tokens": …})`
+  *replaces* the list, which would drop Qwen's `<|vision_start|>` /
+  `<|image_pad|>` markers and leave the C library unable to locate the
+  image placeholder region (the multimodal prompt then loses 6 tokens).
+* **Vision preprocessing is a plain stretch-resize** to 384×384 (not
+  letterbox); the normalisation is baked into the model, so only raw
+  RGB bytes are fed in. The resize runs on the **RGA** (`wdnai._rga`,
+  ctypes → `librga`) exactly like the reference's `convert_image`: RGA's
+  interpolation is not OpenCV's `INTER_LINEAR` (up to 136 per pixel).
+* **The probability calibration is float32 all the way down** (the
+  reference uses C `float`); computing it in double shifts the last
+  digit by ~1e-8. `wdnai.decision.calibrate_probabilities` is float32
+  and matches the official numbers bit for bit.
+
+**Parity with the official C++ demo.** `rknn3_model_zoo`'s
+`examples/Intern_Decision/cpp/main.cpp` was compiled on the board (the
+upstream demo is x86_64-only) and run against the same task JSON and the
+same sentence. Prompt bytes (1063 / 2861), token id sequences (251 / 374),
+raw logits, calibrated probabilities, the score and the calibration
+temperature all match **bit for bit** — for the text task and for the
+image task alike (the image task matches exactly when the official's own
+decoded pixels are used; feeding the SDK's own OpenCV/libjpeg decode
+leaves a ≤0.03pp JPEG-decoder difference and the same decisions).
+  RGB bytes are fed in.
+
+**One card holds both models.** Measured on a single RK1828: the text
+model (2013 MB weights + 44 MB internal + 297 MB KV cache) and the
+vision encoder (651 MB weights + 65 MB internal) are resident
+*simultaneously*, using 383 MB of each ~640 MB NPU node. The vision
+encoder is therefore loaded lazily (only for requests that carry an
+image) and released again once the images are encoded — which is what
+the C++ reference does. `spec.options["keep_vision_resident"] = True`
+keeps it resident instead.

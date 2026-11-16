@@ -179,13 +179,22 @@ class LLMSession(ABC):
           The **output** side is unaffected: ``generating=`` still carries the
           raw text back to the caller, which parses the ``<box>`` spans
           (``_parse_locate_output``).
+        * **decision** backends (Intern-Decision) build their whole prompt
+          on the CPU from a **task schema** (the decision fields + their
+          options). The caller's prompt is only the *state* — and the
+          JSON-schema hint would be pasted into that state, i.e. into the
+          ``## State`` block of the model's prompt. The model would then
+          be asked to decide about the schema description instead of
+          about the user's situation. The output side is unaffected: the
+          backend answers with its own JSON object, which ``generating=``
+          can validate.
 
         Resolved from the session's ``ModelSpec`` — which both implementations
         hold — rather than from the backend, so the decision is made
         identically on both sides of the wire.
         """
         kind = self._model_kind()
-        return kind in ("tts", "grounding", "image")
+        return kind in ("tts", "grounding", "image", "decision")
 
     def _model_kind(self) -> Optional[str]:
         """Best-effort model family: ``"tts"`` / ``"grounding"`` / ``"vlm"`` …

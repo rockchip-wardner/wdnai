@@ -1541,7 +1541,9 @@ class _LLMSession:
         if has_multimodal:
             for x in inputs:
                 if isinstance(x, (RKNN3Image, RKNN3Audio)):
-                    packed.append(self._pack_multimodal(x, prompt, enable_thinking))
+                    packed.append(self._pack_multimodal(
+                        x, prompt, enable_thinking, tokens=tokens,
+                    ))
         # Auxiliary inputs (deepstack, etc.) — kept in order
         # AFTER the multimodal. 严格按 vlm.py 构造顺序保留 aux 索引
         # （vlm.py 给每个 aux 设 ``aux.index = 2 + i``，与模型
@@ -1685,7 +1687,13 @@ class _LLMSession:
         t.enable_thinking = c_bool(bool(enable_thinking))
         return li
 
-    def _pack_multimodal(self, mm: Any, prompt: Optional[str], enable_thinking: bool) -> _LLMInput:
+    def _pack_multimodal(
+        self,
+        mm: Any,
+        prompt: Optional[str],
+        enable_thinking: bool,
+        tokens: Optional[Any] = None,
+    ) -> _LLMInput:
         li = _LLMInput()
         li.role = None
         li.input_type = c_int(int(_LLMInputType.MULTIMODAL))
@@ -1707,8 +1715,24 @@ class _LLMSession:
             mm_t.prompt = prompt_cp
         else:
             mm_t.prompt = None
-        mm_t.tokens = None
-        mm_t.n_tokens = c_uint64(0)
+        # Pre-tokenised input (``tokens=``) alongside an image. The C
+        # reference for Intern-Decision does exactly this: it tokenises
+        # the whole prompt on the host (so it can locate the per-field
+        # ``<decision>`` marker) and hands the *token ids* plus the
+        # image embedding to the session. The image placeholders are
+        # already part of that token stream, so the C library can splice
+        # the vision features into the right slot.
+        if tokens is not None:
+            if isinstance(tokens, np.ndarray):
+                arr = np.ascontiguousarray(tokens.astype(np.int32))
+            else:
+                arr = np.asarray(list(tokens), dtype=np.int32)
+            self._input_pin_refs.append(arr)
+            mm_t.tokens = ctypes_cast(arr.ctypes.data, POINTER(c_int32))
+            mm_t.n_tokens = c_uint64(arr.size)
+        else:
+            mm_t.tokens = None
+            mm_t.n_tokens = c_uint64(0)
         mm_t.enable_thinking = c_bool(bool(enable_thinking))
         if isinstance(mm, RKNN3Image):
             mm_t.image = mm
@@ -2113,6 +2137,52 @@ class RKNN3Lite:
             return 0
         except Exception:  # noqa: BLE001
             return -1
+
+    # ------------------------------------------------------------------ #
+    def recreate_llm_session(self) -> int:
+        """Destroy the current LLM session and create a **fresh** one.
+
+        Same params, same callback bundle — but a brand-new session
+        handle, so every piece of per-session state the runtime keeps
+        (KV cache, **linear-attention recurrent state**, convolution
+        state) starts from zero.
+
+        Why this exists: the Intern-Decision reference implementation
+        (``rknn3_model_zoo/examples/Intern_Decision/cpp/main.cpp``,
+        ``intern_decision_run_field``) runs **one prefill per decision
+        field** and deliberately creates a *new session* for each field
+        — the comment there says it plainly: "Use a fresh session per
+        field to isolate KV, linear-attention and conv state."
+
+        ``keep_history=0`` is **not** enough for that: it clears the KV
+        cache but the linear-attention (gated delta-net style) layers
+        carry their recurrent state across calls inside the same
+        session, which would let field #2 see field #1's state and skew
+        the logits.
+
+        Returns 0 on success, -1 when there is no LLM runtime / no
+        session params yet.
+        """
+        rt = self.rknn_runtime
+        if not isinstance(rt, _LLMRuntime):
+            return -1
+        if rt.session is not None:
+            try:
+                rt.session.destroy()
+            except Exception:  # noqa: BLE001 — best effort
+                pass
+            rt.session = None
+        if self._llm_args is None or self._llm_callback is None:
+            return -1
+        try:
+            rt.session = _LLMSession(
+                rt, session=0, params=self._llm_args,
+                callback=self._llm_callback,
+            )
+        except Exception:  # noqa: BLE001
+            rt.session = None
+            return -1
+        return 0
 
     # ------------------------------------------------------------------ #
     def inference(

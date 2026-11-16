@@ -231,6 +231,8 @@ manifest validation and runtime session lookup use them.
 | `swcap_audio_chat` | audio → text |
 | `swcap_text_to_speech` | text → speech |
 | `swcap_text_to_image` | text → image (Qwen-Image-2.1, 512×512) |
+| `swcap_translate` | text → text (machine translation, HY-MT1.5) |
+| `swcap_decision` | state (text / text+image) → structured decisions (choice / yes-no / score, Intern-Decision-4B) |
 | `swcap_tool_call` | function / tool calling |
 
 ```python

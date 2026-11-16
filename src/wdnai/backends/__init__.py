@@ -20,6 +20,9 @@ _REGISTRY: Dict[str, Type] = {
     "embedding": EmbeddingBackend,
     "grounding": LocateAnythingBackend,
     "depth": DepthAnythingBackend,
+    # 决策模型（Intern-Decision）。``backends/intern_decision.py`` import
+    # librknn3 —— 与 asr / omni 一样在 factory 里按需 import，避免在
+    # 非 RK 机器上 import wdnai 就 segfault。
     # 文生图（Qwen-Image-2.1）。``backends/image.py`` 不 import librknn3 ——
     # 它驱动 C++ 运行时子进程，因此在非 RK 机器上 import 也是安全的。
     "image": ImageBackend,
@@ -53,6 +56,11 @@ def build_backend(
     if spec.kind == "omni":
         from .omni import OmniBackend  # type: ignore  # noqa: WPS433
         return OmniBackend(spec, npu=npu, device_id=device_id)
+    if spec.kind == "decision":
+        from .intern_decision import (  # type: ignore  # noqa: WPS433
+            InternDecisionBackend,
+        )
+        return InternDecisionBackend(spec, npu=npu, device_id=device_id)
     if spec.kind == "vlm_multicard":
         from .vlm_multicard import (  # type: ignore  # noqa: WPS433
             MultiCardVLMBackend,

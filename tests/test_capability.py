@@ -27,6 +27,13 @@ from wdnai import (
 #: 输出靠它可读，所以单独按序断言，不只比对集合）。
 EXPECTED = (
     "swcap_text_chat",
+    # HY-MT1.5 translation model: sits right after TEXT_CHAT because the
+    # enum declares it there (the order is asserted verbatim below).
+    "swcap_translate",
+    # Intern-Decision structured-decision model: sits right after
+    # TRANSLATE — both are "specialised text task" capabilities that a
+    # general chat model cannot stand in for.
+    "swcap_decision",
     "swcap_vision_chat",
     "swcap_vision_grounding",
     "swcap_audio_chat",

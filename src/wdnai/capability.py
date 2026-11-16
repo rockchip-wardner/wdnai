@@ -54,6 +54,22 @@ class SoftwareCapability(str, Enum):
 
     #: 文本 → 文本。多轮上下文 + 流式逐字输出。
     TEXT_CHAT = "swcap_text_chat"
+    #: 文本 → 文本（**机器翻译**：输入待译原文，输出译文）。
+    #: 与 ``TEXT_CHAT`` 分开是必要的：翻译是「一段文本进、一段文本出」的
+    #: **定向**任务，调用方要按能力指名要翻译模型；共用一个能力名会让
+    #: ``get_session("swcap_text_chat")`` 在同时装了通用对话模型的机器上
+    #: 取决于卡号排列 —— 而通用对话模型**不一定**会翻译。
+    #: 实现方：HY-MT1.5（Hunyuan-Dense 翻译模型，专用 prompt 模板）。
+    TRANSLATE = "swcap_translate"
+    #: 状态（文本 + 可选图片）→ **结构化决策**（分类 / 是非 / 评分）。
+    #: 与 ``TEXT_CHAT`` 分开是必要的：决策模型**不生成文本**，它对每个
+    #: 决策字段输出的是「候选符号的 logits」——调用方要的是选项 + 概率，
+    #: 不是一段话。共用一个能力名会让 ``get_session("swcap_text_chat")``
+    #: 在同时装了通用对话模型的机器上取决于卡号排列，而通用对话模型
+    #: **做不了**结构化决策（它只会编一段像 JSON 的散文）。
+    #: 实现方：Intern-Decision（Intern-Decision-4B，专用 prompt 模板
+    #: + 逐字段 prefill）。
+    DECISION = "swcap_decision"
     #: 图像 → 文本。通用 VLM 描述 / 目标检测描述（schema 属调用方）。
     VISION_CHAT = "swcap_vision_chat"
     #: 图像 → 0–1000 归一化 bbox + 文本。需专用定位 encoder

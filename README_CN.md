@@ -216,6 +216,8 @@ cd src/wdnai/_cshim && make          # 或 bash tools/build_cshim.sh
 | `swcap_audio_chat` | 音频 → 文本 |
 | `swcap_text_to_speech` | 文本 → 语音 |
 | `swcap_text_to_image` | 文本 → 图像（Qwen-Image-2.1，512×512） |
+| `swcap_translate` | 文本 → 文本（机器翻译，HY-MT1.5） |
+| `swcap_decision` | 状态（文本 / 图文）→ 结构化决策（分类 / 是非 / 评分，Intern-Decision-4B） |
 | `swcap_tool_call` | 函数 / 工具调用 |
 
 ```python

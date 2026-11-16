@@ -30,13 +30,39 @@ from typing import Any, Dict, Optional
 # --------------------------------------------------------------------------- #
 # Base spec
 # --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ChatTemplate:
+    """The template the **C session** wraps every prompt with.
+
+    The C side composes the final token sequence as::
+
+        system + prefix + <prompt text> + postfix
+
+    ChatML (the default for the Qwen family) is::
+
+        <|im_start|>system\\nYou are a helpful assistant.<|im_end|>\\n
+        + <|im_start|>user\\n + <prompt> + <|im_end|>\\n<|im_start|>assistant\\n
+
+    A model family with its **own** control tokens supplies a different
+    triple — see :data:`HY_MT_CHAT_TEMPLATE` for the Hunyuan-Dense one.
+
+    Frozen: a template is a constant of the model family, not something a
+    caller mutates per call. (The *session* is mutable — that is what
+    ``set_thinking_mode`` flips — but the template itself is not.)
+    """
+
+    system: str
+    prefix: str
+    postfix: str
+
+
 @dataclass
 class ModelSpec:
     """All static configuration + dynamic paths needed for a single model."""
 
     name: str
-    kind: str                                # "llm" | "vlm" | "tts" | "omni" | "asr" | "embedding" | "grounding" | "image"
-    variant: str                             # "qwen2.5" | "qwen3" | "qwen2.5-vl" | "qwen3-vl" | "qwen2.5-omni" | "qwen3-tts" | "qwen3-asr" | "qwen3-vl-embedding" | "qwen-image-2.1"
+    kind: str                                # "llm" | "vlm" | "tts" | "omni" | "asr" | "embedding" | "grounding" | "image" | "decision"
+    variant: str                             # "qwen2.5" | "qwen3" | "qwen2.5-vl" | "qwen3-vl" | "qwen2.5-omni" | "qwen3-tts" | "qwen3-asr" | "qwen3-vl-embedding" | "qwen-image-2.1" | "intern-decision"
 
     # ---- LLM / VLM / TTS / Omni / ASR resources ----
     # kind=llm uses rknn_path / weight_path; kind=vlm uses rknn_llm_path / rknn_vision_path;
@@ -94,6 +120,21 @@ class ModelSpec:
 
     # ---- Sampling parameters: merged into llm_args[0] passed to rknn.init_runtime ----
     options: Dict[str, Any] = field(default_factory=dict)
+
+    # ---- Chat template (C side) -----------------------------------------
+    #: The template the **C session** wraps every prompt with. ``None``
+    #: means ChatML — the default every Qwen-family preset relies on.
+    #:
+    #: The C side composes ``system + prefix + <prompt> + postfix``, so a
+    #: non-ChatML model family (HY-MT uses the Hunyuan ``<｜hy_User｜>``
+    #: control tokens) only needs its own triple here — the *content* of
+    #: the prompt is untouched.
+    #:
+    #: Models that build the **whole** transcript themselves (the 9B
+    #: multi-card backend) leave this ``None`` **and** clear the C-side
+    #: template themselves (``set_chat_template("", "", "")``) — see
+    #: ``wdnai/backends/vlm_multicard.py``.
+    chat_template: Optional["ChatTemplate"] = None
 
     # ------------------------------------------------------------------ #
     def with_paths(self, **paths: str) -> "ModelSpec":
@@ -158,6 +199,77 @@ def _qwen3_4b_spec(**overrides) -> ModelSpec:
     base = dict(name="qwen3-4b", max_context_len=4096)
     base.update(overrides)
     return _qwen3_spec(**base)
+
+
+# --------------------------------------------------------------------------- #
+# HY-MT1.5 (Hunyuan-Dense translation model)
+# --------------------------------------------------------------------------- #
+#: The Hunyuan control-token triple, i.e. the three slots the C session
+#: wraps a prompt with. **Not** ChatML — HY-MT speaks the Hunyuan dialect:
+#:
+#:     <｜hy_begin▁of▁sentence｜>            ← BOS (the "system" slot)
+#:     <｜hy_User｜>{待译原文}<｜hy_Assistant｜> ← user turn + generation prompt
+#:
+#: The three markers are **real vocabulary entries** (ids 120000 / 120006 /
+#: 120007) — if they get byte-level split into ~7 regular tokens the model
+#: never sees the boundaries and the output degrades into a continuation of
+#: the source text instead of a translation.
+#:
+#: The triple mirrors the model's own jinja template (shipped inside the
+#: RKNN *and* in the package's ``.config.pkl``) one-to-one:
+#:
+#:     {% if messages[0]['role'] == 'system' %}
+#:       <｜hy_begin▁of▁sentence｜>{{ system }}<｜hy_place▁holder▁no▁3｜>
+#:     {% else %}
+#:       <｜hy_begin▁of▁sentence｜>
+#:     {% endif %}
+#:
+#: → the BOS is the **system** slot (it precedes any system text), the user
+#: marker is the **prefix**, the assistant marker is the **postfix**.
+HY_MT_CHAT_TEMPLATE = ChatTemplate(
+    system="<｜hy_begin▁of▁sentence｜>",
+    prefix="<｜hy_User｜>",
+    postfix="<｜hy_Assistant｜>",
+)
+
+
+def _hy_mt_1_5_spec(**overrides) -> ModelSpec:
+    """HY-MT1.5-1.8B: Hunyuan-Dense machine-translation model (text → text).
+
+    Sampling is **greedy** (``top_k=1`` + ``temperature=1e-6``): a
+    translation model must reproduce the source faithfully, and any
+    sampling noise shows up as dropped or duplicated clauses in the
+    译文. This is the same reasoning as ``_locate_anything_spec``
+    (structured output degrades above ~1e-6).
+
+    ``max_context_len=8192`` is the value baked into the export (the
+    RKNN's embedded ``hf_config_json`` says
+    ``max_position_embeddings=8192``) — the upstream checkpoint's
+    262144 is a *training* limit the export did not keep.
+
+    The chat template is the Hunyuan one, **not** ChatML — see
+    :data:`HY_MT_CHAT_TEMPLATE`.
+    """
+    base = dict(
+        name="HY-MT1.5-1.8B",
+        kind="llm",
+        variant="hy-mt",
+        vocab_size=120818,
+        special_eos_id=120020,
+        max_context_len=8192,
+        target="rk1820",
+        core_mask=0xFF,
+        chat_template=HY_MT_CHAT_TEMPLATE,
+        options={
+            "max_new_tokens": 512,
+            "top_k": 1,
+            "top_p": 0.9,
+            "temperature": 1e-6,
+            "repeat_penalty": 1.0,
+        },
+    )
+    base.update(overrides)
+    return ModelSpec(**base)
 
 
 def _qwen2_5vl_spec(**overrides) -> ModelSpec:
@@ -920,6 +1032,211 @@ def _verify_locate_anything_files() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# HY-MT1.5-1.8B: Hunyuan-Dense machine translation (text → text).
+#
+# File layout — **one** RKNN + its weights + the tokenizer / embed pair,
+# i.e. the same shape as the plain-text LLM presets::
+#
+#     HY-MT1.5-1.8B.1820.rknn
+#     HY-MT1.5-1.8B.weight
+#     HY-MT1.5-1.8B.embed.bin
+#     HY-MT1.5-1.8B.tokenizer.gguf
+#
+# ``HY-MT1.5-1.8B.config.pkl`` ships alongside them but is **not** read at
+# runtime: it is the conversion tool's receipt (chat template + HF config
+# + vocab size). The SDK takes the same numbers from the RKNN's own
+# embedded metadata and from the GGUF tokenizer, so the SDK never has to
+# unpickle a third-party file (pickle = arbitrary code execution).
+#
+# The ``.1820`` chip suffix differs from the ``.1828`` of the other
+# packages on this board, but it is **only a file name**: the runtime
+# target is carried by ``ModelSpec.target`` (``"rk1820"``, the default for
+# every RKNN3 preset in this SDK).
+# --------------------------------------------------------------------------- #
+_HY_MT_1_5_REQUIRED = (
+    "HY-MT1.5-1.8B.1820.rknn",
+    "HY-MT1.5-1.8B.weight",
+    "HY-MT1.5-1.8B.embed.bin",
+    "HY-MT1.5-1.8B.tokenizer.gguf",
+)
+
+
+def _hy_mt_1_5_dir() -> Path:
+    """Resolve the HY-MT1.5 model directory.
+
+    Override via the ``WDNAI_HY_MT_1_5_DIR`` env var (full path); fallback
+    ``$WDNAI_MODELS_DIR/HY_MT_1_5`` (which itself defaults to
+    ``/userdata/models/HY_MT_1_5`` when ``WDNAI_MODELS_DIR`` is unset).
+    Mirrors ``_locate_anything_dir`` so every model dir honors the same
+    ``WDNAI_MODELS_DIR`` root.
+    """
+    override = _os.environ.get("WDNAI_HY_MT_1_5_DIR")
+    return Path(override) if override else _models_root() / "HY_MT_1_5"
+
+
+def _default_hy_mt_1_5_paths() -> dict:
+    """Return absolute paths to the HY-MT1.5 files under the resolved directory."""
+    d = _hy_mt_1_5_dir()
+    return {
+        "rknn_path": str(d / "HY-MT1.5-1.8B.1820.rknn"),
+        "weight_path": str(d / "HY-MT1.5-1.8B.weight"),
+        "tokenizer_path": str(d / "HY-MT1.5-1.8B.tokenizer.gguf"),
+        "embed_path": str(d / "HY-MT1.5-1.8B.embed.bin"),
+    }
+
+
+def _verify_hy_mt_1_5_files() -> None:
+    """Raise :class:`FileNotFoundError` listing any missing HY-MT1.5 files.
+
+    Required files (must be present): see ``_HY_MT_1_5_REQUIRED``.
+    Path resolution is wrapped in ``try/except OSError`` so a malformed
+    ``WDNAI_HY_MT_1_5_DIR`` surfaces as a single descriptive
+    :class:`FileNotFoundError` rather than an obscure ``OSError`` from
+    ``pathlib``.
+    """
+    try:
+        d = _hy_mt_1_5_dir()
+    except OSError as e:
+        raise FileNotFoundError(
+            f"HY-MT1.5 directory resolution failed: {e}"
+        )
+    missing = [f for f in _HY_MT_1_5_REQUIRED if not (d / f).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"HY-MT1.5 files missing under {d}: {missing}. "
+            f"Place the files there or set WDNAI_HY_MT_1_5_DIR to point at a custom path."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Intern-Decision-4B: structured decision model (state → options + probability)
+#
+# File layout — **two** RKNN pairs (text + vision) plus the tokenizer and
+# the embedding table::
+#
+#     Intern-Decision-4B-llm.rknn
+#         + Intern-Decision-4B-llm.weight
+#         + Intern-Decision-4B-llm.embed.bin
+#         + Intern-Decision-4B-llm.tokenizer.gguf
+#     Intern-Decision-4B-vision.rknn
+#         + Intern-Decision-4B-vision.weight
+#
+# The naming follows the upstream export (``export_rknn.py`` keeps the
+# ``<model>-llm`` / ``<model>-vision`` prefixes); the ``.weight`` sibling
+# is derived by replacing the ``.rknn`` suffix — exactly what the C++
+# reference's ``make_weight_path`` does.
+#
+# Unlike the Qwen VLM presets the **text** half is called ``-llm`` and
+# not ``llm_`` — the upstream export names it that way and the reference
+# implementation scans the directory by that prefix.
+# --------------------------------------------------------------------------- #
+_INTERN_DECISION_4B_REQUIRED = (
+    "Intern-Decision-4B-llm.rknn",
+    "Intern-Decision-4B-llm.weight",
+    "Intern-Decision-4B-llm.embed.bin",
+    "Intern-Decision-4B-llm.tokenizer.gguf",
+    "Intern-Decision-4B-vision.rknn",
+    "Intern-Decision-4B-vision.weight",
+)
+
+
+def _intern_decision_4b_dir() -> Path:
+    """Resolve the Intern-Decision-4B model directory.
+
+    Override via the ``WDNAI_INTERN_DECISION_4B_DIR`` env var (full path);
+    fallback ``$WDNAI_MODELS_DIR/Intern_Decision-4B`` (which itself
+    defaults to ``/userdata/models/Intern_Decision-4B`` when
+    ``WDNAI_MODELS_DIR`` is unset). Mirrors ``_hy_mt_1_5_dir`` so every
+    model dir honors the same ``WDNAI_MODELS_DIR`` root.
+    """
+    override = _os.environ.get("WDNAI_INTERN_DECISION_4B_DIR")
+    return Path(override) if override else _models_root() / "Intern_Decision-4B"
+
+
+def _default_intern_decision_4b_paths() -> dict:
+    """Return absolute paths to the Intern-Decision-4B files."""
+    d = _intern_decision_4b_dir()
+    return {
+        "rknn_llm_path": str(d / "Intern-Decision-4B-llm.rknn"),
+        "weight_llm_path": str(d / "Intern-Decision-4B-llm.weight"),
+        "rknn_vision_path": str(d / "Intern-Decision-4B-vision.rknn"),
+        "weight_vision_path": str(d / "Intern-Decision-4B-vision.weight"),
+        "tokenizer_path": str(d / "Intern-Decision-4B-llm.tokenizer.gguf"),
+        "embed_path": str(d / "Intern-Decision-4B-llm.embed.bin"),
+    }
+
+
+def _verify_intern_decision_4b_files() -> None:
+    """Raise :class:`FileNotFoundError` listing any missing files.
+
+    Required files (must be present): see ``_INTERN_DECISION_4B_REQUIRED``.
+    """
+    try:
+        d = _intern_decision_4b_dir()
+    except OSError as e:
+        raise FileNotFoundError(
+            f"Intern-Decision-4B directory resolution failed: {e}"
+        )
+    missing = [f for f in _INTERN_DECISION_4B_REQUIRED if not (d / f).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Intern-Decision-4B files missing under {d}: {missing}. "
+            f"Place the files there or set WDNAI_INTERN_DECISION_4B_DIR to point at a custom path."
+        )
+
+
+def _intern_decision_4b_spec(**overrides) -> ModelSpec:
+    """Intern-Decision-4B: structured decision model (分类 / 是非 / 评分).
+
+    Not a chat model: it does **not** generate text. For each decision
+    field it emits the logits of the 62 candidate symbols
+    (``A-Z`` + ``a-z`` + ``0-9``), which the CPU side turns into option
+    probabilities (softmax + checkpoint temperature calibration).
+
+    ``vocab_size=248320`` / ``special_eos_id=248046`` come from the
+    shipped GGUF tokenizer. ``max_context_len=4096`` is the value baked
+    into the export (``max_position_embeddings=4096``,
+    ``kvcache_buffer_len=4096``) — the upstream checkpoint's training
+    limit is much larger but the export did not keep it. The runtime
+    overrides it with the model's own ``max_ctx_len`` anyway.
+
+    Sampling is irrelevant here (the backend runs
+    ``disable_sampling=True`` and reads the logits directly), but the
+    values mirror the C++ reference: ``temperature=1``,
+    ``repeat_penalty=1``, ``top_k=1``, ``top_p=1``.
+
+    The **calibration** temperature (a different thing — it shapes the
+    reported probabilities on the CPU) is looked up from the model's
+    embedding width at runtime; see
+    :data:`wdnai.decision.CHECKPOINT_TEMPERATURES`.
+    """
+    base = dict(
+        name="Intern-Decision-4B",
+        kind="decision",
+        variant="intern-decision",
+        vocab_size=248320,
+        special_eos_id=248046,
+        max_context_len=4096,
+        image_size=384,
+        target="rk1820",
+        core_mask=0xFF,
+        options={
+            "max_new_tokens": 1,
+            "top_k": 1,
+            "top_p": 1.0,
+            "temperature": 1.0,
+            "repeat_penalty": 1.0,
+            "keep_history": 0,
+            # 视觉模型是否常驻。默认 False —— 与 C++ 参考实现一致：
+            # 图编码完就释放视觉模型，再做各字段的 LLM prefill。
+            "keep_vision_resident": False,
+        },
+    )
+    base.update(overrides)
+    return ModelSpec(**base)
+
+
+# --------------------------------------------------------------------------- #
 # Depth Anything V3: monocular depth estimation (image-in, depth-map-out).
 # File layout — **three** RKNN stages, each with its own ``.weight``::
 #
@@ -1475,6 +1792,64 @@ class SystemLanguageModel:
         """
         _verify_locate_anything_files()
         return _locate_anything_spec().with_paths(**_default_locate_anything_paths())
+
+    # ---- Machine translation --------------------------------------------
+    @classmethod
+    def hy_mt_1_5(cls) -> ModelSpec:
+        """Return a :class:`ModelSpec` pre-bound to the HY-MT1.5-1.8B files.
+
+        Hunyuan-Dense machine-translation model (text → text). Files are
+        expected at ``$WDNAI_MODELS_DIR/HY_MT_1_5/`` (default
+        ``/userdata/models/HY_MT_1_5/`` when ``WDNAI_MODELS_DIR`` is unset;
+        override the root with ``WDNAI_MODELS_DIR`` or pin a custom path
+        with ``WDNAI_HY_MT_1_5_DIR``). If any expected file is missing a
+        :class:`FileNotFoundError` is raised listing them.
+
+        The prompt template is the **Hunyuan** one
+        (``<｜hy_begin▁of▁sentence｜>`` / ``<｜hy_User｜>`` /
+        ``<｜hy_Assistant｜>``), **not** ChatML — see
+        :data:`HY_MT_CHAT_TEMPLATE`. Sampling is greedy
+        (``top_k=1``, ``temperature=1e-6``) so the translation is
+        reproducible.
+        """
+        _verify_hy_mt_1_5_files()
+        return _hy_mt_1_5_spec().with_paths(**_default_hy_mt_1_5_paths())
+
+    # ---- Structured decision -------------------------------------------
+    @classmethod
+    def intern_decision_4b(cls) -> ModelSpec:
+        """Return a :class:`ModelSpec` pre-bound to the Intern-Decision-4B files.
+
+        Structured-decision model (state → options + probabilities): it
+        does **not** generate text — for each decision field it emits the
+        logits of the 62 candidate symbols, which the SDK turns into
+        option probabilities. Three field types are supported:
+        ``choice`` (pick one), ``score`` (probability-weighted numeric
+        score) and ``noul`` (yes/no + affirmative probability).
+
+        Files are expected at ``$WDNAI_MODELS_DIR/Intern_Decision-4B/``
+        (default ``/userdata/models/Intern_Decision-4B/`` when
+        ``WDNAI_MODELS_DIR`` is unset; override the root with
+        ``WDNAI_MODELS_DIR`` or pin a custom path with
+        ``WDNAI_INTERN_DECISION_4B_DIR``). If any expected file is
+        missing a :class:`FileNotFoundError` is raised listing them.
+
+        The package holds **two** RKNN pairs — the text model
+        (``-llm``) and the vision encoder (``-vision``) — plus the
+        tokenizer and the embedding table. The vision encoder is loaded
+        lazily (only when a request actually carries an image) and
+        released again once the images are encoded, mirroring the C++
+        reference implementation.
+
+        The chat template is **empty** on purpose: this model family
+        builds its whole prompt on the CPU (see
+        :mod:`wdnai.decision`), so the C-side ChatML wrapper must not
+        be applied.
+        """
+        _verify_intern_decision_4b_files()
+        return _intern_decision_4b_spec().with_paths(
+            **_default_intern_decision_4b_paths()
+        )
 
     # ---- Depth estimation -----------------------------------------------
     @classmethod
