@@ -1,6 +1,7 @@
 """Shared logic for all backends: tokenizer / embed / callbacks / streaming result sink."""
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -440,24 +441,121 @@ def build_llm_args(spec) -> List[Dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- #
-# Perf-table printout (style matches the example scripts)
+# Perf table
 # --------------------------------------------------------------------------- #
+#
+# ⚠️ **为什么要把它从 printf_perf 里抠出来**（2026-11-17）：
+#
+# 以前这些派生量（tokens/s、每 token 耗时、LLM 延迟）**只在 printf_perf
+# 里算完就打印掉了** —— 调用方拿不到，只能去解析 stdout（而 stdout 在
+# **worker 进程**里，Web UI 那边根本看不见）。
+#
+# ⇒ 板端 Web UI 要显示「这次翻译花了多久、多少 tokens/s」时，只能自己
+# **重新算一遍** —— 于是同一套公式散落在两个地方（SDK 打印一份、宿主
+# 算一份），**迟早会漂**（改了 SDK 的算法，界面上的数就悄悄对不上了）。
+#
+# ⇒ 这里把它提成**纯函数** ``perf_table(perf)``：
+#   · :func:`printf_perf` 复用它（打印的和返回的**同一份算法**）；
+#   · 调用方（宿主翻译 provider）也复用它（拿累加后的原始计数算汇总值）。
+#
+# 公式**一个字都没改** —— 还是 SDK 原来那套（见 printf_perf 的历史）。
+def perf_table(perf: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """把 perf 表里的原始计数算成一份**派生数字字典**。
+
+    输入是 ``sink.perf`` 那种原始计数：
+    ``n_decode_tokens`` / ``n_prefill_tokens`` / ``prefill_ms`` / ``decode_ms``。
+
+    输出（**全是数字**，可以直接进 JSON / 过 wire）：
+
+    ==========================  ==========================================
+    ``prefill_tokens``          预填充 token 数
+    ``decode_tokens``           解码（生成）token 数
+    ``prefill_ms`` / ``decode_ms``  两段的耗时（毫秒）
+    ``prefill_ms_per_token``    预填充的每 token 耗时
+    ``decode_ms_per_token``     解码的每 token 耗时
+    ``prefill_tokens_per_second``  预填充的吞吐（tokens/s）
+    ``decode_tokens_per_second``   **解码的吞吐（tokens/s）** ← 界面显示的
+    ``llm_latency_ms``          LLM 总延迟 = 预填充 + 解码
+    ==========================  ==========================================
+
+    ⚠️ **计数为 0 时对应的速率也是 0**（不是 inf/nan）—— 这些数要进 JSON
+    响应，``inf`` / ``NaN`` 编不过去 ⇒ 整个响应序列化失败 ⇒ **推理成功了
+    但前端收到 500**。
+    """
+    p = perf if isinstance(perf, dict) else {}
+    decode_n = int(p.get("n_decode_tokens", 0) or 0)
+    prefill_n = int(p.get("n_prefill_tokens", 0) or 0)
+    prefill_ms = float(p.get("prefill_ms", 0.0) or 0.0)
+    decode_ms = float(p.get("decode_ms", 0.0) or 0.0)
+    return {
+        "prefill_tokens": prefill_n,
+        "decode_tokens": decode_n,
+        "prefill_ms": prefill_ms,
+        "decode_ms": decode_ms,
+        "prefill_ms_per_token": prefill_ms / prefill_n if prefill_n else 0.0,
+        "decode_ms_per_token": decode_ms / decode_n if decode_n else 0.0,
+        "prefill_tokens_per_second": (
+            (prefill_n * 1000.0) / prefill_ms if prefill_ms else 0.0),
+        "decode_tokens_per_second": (
+            (decode_n * 1000.0) / decode_ms if decode_ms else 0.0),
+        "llm_latency_ms": prefill_ms + decode_ms,
+    }
+
+
+def perf_json(perf: Optional[Dict[str, Any]]) -> str:
+    """把 perf 表算成**一段 JSON 文本**（可以直接贴进日志 / 响应体）。
+
+    ⚠️ **为什么要有「文本」这一版**：perf 表最终要**过 wire**（DDS reply
+    → HTTP 响应 → 前端）。中间任何一环只要带了编不过去的值（``inf`` /
+    ``NaN`` / 非数字对象），**整条响应就序列化失败** ⇒ 推理明明成功了，
+    调用方收到的却是传输错误 —— 最难查的一种失败。
+
+    ⇒ 所以这里**先序列化一次**：编不过去就地降级（``NaN``/``inf`` → 0），
+    保证产出的**一定是一段合法 JSON**。
+
+    用法::
+
+        print(perf_json(sink.perf))     # 日志里贴一行 JSON
+        reply["perf_json"] = perf_json(sink.perf)   # 或者直接带过 wire
+    """
+    table = perf_table(perf)
+    # ⚠️ ``allow_nan=False``：``NaN``/``inf`` **不是合法 JSON**（虽然
+    # Python 的 json 默认会把它们写成 NaN/Infinity，但别的解析器不认）。
+    # 这里先自己清一遍，再让 json 严格校验。
+    clean = {}
+    for key, val in table.items():
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            continue
+        if num != num or num in (float("inf"), float("-inf")):
+            num = 0.0
+        clean[str(key)] = num
+    try:
+        return json.dumps(clean, ensure_ascii=False, sort_keys=True,
+                          allow_nan=False)
+    except (TypeError, ValueError):
+        # 兜底：连 ``clean`` 都编不过去（理论上不会）⇒ 给一份空的
+        return "{}"
+
+
 def printf_perf(sink: StreamSink, vision_latency: Optional[float] = None) -> None:
     p = sink.perf
     if not p:
         return
-    decode_n = int(p.get("n_decode_tokens", 0))
-    prefill_n = int(p.get("n_prefill_tokens", 0))
-    prefill_ms = float(p.get("prefill_ms", 0.0))
-    decode_ms = float(p.get("decode_ms", 0.0))
+    t = perf_table(p)
+    decode_n = t["decode_tokens"]
+    prefill_n = t["prefill_tokens"]
+    prefill_ms = t["prefill_ms"]
+    decode_ms = t["decode_ms"]
     print("\n--------------------------------------------------------------------------------------")
     print(" %-12s  %-15s  %-8s  %-23s  %-23s" %
           ("Stage", "Total Time (ms)", "Tokens", "Time per Token (ms)", "Tokens per Second"))
     print("--------------------------------------------------------------------------------------")
-    prefill_tpt = prefill_ms / prefill_n if prefill_n else 0.0
-    prefill_tps = (prefill_n * 1000.0) / prefill_ms if prefill_ms else 0.0
-    decode_tpt = decode_ms / decode_n if decode_n else 0.0
-    decode_tps = (decode_n * 1000.0) / decode_ms if decode_ms else 0.0
+    prefill_tpt = t["prefill_ms_per_token"]
+    prefill_tps = t["prefill_tokens_per_second"]
+    decode_tpt = t["decode_ms_per_token"]
+    decode_tps = t["decode_tokens_per_second"]
     print(" %-12s  %-15.2f  %-8d  %-23.2f  %-23.2f" %
           ("Prefill", prefill_ms, prefill_n, prefill_tpt, prefill_tps))
     print(" %-12s  %-15.2f  %-8d  %-23.2f  %-23.2f" %
@@ -466,7 +564,7 @@ def printf_perf(sink: StreamSink, vision_latency: Optional[float] = None) -> Non
     # Combined LLM-only latency (prefill + decode). Excludes vision
     # preprocessing so it stays comparable across text-only and VLM
     # backends.
-    llm_ms = prefill_ms + decode_ms
+    llm_ms = t["llm_latency_ms"]
     print(f" LLM latency = {llm_ms:.2f} ms")
     if vision_latency is not None:
         # ``vision_latency`` measures only vision preprocessing +

@@ -96,6 +96,7 @@ from .backends.image import ImageBackend
 from .backends.locate_anything import LocateAnythingBackend
 from .backends.depth_anything import DepthAnythingBackend, DepthResult
 from .backends.intern_decision import InternDecisionBackend
+from .backends._common import perf_json, perf_table
 
 __all__ = [
     "BaseModel",
@@ -126,6 +127,8 @@ __all__ = [
     "DepthResult",
     "ImageBackend",
     "InternDecisionBackend",
+    "perf_table",
+    "perf_json",
     "DECISION_SYMBOLS",
     "DECISION_SYSTEM_PROMPT",
     "DECISION_MARKER",

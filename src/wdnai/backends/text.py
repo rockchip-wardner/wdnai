@@ -11,6 +11,7 @@ from ._common import (
     build_llm_callback,
     load_embed_table,
     load_tokenizer,
+    perf_table,
     printf_perf,
     raise_for_session_run,
     resolve_device_id,
@@ -87,6 +88,14 @@ class TextBackend:
                 "prefill_ms": (self.sink.first_token_time - llm_start) * 1000.0,
                 "decode_ms": (llm_end - self.sink.first_token_time) * 1000.0,
             })
+            # ⚠️ **把 SDK 算好的派生量也放进 sink**（2026-11-17）。
+            #
+            # 以前 tokens/s / 每 token 耗时这些只存在于 printf_perf 的
+            # **打印**里 —— 调用方拿不到（stdout 在别的进程里）。
+            # ⇒ 现在用同一个函数算一份放进 sink.perf：
+            #   · 想要数字的人直接读 sink.perf；
+            #   · 想要表格的人照旧 printf_perf（**同一份算法**，不会漂）。
+            self.sink.perf.update(perf_table(self.sink.perf))
             if overrides.get("perf", False):
                 printf_perf(self.sink)
         else:  # pragma: no cover

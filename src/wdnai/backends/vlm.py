@@ -67,6 +67,7 @@ from ._common import (
     build_llm_callback,
     load_embed_table,
     load_tokenizer,
+    perf_table,
     printf_perf,
     raise_for_session_run,
     resolve_device_id,
@@ -652,6 +653,9 @@ class VLMBackend:
                 "prefill_ms": (self.sink.first_token_time - llm_start) * 1000.0,
                 "decode_ms": (llm_end - self.sink.first_token_time) * 1000.0,
             })
+            # 派生量（tokens/s 等）也放进 sink —— 调用方直接读得到，
+            # 且与 printf_perf 打印的**同一份算法**（见 perf_table）。
+            self.sink.perf.update(perf_table(self.sink.perf))
         if overrides.get("perf", False):
             printf_perf(self.sink, vision_latency=vision_latency)
         return self.sink.text
