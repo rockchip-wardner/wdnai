@@ -1227,9 +1227,16 @@ def _intern_decision_4b_spec(**overrides) -> ModelSpec:
             "temperature": 1.0,
             "repeat_penalty": 1.0,
             "keep_history": 0,
-            # 视觉模型是否常驻。默认 False —— 与 C++ 参考实现一致：
-            # 图编码完就释放视觉模型，再做各字段的 LLM prefill。
-            "keep_vision_resident": False,
+            # 视觉模型是否常驻。
+            #
+            # ⚠️ **默认 True**（2026-11-17 改）：决策模型要**独占**一整张卡
+            # （两张 1828 卡各 5120 MB，一份决策实例 ~3100 MB 就吃掉大半张），
+            # 既然独占，就没必要再为「省 700 MB」把视觉做成按需加载 ——
+            # 常驻的好处是**带图请求没有首次加载的 7.5 秒**，且显存占用是
+            # 稳定的、可预期的（算力页上显示的数字就是真实占用）。
+            #
+            # 设 False 可回到 C++ 参考实现的行为：图编码完就释放视觉模型。
+            "keep_vision_resident": True,
         },
     )
     base.update(overrides)
