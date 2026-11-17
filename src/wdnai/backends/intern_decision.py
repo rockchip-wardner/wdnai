@@ -250,6 +250,20 @@ class InternDecisionBackend:
         # 一致），查不到就用 spec 里显式给的 calibration_temperature。
         self.temperature = self._resolve_temperature()
 
+        # ---- 推理性能表（2026-11-17）-------------------------------------
+        #
+        # ⚠️ 这个 backend **没有** ``StreamSink``（它用的是
+        # ``_DecisionOutputSink``，只收 logits），所以标准的
+        # ``backend.sink.perf`` 这条路走不通 ⇒ 自己记一份。
+        #
+        # ⚠️ **每个字段跑一次独立的 prefill-only 推理**
+        # （``max_new_tokens=1``）⇒ 解码 token 恒为 0 ⇒ 真正的吞吐是
+        # **预填充速率**（提示词处理速度），不是解码速率。
+        #
+        # DDS worker 侧会读 ``backend.perf`` 并带过 wire（见
+        # ``wdndds/ai_session.py`` 的 ``_read_perf``）。
+        self._perf: Dict[str, float] = {}
+
         # ---- 视觉（懒加载）-------------------------------------------------
         self._vision: Optional[_VisionModel] = None
         self._vision_geom: Optional[Tuple[int, int, int]] = None
@@ -480,6 +494,48 @@ class InternDecisionBackend:
             )
         return [list(tokens[: pos]) for pos in positions]
 
+    def _record_perf(self, stats: Any, wall_ms: float) -> None:
+        """把一次 prefill-only 推理的计时数据**累加**进性能表。
+
+        ⚠️ ``stats`` 是 ``session_run`` 返回的
+        ``(n_decode, n_prefill, llm_start, llm_end)``。后两个是 **C 侧**
+        的墙钟锚点（``time.perf_counter()``，见 ``wdnai/_librknn.py``）——
+        比 Python 侧的墙钟更贴近真正的推理时间（不含打包输入的开销）。
+
+        ⚠️ **prefill-only ⇒ 解码 token 恒为 0**：这次推理的时间全算在
+        ``prefill_ms`` 上。所以这个模型的吞吐 = **预填充速率**。
+
+        ⚠️ 墙钟退路：C 侧锚点缺失（老版本 / 异常）时用 Python 侧的
+        墙钟 —— 宁可粗一点，也不能没有。
+        """
+        n_decode = 0
+        n_prefill = 0
+        dur_ms = wall_ms
+        try:
+            n_decode, n_prefill, llm_start, llm_end = stats
+        except (TypeError, ValueError):
+            pass
+        else:
+            try:
+                if llm_end and llm_start:
+                    dur_ms = (float(llm_end) - float(llm_start)) * 1000.0
+            except (TypeError, ValueError):
+                pass
+        self._perf["n_decode_tokens"] = self._perf.get("n_decode_tokens", 0.0) + float(n_decode or 0)
+        self._perf["n_prefill_tokens"] = self._perf.get("n_prefill_tokens", 0.0) + float(n_prefill or 0)
+        self._perf["prefill_ms"] = self._perf.get("prefill_ms", 0.0) + float(dur_ms or 0.0)
+
+    @property
+    def perf(self) -> Dict[str, float]:
+        """最近一次决策推理的性能表（原始计数）。
+
+        ⚠️ **每次决策前会被清空**（见 :meth:`decide`）⇒ 它只反映**最近
+        一次**请求，跟 ``StreamSink.perf`` 的语义一样。
+
+        DDS worker 侧读它、把数字带过 wire（见 ``wdndds/ai_session.py``）。
+        """
+        return dict(self._perf)
+
     def _run_field(
         self,
         prefix: Sequence[int],
@@ -501,7 +557,12 @@ class InternDecisionBackend:
         }
         if image_input is not None:
             kwargs["inputs"] = [image_input]
-        ret, _stats = self.rknn_llm.session_run(**kwargs)
+        t_run = time.perf_counter()
+        ret, stats = self.rknn_llm.session_run(**kwargs)
+        # ⚠️ **stats 以前是丢掉的**（``_stats``）—— 现在留下计时数据。
+        # 它是 ``(n_decode, n_prefill, llm_start, llm_end)``：前两个是
+        # token 数，后两个是 C 侧的墙钟锚点。
+        self._record_perf(stats, (time.perf_counter() - t_run) * 1000.0)
         if ret != 0:
             raise RuntimeError(f"session_run failed: ret={ret}")
         if self._sink.error:
@@ -609,6 +670,9 @@ class InternDecisionBackend:
         image_list = list(images or [])
         features = None
         tokens_per_image = 0
+        # ⚠️ **每次决策前清空性能表** —— 它只反映**最近一次**请求
+        # （跟 ``StreamSink.perf`` 的语义一样）。
+        self._perf = {}
         if image_list:
             features, tokens_per_image = self._encode_images(image_list)
             # 视觉编码完成 → 释放视觉模型（与参考实现一致），给 LLM 的

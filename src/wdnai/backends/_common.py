@@ -474,9 +474,21 @@ def perf_table(perf: Optional[Dict[str, Any]]) -> Dict[str, float]:
     ``prefill_ms_per_token``    预填充的每 token 耗时
     ``decode_ms_per_token``     解码的每 token 耗时
     ``prefill_tokens_per_second``  预填充的吞吐（tokens/s）
-    ``decode_tokens_per_second``   **解码的吞吐（tokens/s）** ← 界面显示的
+    ``decode_tokens_per_second``   解码的吞吐（tokens/s）
+    ``tokens_per_second``       **主吞吐**（见下）
     ``llm_latency_ms``          LLM 总延迟 = 预填充 + 解码
     ==========================  ==========================================
+
+    ⚠️ ``tokens_per_second`` = **主吞吐**：有解码 token 就是解码速率，
+    没有就是预填充速率。
+
+    为什么要这一项：**有些模型压根不解码**。Intern-Decision 每个字段跑
+    一次 ``max_new_tokens=1`` 的 **prefill-only** 推理 ⇒ 解码 token 恒为 0
+    ⇒ 只看 ``decode_tokens_per_second`` 永远是 0 ⇒ 界面上一个速率都显示
+    不出来。而它真正的吞吐就是**预填充速率**（提示词处理速度）。
+
+    ⇒ 界面显示「tokens/s」用这一项；要看分段的细账就另外读
+    ``prefill_tokens_per_second`` / ``decode_tokens_per_second``。
 
     ⚠️ **计数为 0 时对应的速率也是 0**（不是 inf/nan）—— 这些数要进 JSON
     响应，``inf`` / ``NaN`` 编不过去 ⇒ 整个响应序列化失败 ⇒ **推理成功了
@@ -487,6 +499,8 @@ def perf_table(perf: Optional[Dict[str, Any]]) -> Dict[str, float]:
     prefill_n = int(p.get("n_prefill_tokens", 0) or 0)
     prefill_ms = float(p.get("prefill_ms", 0.0) or 0.0)
     decode_ms = float(p.get("decode_ms", 0.0) or 0.0)
+    prefill_tps = (prefill_n * 1000.0) / prefill_ms if prefill_ms else 0.0
+    decode_tps = (decode_n * 1000.0) / decode_ms if decode_ms else 0.0
     return {
         "prefill_tokens": prefill_n,
         "decode_tokens": decode_n,
@@ -494,10 +508,9 @@ def perf_table(perf: Optional[Dict[str, Any]]) -> Dict[str, float]:
         "decode_ms": decode_ms,
         "prefill_ms_per_token": prefill_ms / prefill_n if prefill_n else 0.0,
         "decode_ms_per_token": decode_ms / decode_n if decode_n else 0.0,
-        "prefill_tokens_per_second": (
-            (prefill_n * 1000.0) / prefill_ms if prefill_ms else 0.0),
-        "decode_tokens_per_second": (
-            (decode_n * 1000.0) / decode_ms if decode_ms else 0.0),
+        "prefill_tokens_per_second": prefill_tps,
+        "decode_tokens_per_second": decode_tps,
+        "tokens_per_second": decode_tps if decode_n else prefill_tps,
         "llm_latency_ms": prefill_ms + decode_ms,
     }
 
